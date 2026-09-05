@@ -1,0 +1,129 @@
+#!/bin/bash
+#PBS -P gai51740
+#PBS -q R9920261300
+#PBS -v RTYPE=rt_HF
+#PBS -l select=2:mpiprocs=8
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -N miles-tinker-gw
+#PBS -j oe
+#PBS -o /home/aci18912it/miles-tinker/logs/
+#
+# Two-node Tinker gateway on ABCI (singularity + PBS + Ray).
+#   node 0: ray head + miles driver (serve_tinker.py) + gateway HTTP  (one container)
+#   node 1: ray worker                                                (one container via pbsdsh)
+# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...`.
+set -euo pipefail
+umask 077
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load singularity-ce/4.4.1 2>/dev/null || true
+
+# ---------------------------------------------------------------- layout
+GROUPS_ROOT=/groups/gai51740/aci18912it
+PROJECT_ROOT=${PROJECT_ROOT:-$GROUPS_ROOT/miles-tinker}
+SIF=${MILES_SIF:-$PROJECT_ROOT/images/miles-latest-cu13.sif}
+ROOTFS=${ROOTFS:-$PROJECT_ROOT/rootfs}                 # mounted as /root: Megatron-LM/, models/, shared_data/
+MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}  # the fork checkout, mounted at /root/miles
+EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}     # pip --target dir with the tinker SDK
+HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
+HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
+MODE=${MODE:-lora}
+JOB=${PBS_JOBID%%.*}
+RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
+JOBDIR=$PROJECT_ROOT/jobs/$RUN_NAME
+NODE_LOCAL=${PBS_LOCALDIR:?}/miles
+TINKER_PORT=${TINKER_PORT:-$((20000 + 10#$JOB % 20000))}
+RAY_PORT=6379; DASH_PORT=8265
+mkdir -p "$JOBDIR" "$PROJECT_ROOT/checkpoints" "$PROJECT_ROOT/name-resolve"
+
+# ---------------------------------------------------------------- node map
+awk '!seen[$1]++ { printf "%s\t%d\n", $1, NR-1 }' "$PBS_NODEFILE" > "$JOBDIR/nodes.tsv"
+mapfile -t HOSTS < <(cut -f1 "$JOBDIR/nodes.tsv"); mapfile -t VIDX < <(cut -f2 "$JOBDIR/nodes.tsv")
+(( ${#HOSTS[@]} == 2 )) || { echo "expected 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
+[[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
+HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(getent hosts "$HEAD_HOST" | awk '{print $1; exit}')
+IFNAME=$(ip -o -4 addr show | awk -v ip="$HEAD_IP" '$4 ~ "^"ip"/" {print $2; exit}')
+echo "job=$JOB run=$RUN_NAME mode=$MODE head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF"
+echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD) $(git -C "$MILES_SRC" branch --show-current)"
+
+# ---------------------------------------------------------------- container command (same on both nodes)
+export NVIDIA_VISIBLE_DEVICES=all     # nvidia-container-cli + --contain: required or no GPUs are visible
+CONTAINER_ARGS=(
+  --nv --cleanenv --containall --no-mount cwd
+  --bind /dev/infiniband:/dev/infiniband
+  --bind "$NODE_LOCAL/tmp:/tmp"
+  --home "$ROOTFS:/root"
+  --bind "$MILES_SRC:/root/miles"
+  --bind "$GROUPS_ROOT:$GROUPS_ROOT"
+  --pwd /root/miles
+  --env TMPDIR=/tmp --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 --env PYTHONNOUSERSITE=1
+  --env "PYTHONPATH=/root/miles:/root/Megatron-LM:$EXTRA_SITE"
+  --env "HF_HOME=$HF_HOME" --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1
+  --env XDG_CACHE_HOME=/tmp/xdg --env TRITON_CACHE_DIR=/tmp/triton --env TORCHINDUCTOR_CACHE_DIR=/tmp/inductor
+  --env FLASHINFER_WORKSPACE_DIR=/tmp/flashinfer --env TORCH_EXTENSIONS_DIR=/tmp/torch-ext --env CUDA_CACHE_PATH=/tmp/nv-cache
+  --env DG_JIT_CACHE_DIR=/tmp/deepgemm --env RAY_TMPDIR=/tmp/ray --env RAY_memory_monitor_refresh_ms=0
+  --env "NCCL_SOCKET_IFNAME=$IFNAME" --env "GLOO_SOCKET_IFNAME=$IFNAME" --env "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
+  --env TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  --env "MASTER_ADDR=$HEAD_IP" --env MILES_SCRIPT_EXTERNAL_RAY=1
+  --env "WANDB_MODE=${WANDB_MODE:-offline}" --env "WANDB_DIR=$JOBDIR/wandb"
+)
+printf '%q ' "${CONTAINER_ARGS[@]}" > "$JOBDIR/container_args.txt"
+
+# ---------------------------------------------------------------- node-local init on both nodes
+for i in 0 1; do
+  pbsdsh -n "${VIDX[$i]}" -- /bin/bash -c "mkdir -p '$NODE_LOCAL/tmp' && chmod 1777 '$NODE_LOCAL/tmp' && echo init_ok \$(hostname -s)"
+done
+
+# ---------------------------------------------------------------- worker (node 1)
+cat > "$JOBDIR/worker.sh" <<EOF
+set -euo pipefail
+ulimit -n \$(ulimit -Hn); ulimit -s unlimited 2>/dev/null || true
+export NVIDIA_VISIBLE_DEVICES=all
+source /etc/profile.d/modules.sh 2>/dev/null || true; module load singularity-ce/4.4.1 2>/dev/null || true
+exec singularity exec $(cat "$JOBDIR/container_args.txt") "$SIF" /bin/bash -c '
+  ip=\$(getent hosts \$(hostname -s) | awk "{print \\\$1; exit}")
+  for t in \$(seq 1 60); do
+    ray start --address=$HEAD_IP:$RAY_PORT --node-ip-address=\$ip --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats --block && break
+    echo "worker join retry \$t"; sleep 10
+  done'
+EOF
+pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/bin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
+WORKER_PID=$!
+
+cleanup() { local st=$?; trap - EXIT; echo "cleanup status=$st $(date)"
+  [[ -n ${HEAD_PID:-} ]] && kill -TERM "$HEAD_PID" 2>/dev/null || true
+  kill -TERM "$WORKER_PID" 2>/dev/null || true; sleep 5
+  kill -KILL "$WORKER_PID" 2>/dev/null || true; kill -KILL "${HEAD_PID:-0}" 2>/dev/null || true
+  rm -f "$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint"; wait 2>/dev/null || true; exit "$st"; }
+trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
+
+# ---------------------------------------------------------------- head + driver + gateway (node 0)
+ulimit -n "$(ulimit -Hn)"; ulimit -s unlimited 2>/dev/null || true
+LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
+EXTRA_ARGS=${EXTRA_ARGS:-}
+singularity exec "${CONTAINER_ARGS[@]}" \
+  --env "TINKER_PORT=$TINKER_PORT" --env "RUN_NAME=$RUN_NAME" --env "MODE=$MODE" --env "HF_SNAPSHOT=$HF_SNAPSHOT" \
+  --env "CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints/$RUN_NAME" --env "ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint" \
+  --env "LAUNCHER_ARGS=$LAUNCHER_ARGS" --env "EXTRA_ARGS=$EXTRA_ARGS" \
+  "$SIF" /bin/bash -c '
+    set -euo pipefail
+    ray start --head --node-ip-address='"$HEAD_IP"' --port='"$RAY_PORT"' --dashboard-host=127.0.0.1 --dashboard-port='"$DASH_PORT"' \
+              --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats
+    for t in $(seq 1 90); do ray status 2>/dev/null | grep -q "/16.0 GPU" && break; echo "waiting for 16 GPUs ($t/90)"; sleep 10; done
+    ray status | grep -q "/16.0 GPU" || { echo "worker never joined" >&2; ray status; exit 1; }
+    printf "http://%s:%s\n" "$(hostname -s)" "$TINKER_PORT" > "$ENDPOINT_FILE.tmp" && mv "$ENDPOINT_FILE.tmp" "$ENDPOINT_FILE"
+    echo "endpoint $(cat "$ENDPOINT_FILE") (ray cluster ready $(date))"
+    python examples/tinker/run_qwen3_4b_gateway.py serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
+      --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
+  ' > "$JOBDIR/head.log" 2>&1 &
+HEAD_PID=$!
+
+# ---------------------------------------------------------------- health + supervise
+for t in $(seq 1 360); do
+  if curl -sf --noproxy '*' --connect-timeout 3 --max-time 10 "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" >/dev/null; then
+    echo "gateway healthy at http://$HEAD_HOST:$TINKER_PORT ($(date))"; break
+  fi
+  kill -0 "$HEAD_PID" 2>/dev/null || { echo "head container exited early" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
+  sleep 10
+done
+wait "$HEAD_PID"; st=$?; echo "head exited status=$st $(date)"; exit "$st"
