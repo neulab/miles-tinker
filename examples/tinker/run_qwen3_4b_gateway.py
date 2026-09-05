@@ -66,7 +66,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     # LoRA slot pool (mode=lora); per-client rank comes from the SDK, capped by lora_rank.
     lora_rank: int = 32
-    lora_alpha: int = 64
+    lora_alpha: int = 32  # Tinker convention: alpha fixed at 32 regardless of rank
     n_adapters: int = 8
     target_modules: str = "linear_qkv,linear_proj,linear_fc1,linear_fc2"
 
