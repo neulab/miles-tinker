@@ -45,6 +45,8 @@ async def serve(args):
 
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
+    # the backend keeps its perf log beside the checkpoints, whichever flag named the root
+    args.tinker_checkpoint_root = checkpoint_root
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
         # full fine-tuning: one tenant, slot 0 is the base model
