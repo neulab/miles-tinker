@@ -1,0 +1,65 @@
+#!/bin/bash
+#PBS -P gai51740
+#PBS -q R9920261300
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1:mpiprocs=8
+#PBS -l walltime=03:00:00
+#PBS -N miles-tinker-pull
+#PBS -j oe
+#PBS -o /home/aci18912it/miles-tinker/logs/
+#
+# Pull radixark/miles:<tag> by digest into a SIF on /groups (1 node; the login node cannot pull).
+#   qsub -v TAG=latest,DIGEST=sha256:...,NAME=miles-latest-cu13 deploy/abci/pull_image.pbs
+# Writes $IMAGES/$NAME.sif, $NAME.sif.sha256 (sha256sum format, for `sha256sum -c`) and
+# $NAME.receipt.txt (digest, labels, pinned miles/Megatron/sglang commits read from the image with --fakeroot).
+# The pull cache and the squashfs build live on node-local /local; ~120 GB are needed there.
+set -euo pipefail
+umask 077
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load singularity-ce/4.4.1 2>/dev/null || true
+
+GROUPS_ROOT=/groups/gai51740/aci18912it
+PROJECT_ROOT=${PROJECT_ROOT:-$GROUPS_ROOT/miles-tinker}
+IMAGES=${IMAGES:-$PROJECT_ROOT/images}
+TAG=${TAG:-latest}
+# `latest` is retagged twice a day: pin the amd64 manifest digest (docker manifest inspect radixark/miles:$TAG).
+DIGEST=${DIGEST:-sha256:37945072c6cfd99cedb4368a2f14bf72a9bafd032bb9ba33e5c5f0add444febe}
+NAME=${NAME:-miles-${TAG}-cu13}
+LOCAL=${PBS_LOCALDIR:?}/miles-pull
+export SINGULARITY_CACHEDIR=$LOCAL/cache SINGULARITY_TMPDIR=$LOCAL/tmp
+mkdir -p "$IMAGES" "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR"
+trap 'rm -rf "$LOCAL"' EXIT
+
+echo "=== $(hostname -s) $(date) tag=$TAG digest=$DIGEST -> $IMAGES/$NAME.sif ==="
+echo "driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1) $(nvidia-smi | grep -o 'CUDA Version: [0-9.]*')"
+df -h /local | tail -1
+[[ -e $IMAGES/$NAME.sif ]] && { echo "refusing to overwrite $IMAGES/$NAME.sif (remove it or pick another NAME)" >&2; exit 2; }
+
+SIF=$LOCAL/$NAME.sif
+singularity pull --arch amd64 "$SIF" "docker://radixark/miles@${DIGEST}"
+singularity sif list "$SIF" >/dev/null
+
+{
+  echo "tag=$TAG"
+  echo "digest=$DIGEST"
+  echo "pulled=$(date -Is) host=$(hostname -s) job=${PBS_JOBID:-}"
+  echo "--- labels"
+  singularity inspect --labels "$SIF"
+  echo "--- pinned trees (fakeroot: /root is 0700 in the image)"
+  singularity exec --fakeroot --cleanenv --containall --no-home "$SIF" /bin/bash -c '
+    for d in /root/miles /root/Megatron-LM /sgl-workspace/sglang; do
+      printf "%s %s\n" "$d" "$(git -C $d rev-parse HEAD 2>/dev/null || echo unknown)"
+    done
+    python3 -c "import torch, sglang, ray; print(\"torch\", torch.__version__, \"sglang\", sglang.__version__, \"ray\", ray.__version__)"
+  ' 2>&1 || echo "fakeroot receipt failed (non-fatal)"
+  echo "--- gpu check"
+  singularity exec --nv --cleanenv --containall --no-home "$SIF" python3 -c \
+    "import torch; assert torch.cuda.is_available(); print('cuda', torch.version.cuda, torch.cuda.get_device_name(0))" 2>&1
+} | tee "$LOCAL/$NAME.receipt.txt"
+
+echo "=== copying to $IMAGES ($(du -h "$SIF" | cut -f1)) $(date) ==="
+cp "$SIF" "$IMAGES/$NAME.sif.tmp" && mv "$IMAGES/$NAME.sif.tmp" "$IMAGES/$NAME.sif"
+(cd "$IMAGES" && sha256sum "$NAME.sif" > "$NAME.sif.sha256")
+cp "$LOCAL/$NAME.receipt.txt" "$IMAGES/$NAME.receipt.txt"
+cat "$IMAGES/$NAME.sif.sha256"
+echo "=== done $(date) ==="
