@@ -81,8 +81,9 @@ done
 
 # ---------------------------------------------------------------- worker (node 1)
 cat > "$JOBDIR/worker.sh" <<EOF
-set -euo pipefail
-ulimit -n \$(ulimit -Hn); ulimit -s unlimited 2>/dev/null || true
+exec >> "$JOBDIR/worker-\$(hostname -s).log" 2>&1
+set -x
+ulimit -n \$(ulimit -Hn) 2>/dev/null || true; ulimit -s unlimited 2>/dev/null || true
 export NVIDIA_VISIBLE_DEVICES=all
 source /etc/profile.d/modules.sh 2>/dev/null || true; module load singularity-ce/4.4.1 2>/dev/null || true
 WIP=\$(ip -o -4 addr show | awk '\$4 ~ /^10\\.0\\./ {split(\$4, a, "/"); print a[1]; exit}')
@@ -93,6 +94,7 @@ exec singularity exec $(cat "$JOBDIR/container_args.txt") "$SIF" /bin/bash -c "
     echo \"worker join retry \$t\"; sleep 10
   done"
 EOF
+pbsdsh -n "${VIDX[1]}" -- /bin/bash -c "echo host=\$(hostname -s) ulimit_hn=\$(ulimit -Hn) path=\$PATH; which ip singularity; ip -o -4 addr show | grep ' 10\.0\.'" > "$JOBDIR/worker-env.log" 2>&1 || echo "worker env probe failed status=$?" >> "$JOBDIR/worker-env.log"
 pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
 WORKER_PID=$!
 
