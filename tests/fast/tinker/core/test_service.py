@@ -414,6 +414,8 @@ async def test_sample_resubmits_are_idempotent_per_sampling_seq(service):
     await await_settled(service, "tenant", fresh[0])
     assert first == retry and fresh != first
     assert len(service.backend.named("sample")) == 2
+    await await_settled(service, "tenant", first[0])
+    assert not service._sample_by_seq, "finished samples leave the dedup table (it must not grow per sample)"
 
 
 async def test_unknown_samplers_are_user_errors(service):

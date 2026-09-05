@@ -92,7 +92,7 @@ class TinkerService:
         self._wake = asyncio.Event()
         self._backend_lock = asyncio.Lock()
         self._sample_slots = asyncio.Semaphore(config.max_concurrent_samples)
-        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant, sampling_session_id, lora_name)
+        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
         self._sample_by_seq: dict[tuple, tuple[str, list[str]]] = {}  # (sampling_session_id, seq_id) -> reply
         self._model_by_seq: dict[tuple, tuple[str, str]] = {}  # (session_id, model_seq_id) -> reply
         self._background_tasks: set = set()
@@ -317,7 +317,7 @@ class TinkerService:
         promise = self.promises.create(model_path or "base", tenant)
         sequence_ids = [f"seq-{uuid.uuid4().hex}" for _ in range(payload.get("num_samples", 1))]
         task = asyncio.create_task(self._run_sample(promise.request_id, payload, lora_name))
-        self._sample_tasks[promise.request_id] = (task, tenant, sampling_session_id, lora_name)
+        self._sample_tasks[promise.request_id] = (task, tenant, sampling_session_id, lora_name, dedup_key)
         task.add_done_callback(lambda _t, rid=promise.request_id: self._sample_done(rid))
         reply = (promise.request_id, sequence_ids)
         if None not in dedup_key:
@@ -328,6 +328,8 @@ class TinkerService:
         entry = self._sample_tasks.pop(request_id, None)
         if entry is None:
             return
+        if self._sample_by_seq.get(entry[4], (None,))[0] == request_id:
+            del self._sample_by_seq[entry[4]]  # a later resubmit of this seq samples afresh (harmless)
         promise = self.promises.get(request_id, entry[1])
         if promise is not None and promise.state == PENDING:
             self.promises.fail(request_id, "cancelled", "user")  # cancelled before the task ever ran
@@ -377,7 +379,7 @@ class TinkerService:
         prefix = f"{model_id}@"
         return {
             int(lora_name.removeprefix(prefix))
-            for _task, _tenant, _sid, lora_name in self._sample_tasks.values()
+            for _task, _tenant, _sid, lora_name, _key in self._sample_tasks.values()
             if lora_name is not None and lora_name.startswith(prefix)
         }
 
@@ -408,7 +410,7 @@ class TinkerService:
         for sampling_session_id, session in list(self.sampling_sessions.items()):
             if is_stale(session["session_id"], session["tenant"]):
                 del self.sampling_sessions[sampling_session_id]
-        for request_id, (task, tenant, sampling_session_id, _lora) in list(self._sample_tasks.items()):
+        for request_id, (task, tenant, sampling_session_id, _lora, _key) in list(self._sample_tasks.items()):
             orphaned = sampling_session_id is not None and sampling_session_id not in self.sampling_sessions
             if orphaned or is_stale("", tenant):
                 logger.warning(f"lease expired for sample {request_id}; cancelling")
