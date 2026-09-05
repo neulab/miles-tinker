@@ -87,7 +87,10 @@ def build_app(service: TinkerService) -> FastAPI:
         return {}
 
     @app.post("/api/v1/telemetry")
-    async def telemetry():
+    async def telemetry(request: Request):
+        payload = await _json_or_empty(request)
+        if _announces_session_end(payload):
+            await service.end_session(payload["session_id"])
         return {"status": "accepted"}
 
     @app.post("/api/v1/create_session")
@@ -294,3 +297,20 @@ def build_app(service: TinkerService) -> FastAPI:
         return Response(status_code=204)
 
     return app
+
+async def _json_or_empty(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _announces_session_end(payload: dict) -> bool:
+    """Both SDKs flush a SESSION_END event when the client shuts down."""
+    if not payload.get("session_id"):
+        return False
+    return any(
+        isinstance(event, dict) and event.get("event", event.get("event_type")) == "SESSION_END"
+        for event in payload.get("events") or []
+    )

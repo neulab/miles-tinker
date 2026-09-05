@@ -386,6 +386,15 @@ class TinkerService:
 
     # -------- leases --------
 
+    async def end_session(self, session_id: str) -> None:
+        """The client announced its exit (SESSION_END telemetry): reclaim the
+        session's models and slots now instead of after the lease timeout."""
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        session["last_heartbeat"] = float("-inf")
+        await self._sweep_once()
+
     async def sweep_leases(self) -> None:
         """Reclaim from stale sessions: cancel sampling, unload models, free
         slots. Training state dies with the lease; only checkpoints survive."""

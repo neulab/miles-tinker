@@ -429,3 +429,24 @@ async def test_capabilities_health_and_telemetry_shapes(client):
     assert capabilities["supported_models"][0]["model_name"] == "base"
     assert (await client.post("/api/v1/telemetry", json={})).json() == {"status": "accepted"}
     assert (await client.get("/health")).json() == (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
+
+
+async def test_a_session_end_event_frees_the_slots_at_once(client):
+    session = await client.post("/api/v1/create_session", json={"sdk_version": "0.27.1"}, headers=_headers())
+    session_id = session.json()["session_id"]
+    model_id = await _create_model(client, session_id=session_id, model_seq_id=0)
+    free_before = len(client.service.free_slots)
+
+    batch = {
+        "session_id": session_id,
+        "sdk_version": "0.27.1",
+        "platform": "linux",
+        "process_uuid": "p",
+        "events": [{"event": "SESSION_END", "session_id": session_id, "timestamp": 0}],
+    }
+    assert (await client.post("/api/v1/telemetry", json=batch)).json() == {"status": "accepted"}
+
+    assert model_id not in client.service.models
+    assert len(client.service.free_slots) == free_before + 1
+    # telemetry without a session end (or malformed) still just accepts
+    assert (await client.post("/api/v1/telemetry", content=b"not json")).json() == {"status": "accepted"}
