@@ -93,7 +93,7 @@ exec singularity exec $(cat "$JOBDIR/container_args.txt") "$SIF" /bin/bash -c "
     echo \"worker join retry \$t\"; sleep 10
   done"
 EOF
-pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/bin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
+pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
 WORKER_PID=$!
 
 cleanup() { local st=$?; trap - EXIT; echo "cleanup status=$st $(date)"
