@@ -31,6 +31,13 @@ def validate_tinker_serve_args(args) -> None:
             "--tinker-train-mode full resets Adam moments in place on load_state/reset_to_base; "
             "--use-precision-aware-optimizer (scaled master params) is not supported"
         )
+        if getattr(args, "pause_generation_mode", "retract") == "in_place":
+            # a full-weight push invalidates every cached KV entry; in_place keeps the prefix cache
+            logger.warning(
+                "--tinker-train-mode full pushes the base weights on every sampler save; overriding "
+                "--pause-generation-mode in_place with retract so engines drop their prefix cache"
+            )
+            args.pause_generation_mode = "retract"
     else:
         assert args.multi_lora_n_adapters > 0, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
         if args.tensor_model_parallel_size * args.expert_model_parallel_size > 1:

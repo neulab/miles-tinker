@@ -64,3 +64,15 @@ def test_lora_mode_warns_about_tp_ep_marked_grad_double_sum(caplog):
     with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
         arguments.validate_tinker_serve_args(args)
     assert any("TP*EP" in message for message in caplog.messages)
+
+
+def test_full_mode_overrides_in_place_pausing(caplog):
+    from miles.utils.tinker_args import validate_tinker_serve_args
+
+    args = _serve_args(tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="in_place")
+    validate_tinker_serve_args(args)
+    assert args.pause_generation_mode == "retract"
+
+    args = _serve_args(tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="abort")
+    validate_tinker_serve_args(args)
+    assert args.pause_generation_mode == "abort"

@@ -24,8 +24,9 @@ Args:
   --max-tokens-per-gpu: packed tokens per training microbatch (raise until OOM).
   --recompute-args: extra Megatron recompute flags, e.g.
     ``"--recompute-granularity full --recompute-method block --recompute-num-layers 8"``.
-  --pause-generation-mode: how engines pause during weight pushes; ``in_place``
-    keeps the prefix cache (default ``retract`` refills it on every push).
+  --pause-generation-mode: how engines pause during weight pushes; defaults to
+    ``in_place`` for ``--mode lora`` (adapter pushes keep the prefix cache) and
+    ``retract`` for ``--mode full`` (a base-weight push must drop the cache).
   --update-weight-buffer-size: bytes per weight-update batch (1 GiB).
   --sglang-mem-fraction-static / --sglang-context-length /
     --sglang-chunked-prefill-size / --sglang-max-running-requests: engine knobs.
@@ -74,8 +75,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 16384
     recompute_args: str = ""
 
-    # Weight pushes: in_place keeps in-flight requests and the prefix cache across a push.
-    pause_generation_mode: str = "in_place"
+    # Weight pushes: in_place keeps in-flight requests and the prefix cache across an adapter push
+    # (mode=lora); full-weight pushes must drop the cache, so mode=full defaults to retract.
+    pause_generation_mode: str | None = None
     update_weight_buffer_size: int = 1024**3
 
     # Sampling engines.
@@ -93,6 +95,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.checkpoint_root is None:
             self.checkpoint_root = f"{self.output_dir}/tinker/{self.run_id}"
         assert self.mode in ("lora", "full"), f"--mode must be lora or full, got {self.mode!r}"
+        if self.pause_generation_mode is None:
+            self.pause_generation_mode = "in_place" if self.mode == "lora" else "retract"
         assert self.pause_generation_mode in ("abort", "retract", "in_place"), self.pause_generation_mode
 
 
