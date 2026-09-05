@@ -45,13 +45,18 @@ def create_multi_lora_instance(args: Namespace):
     )
 
 
-def megatron_shard_name(tp_rank: int, pp_rank: int, ep_rank: int, ep_size: int) -> str:
-    """Adapter shard name for one (tp, pp, ep) coordinate; EP ranks hold different local
-    experts. The ep suffix is omitted at ep_size == 1 so legacy checkpoints stay loadable."""
-    name = f"adapter_megatron_tp{tp_rank}_pp{pp_rank}"
+def shard_coord_tag(tp_rank: int, pp_rank: int, ep_rank: int, ep_size: int) -> str:
+    """File-name tag of one (tp, pp, ep) shard coordinate, e.g. ``tp0_pp1``; EP ranks hold different
+    local experts. The ep suffix is omitted at ep_size == 1 so legacy checkpoints stay loadable."""
+    tag = f"tp{tp_rank}_pp{pp_rank}"
     if ep_size > 1:
-        name += f"_ep{ep_rank}"
-    return name + ".pt"
+        tag += f"_ep{ep_rank}"
+    return tag
+
+
+def megatron_shard_name(tp_rank: int, pp_rank: int, ep_rank: int, ep_size: int) -> str:
+    """Adapter weight shard name for one (tp, pp, ep) coordinate."""
+    return f"adapter_megatron_{shard_coord_tag(tp_rank, pp_rank, ep_rank, ep_size)}.pt"
 
 
 def adapter_shard_topology() -> tuple[bool, tuple[tuple[int, int, int], ...]]:
