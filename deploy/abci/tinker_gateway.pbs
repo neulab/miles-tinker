@@ -41,9 +41,14 @@ awk '!seen[$1]++ { printf "%s\t%d\n", $1, NR-1 }' "$PBS_NODEFILE" > "$JOBDIR/nod
 mapfile -t HOSTS < <(cut -f1 "$JOBDIR/nodes.tsv"); mapfile -t VIDX < <(cut -f2 "$JOBDIR/nodes.tsv")
 (( ${#HOSTS[@]} == 2 )) || { echo "expected 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
 [[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
-HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(getent hosts "$HEAD_HOST" | awk '{print $1; exit}')
-IFNAME=$(ip -o -4 addr show | awk -v ip="$HEAD_IP" '$4 ~ "^"ip"/" {print $2; exit}')
-echo "job=$JOB run=$RUN_NAME mode=$MODE head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF"
+# The node's own hostname resolves to an IPv6 link-local address on the node itself, so pick the
+# IPoIB hostname network (10.0.x.y) from the interface list instead of getent.
+node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}'; }
+node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
+HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
+[[ -n $HEAD_IP && -n $IFNAME ]] || { echo "could not determine the head IPoIB address" >&2; ip -o -4 addr show >&2; exit 2; }
+exec > >(tee -a "$JOBDIR/launcher.log") 2>&1
+echo "job=$JOB run=$RUN_NAME mode=$MODE head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF $(date)"
 echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD) $(git -C "$MILES_SRC" branch --show-current)"
 
 # ---------------------------------------------------------------- container command (same on both nodes)
@@ -80,12 +85,13 @@ set -euo pipefail
 ulimit -n \$(ulimit -Hn); ulimit -s unlimited 2>/dev/null || true
 export NVIDIA_VISIBLE_DEVICES=all
 source /etc/profile.d/modules.sh 2>/dev/null || true; module load singularity-ce/4.4.1 2>/dev/null || true
-exec singularity exec $(cat "$JOBDIR/container_args.txt") "$SIF" /bin/bash -c '
-  ip=\$(getent hosts \$(hostname -s) | awk "{print \\\$1; exit}")
+WIP=\$(ip -o -4 addr show | awk '\$4 ~ /^10\\.0\\./ {split(\$4, a, "/"); print a[1]; exit}')
+echo "worker \$(hostname -s) ip=\$WIP joining $HEAD_IP:$RAY_PORT \$(date)"
+exec singularity exec $(cat "$JOBDIR/container_args.txt") "$SIF" /bin/bash -c "
   for t in \$(seq 1 60); do
-    ray start --address=$HEAD_IP:$RAY_PORT --node-ip-address=\$ip --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats --block && break
-    echo "worker join retry \$t"; sleep 10
-  done'
+    ray start --address=$HEAD_IP:$RAY_PORT --node-ip-address=\$WIP --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats --block && break
+    echo \"worker join retry \$t\"; sleep 10
+  done"
 EOF
 pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/bin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
 WORKER_PID=$!
