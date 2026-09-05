@@ -339,6 +339,22 @@ async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
         service.delete_checkpoint("tenant", model_id, "bogus")
 
 
+async def test_checkpoint_names_cannot_escape_the_checkpoint_root(service):
+    model_id = await created_model(service)
+    escaping = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "../escape"})
+    promise = await await_settled(service, "tenant", escaping)
+    assert (promise.state, promise.error_category) == (FAILED, "user")
+    assert not service.backend.named("save_slot")
+
+    for checkpoint_id in ("weights/..", "weights/a/b"):
+        with pytest.raises(UserInputError, match="invalid checkpoint path"):
+            service.delete_checkpoint("tenant", model_id, checkpoint_id)
+    with pytest.raises(UserInputError, match="invalid checkpoint path"):
+        service.delete_checkpoint("tenant", "..", "weights/ckpt")
+    with pytest.raises(UserInputError, match="invalid checkpoint path"):
+        service.weights_info("tenant", "tinker://../weights/..")
+
+
 # -------- samplers --------
 
 

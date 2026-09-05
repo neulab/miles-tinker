@@ -739,6 +739,8 @@ class TinkerService:
         shutil.rmtree(path, ignore_errors=True)
 
     def _checkpoint_dir(self, model_id: str, kind: str, name: str) -> str:
+        for part in (model_id, kind, name):
+            _check_path_component(part)
         return f"{self.config.checkpoint_root}/{model_id}/{kind}/{name}"
 
 
@@ -799,6 +801,12 @@ def read_sidecar(path: str) -> dict | None:
             return json.load(handle)
     except FileNotFoundError:
         return None
+
+
+def _check_path_component(part: str) -> None:
+    """Client-chosen names and ids become directory names under checkpoint_root."""
+    if not part or part in (".", "..") or "/" in part or "\\" in part:
+        raise UserInputError(f"invalid checkpoint path component {part!r}")
 
 
 def _path_model_id(tinker_path: str | None) -> str | None:
