@@ -38,5 +38,19 @@ def test_an_expired_promise_returns_none(monkeypatch):
     assert store.get(promise.request_id, "tenant") is None, "finished past TTL must read as unknown (410)"
 
 
+def test_the_polled_promise_expires_inline_and_the_rest_on_the_sweep_interval(monkeypatch):
+    store = PromiseStore()
+    polled, other = store.create("model", "tenant"), store.create("model", "tenant")
+    for promise in (polled, other):
+        store.resolve(promise.request_id, {"kind": "optim_step"})
+
+    monkeypatch.setattr(promise_module, "_FINISHED_TTL_S", -1.0)
+    assert store.get(polled.request_id, "tenant") is None
+    assert other.request_id in store._promises, "a poll must not walk every promise"
+    store._last_sweep -= promise_module._SWEEP_INTERVAL_S
+    assert store.get("req-nope", "tenant") is None
+    assert other.request_id not in store._promises, "the periodic pass drops the rest"
+
+
 def test_unknown_request_returns_none():
     assert PromiseStore().get("req-nope", "tenant") is None

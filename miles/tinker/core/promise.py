@@ -2,10 +2,11 @@
 
 The HTTP side reads, the execution side writes; this is the only interface
 between the two worlds. Promises live in memory: a gateway restart answers
-410 and the SDK resubmits the original request, which the stream dedup makes
-safe.
+410, which the SDK treats as a retryable "promise expired" for sampling and
+as fatal for training (the stream dedup makes a resubmit safe either way).
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ DONE = "done"
 FAILED = "failed"
 
 _FINISHED_TTL_S = 3600.0
+_SWEEP_INTERVAL_S = 60.0  # full expiry pass; the polled promise itself is always checked
 
 
 @dataclass
@@ -30,11 +32,13 @@ class Promise:
     error_category: str | None = None
     finished_at: float | None = None
     created_at: float = field(default_factory=time.monotonic)
+    settled: asyncio.Event = field(default_factory=asyncio.Event)  # long-poll wake-up
 
 
 class PromiseStore:
     def __init__(self) -> None:
         self._promises: dict[str, Promise] = {}
+        self._last_sweep = time.monotonic()
 
     def create(self, model_id: str, tenant: str) -> Promise:
         promise = Promise(request_id=f"req-{uuid.uuid4().hex}", model_id=model_id, tenant=tenant)
@@ -46,6 +50,7 @@ class PromiseStore:
         promise.state = DONE
         promise.result = result
         promise.finished_at = time.monotonic()
+        promise.settled.set()
 
     def fail(self, request_id: str, error: str, category: str) -> None:
         promise = self._promises[request_id]
@@ -53,13 +58,16 @@ class PromiseStore:
         promise.error = error
         promise.error_category = category
         promise.finished_at = time.monotonic()
+        promise.settled.set()
 
     def get(self, request_id: str, tenant: str) -> Promise | None:
-        """None means unknown/expired: the HTTP layer answers 410 and the SDK
-        resubmits the original request."""
+        """None means unknown/expired: the HTTP layer answers 410."""
         self._sweep()
         promise = self._promises.get(request_id)
         if promise is None:
+            return None
+        if _expired(promise, time.monotonic()):
+            del self._promises[request_id]
             return None
         if promise.tenant != tenant:
             raise OwnershipError(f"request {request_id} does not belong to this tenant")
@@ -67,10 +75,12 @@ class PromiseStore:
 
     def _sweep(self) -> None:
         now = time.monotonic()
-        expired = [
-            rid
-            for rid, p in self._promises.items()
-            if p.finished_at is not None and now - p.finished_at > _FINISHED_TTL_S
-        ]
-        for rid in expired:
+        if now - self._last_sweep < _SWEEP_INTERVAL_S:
+            return  # every poll would otherwise walk every promise of the last hour
+        self._last_sweep = now
+        for rid in [rid for rid, p in self._promises.items() if _expired(p, now)]:
             del self._promises[rid]
+
+
+def _expired(promise: Promise, now: float) -> bool:
+    return promise.finished_at is not None and now - promise.finished_at > _FINISHED_TTL_S

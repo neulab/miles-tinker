@@ -46,6 +46,9 @@ class ModelStream:
         self.arrivals: dict[int, Command] = {}
         self.request_id_by_seq: dict[int, str] = {}
         self.queue: deque[PendingRequest] = deque()
+        # a failed forward_backward leaves partial gradients behind: the next
+        # optim_step must discard them and fail typed instead of stepping
+        self.dirty: str | None = None
 
     def submit(self, command: Command) -> None:
         """Accept one deduplicated command; feed the queue in seq order."""
@@ -78,3 +81,8 @@ class ModelStream:
 
     def finish(self, pending: PendingRequest) -> None:
         self.queue.remove(pending)
+
+    def window_may_grow(self) -> bool:
+        """True while nothing but window commands is queued: a later chunk of
+        the same window can still arrive and pack with the ready rows."""
+        return len(self.open_window()) == len(self.queue)

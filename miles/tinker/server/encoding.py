@@ -8,9 +8,17 @@ Sequence mapping: a datum's model_input tokens x[0..T-1] and target_tokens
 t[0..T-1] must satisfy t[i] == x[i+1] for i < T-1 (standard next-token
 supervision). The encoded row is x + [t[-1]] with T supervised positions, so
 the trainer scores exactly logprob(t[i] | x[0..i]).
+
+Two SDK dialects arrive here: 0.27.1 serialises every field, 0.16.1 omits
+unset defaults (chunk ``type``, adam fields) and sends explicit nulls.
 """
 
+import logging
+import math
+
 from miles.tinker.core.types import UserInputError
+
+logger = logging.getLogger(__name__)
 
 # materialized at the boundary so core and the executor can require every key
 ADAM_PARAM_DEFAULTS = {
@@ -48,22 +56,33 @@ def decode_command(kind: str, payload: dict) -> tuple[str, dict]:
     if kind == "load_state":
         return kind, decoded | {"path": payload["path"], "optimizer": payload["optimizer"]}
     if kind == "save_weights_for_sampler":
-        return kind, decoded
+        return kind, decoded | {
+            "name": payload.get("path"),
+            "sampling_session_seq_id": payload.get("sampling_session_seq_id"),
+        }
     raise UserInputError(f"unknown command kind {kind!r}")
+
+
+def decode_forward_request(payload: dict) -> tuple[str, dict]:
+    """0.16.1's POST /forward: the same body under ``forward_input``."""
+    body = {**payload, "forward_backward_input": payload["forward_input"], "forward_only": True}
+    return decode_command("forward_backward", body)
 
 
 def materialize_adam_params(raw: dict) -> dict:
     unknown = set(raw) - set(ADAM_PARAM_DEFAULTS)
     if unknown:
-        raise UserInputError(f"unknown adam_params keys: {sorted(unknown)}")
-    return {**ADAM_PARAM_DEFAULTS, **raw}
+        logger.warning(f"ignoring unknown adam_params keys: {sorted(unknown)}")
+    known = {key: value for key, value in raw.items() if key in ADAM_PARAM_DEFAULTS and value is not None}
+    return {**ADAM_PARAM_DEFAULTS, **known}
 
 
 def model_input_tokens(model_input: dict) -> list[int]:
     tokens: list[int] = []
     for chunk in model_input["chunks"]:
-        if chunk.get("type") != "encoded_text":
-            raise UserInputError(f"unsupported model_input chunk type: {chunk.get('type')}")
+        chunk_type = chunk.get("type", "encoded_text")  # 0.16.1 omits the default discriminator
+        if chunk_type != "encoded_text":
+            raise UserInputError(f"unsupported model_input chunk type: {chunk_type}")
         tokens.extend(chunk["tokens"])
     return tokens
 
@@ -116,6 +135,7 @@ def decode_sample_request(payload: dict) -> dict:
     return {
         "model_path": payload.get("model_path"),
         "sampling_session_id": payload.get("sampling_session_id"),
+        "seq_id": payload.get("seq_id"),
         "num_samples": payload.get("num_samples", 1),
         "prompt_tokens": model_input_tokens(payload["prompt"]),
         "sampling_params": payload.get("sampling_params") or {},
@@ -125,6 +145,15 @@ def decode_sample_request(payload: dict) -> dict:
 
 
 # -------- result rendering (JSON; proto_codec renders the binary forms) --------
+
+
+def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
+    """Request-level metrics in the SDK's ``name:reduction`` form."""
+    return {
+        "loss:sum": float(sum(output["loss"] for output in outputs)),
+        "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
+        "num_datums:sum": float(len(outputs)),
+    }
 
 
 def render_result(result: dict) -> dict:
@@ -138,25 +167,49 @@ def render_result(result: dict) -> dict:
                 {"loss:sum": _tensor_json([output["loss"]]), "logprobs": _tensor_json(output["logprobs"])}
                 for output in outputs
             ],
-            "metrics": {"loss:sum": float(sum(output["loss"] for output in outputs))},
+            "metrics": forward_backward_metrics(outputs),
         }
     if kind == "sample":
-        rendered = {"type": "sample", "sequences": result["sequences"]}
-        for key in ("prompt_logprobs", "topk_prompt_logprobs"):
-            if result.get(key) is not None:
-                rendered[key] = result[key]
-        return rendered
+        return _render_sample(result)
     if kind == "create_model":
         return {"type": "create_model", "model_id": result["model_id"]}
+    if kind == "unload_model":
+        return {"type": "unload_model", "model_id": result["model_id"]}
     if kind == "save_state":
         return {"type": "save_weights", "path": result["path"]}
     if kind == "save_weights_for_sampler":
-        return {"type": "save_weights_for_sampler", "path": result["path"]}
+        sampling_session_id = result.get("sampling_session_id")
+        # unnamed saves answer only the minted session: 0.16.1 asserts path is None there
+        path = None if sampling_session_id is not None else result["path"]
+        return {"type": "save_weights_for_sampler", "path": path, "sampling_session_id": sampling_session_id}
     if kind == "load_state":
         return {"type": "load_weights"}
     if kind == "optim_step":
         return {"type": "optim_step", "metrics": result["metrics"]}
     raise AssertionError(f"unrenderable result kind {kind!r}")
+
+
+def _render_sample(result: dict) -> dict:
+    """JSON SampleResponse (0.16.1 shape): NaN becomes null, top-k rows are
+    lists of [token, logprob] pairs with null for unscored positions."""
+    rendered = {"type": "sample", "sequences": result["sequences"]}
+    if result.get("prompt_logprobs") is not None:
+        rendered["prompt_logprobs"] = [_nan_to_none(value) for value in result["prompt_logprobs"]]
+    if result.get("topk_prompt_logprobs") is not None:
+        topk = result["topk_prompt_logprobs"]
+        rendered["topk_prompt_logprobs"] = [
+            _topk_pairs(tokens, logprobs) for tokens, logprobs in zip(topk["token_ids"], topk["logprobs"], strict=True)
+        ]
+    return rendered
+
+
+def _topk_pairs(tokens: list[int], logprobs: list[float]) -> list | None:
+    pairs = [[token, logprob] for token, logprob in zip(tokens, logprobs, strict=True) if not math.isnan(logprob)]
+    return pairs or None
+
+
+def _nan_to_none(value: float) -> float | None:
+    return None if math.isnan(value) else value
 
 
 def _tensor_json(values: list[float]) -> dict:

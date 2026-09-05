@@ -35,6 +35,10 @@ class WorkUnit:
     loss_fn_config: dict | None
     rows: list[RowRef]
 
+    @property
+    def num_tokens(self) -> int:
+        return sum(len(ref.row["tokens"]) for ref in self.rows)
+
 
 @dataclass
 class BarrierUnit:
@@ -57,6 +61,19 @@ class Planner:
         return self._streams[model_id]
 
     def next_unit(self) -> WorkUnit | BarrierUnit | None:
+        """Plan and commit: the unit's rows are marked issued."""
+        unit = self.plan_unit()
+        if isinstance(unit, WorkUnit):
+            self.commit(unit)
+        return unit
+
+    def commit(self, unit: WorkUnit) -> None:
+        for ref in unit.rows:
+            ref.request.issued += 1
+
+    def plan_unit(self) -> WorkUnit | BarrierUnit | None:
+        """What would run next; pure, so the service may look, wait for more
+        rows to arrive, and plan again."""
         rows = self._ready_rows()
         barriers = self._ready_barriers()
 
@@ -96,8 +113,6 @@ class Planner:
                 break
             picked.append(ref)
             tokens += row_tokens
-        for ref in picked:
-            ref.request.issued += 1
         command = seed.request.command
         return WorkUnit(
             kind=command.kind,

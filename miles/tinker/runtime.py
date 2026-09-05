@@ -83,7 +83,10 @@ class MilesBackend(ExecutorBackend):
     async def sample(self, payload: dict, lora_name: str | None) -> dict:
         request = self._generate_request(payload, lora_name)
         responses = await asyncio.gather(
-            *[post(f"{self.router_url}/generate", dict(request)) for _ in range(payload["num_samples"])]
+            *[
+                post(f"{self.router_url}/generate", per_sample, max_retries=3)
+                for per_sample in _per_sample_requests(request, payload["num_samples"])
+            ]
         )
         result = {"sequences": [_to_sequence(response) for response in responses]}
         if payload["prompt_logprobs"]:
@@ -97,21 +100,27 @@ class MilesBackend(ExecutorBackend):
         max_tokens = params.get("max_tokens")
         if max_tokens is None:
             raise UserInputError("sampling_params.max_tokens is required")
+        prompt_tokens = payload["prompt_tokens"]
         sampling_params = {
-            "max_new_tokens": max_tokens,
+            "max_new_tokens": _clamp_max_new_tokens(
+                max_tokens, len(prompt_tokens), getattr(self.args, "rollout_max_context_len", None)
+            ),
             "temperature": params.get("temperature", 1.0),
             "top_p": params.get("top_p", 1.0),
             "top_k": params.get("top_k", -1),
+            "no_stop_trim": True,  # the matched stop token stays in the returned tokens (Tinker semantics)
         }
         if params.get("seed") is not None:
             sampling_params["sampling_seed"] = params["seed"]
         stop = params.get("stop")
-        if stop is not None:
+        if stop == []:
+            sampling_params["ignore_eos"] = True  # Tinker: an empty stop list disables every stop, EOS included
+        elif stop is not None:
             if isinstance(stop, list) and stop and isinstance(stop[0], int):
                 sampling_params["stop_token_ids"] = stop
             else:
                 sampling_params["stop"] = stop
-        request = {"input_ids": payload["prompt_tokens"], "sampling_params": sampling_params, "return_logprob": True}
+        request = {"input_ids": prompt_tokens, "sampling_params": sampling_params, "return_logprob": True}
         if payload["prompt_logprobs"] or payload["topk_prompt_logprobs"]:
             request["logprob_start_len"] = 0
         if payload["topk_prompt_logprobs"]:
@@ -119,6 +128,29 @@ class MilesBackend(ExecutorBackend):
         if lora_name is not None:
             request["lora_path"] = lora_name
         return request
+
+
+def _clamp_max_new_tokens(max_tokens: int, prompt_len: int, context_len: int | None) -> int:
+    """Fit the generation into an explicit engine context; without one the
+    engine's own limit applies."""
+    if not context_len:
+        return max_tokens
+    room = context_len - prompt_len
+    if room <= 0:
+        raise UserInputError(f"prompt of {prompt_len} tokens leaves no room in a {context_len}-token context")
+    return min(max_tokens, room)
+
+
+def _per_sample_requests(request: dict, num_samples: int) -> list[dict]:
+    """One /generate body per sample; a client seed is offset per sample so
+    deterministic engines do not return num_samples identical sequences."""
+    requests = []
+    for index in range(num_samples):
+        sampling_params = dict(request["sampling_params"])
+        if "sampling_seed" in sampling_params and num_samples > 1:
+            sampling_params["sampling_seed"] = sampling_params["sampling_seed"] + index
+        requests.append({**request, "sampling_params": sampling_params})
+    return requests
 
 
 def _build_train_data(slot_rows: list) -> dict:
@@ -163,6 +195,9 @@ def _topk_prompt_logprobs(response: dict, k: int) -> dict:
 def _to_sequence(response: dict) -> dict:
     output_token_logprobs = response["meta_info"]["output_token_logprobs"]
     finish = response["meta_info"]["finish_reason"]["type"]
+    if finish == "abort":
+        # an aborted generation is a server failure, not a clean stop
+        raise RuntimeError("generation aborted by the engine")
     return {
         "sequence_id": f"seq-{uuid.uuid4().hex}",
         "tokens": [entry[1] for entry in output_token_logprobs],
