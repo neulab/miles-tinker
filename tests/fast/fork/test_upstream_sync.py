@@ -11,6 +11,9 @@ FORK_MD = """
 |---|---|---|
 | `serve_tinker.py` | train-mode flag | yes |
 | `deploy/abci/` | ABCI launcher | no |
+| `miles/tinker/runtime.py` (sampling functions) | seed offset | yes |
+| `miles/tinker/runtime.py` (MilesBackend) | dp padding | yes |
+| `miles/utils/timer.py`, `miles/utils/flops_utils.py` | per-unit MFU | yes |
 """
 
 
@@ -82,6 +85,19 @@ def test_fork_rationale_matches_files_and_directory_prefixes():
     assert found == {"serve_tinker.py": "train-mode flag", "deploy/abci/x.pbs": "ABCI launcher"}
 
 
+def test_fork_rationale_reads_qualified_and_multi_path_rows():
+    found = sync.fork_rationale(FORK_MD, ("miles/tinker/runtime.py", "miles/utils/flops_utils.py"))
+    assert found == {"miles/tinker/runtime.py": "seed offset | dp padding", "miles/utils/flops_utils.py": "per-unit MFU"}
+
+
+def test_fork_rationale_covers_every_row_of_the_real_fork_md():
+    fork_md = (Path(__file__).resolve().parents[3] / "FORK.md").read_text()
+    listed = [row for row in fork_md.splitlines() if row.startswith("| `")]
+    assert listed, "FORK.md tables not found"
+    sample = ("miles/tinker/runtime.py", "miles/utils/timer.py", "tests/fast/tinker/test_runtime.py", "deploy/abci/x.pbs")
+    assert set(sync.fork_rationale(fork_md, sample)) == set(sample)
+
+
 def test_parse_pytest_summary_reads_the_last_summary_line():
     output = "collected 3 items\n...\n=== 2 passed, 1 failed, 1 skipped in 0.1s ===\n"
     assert sync.parse_pytest_summary(output) == {"passed": 2, "failed": 1, "skipped": 1}
@@ -114,6 +130,22 @@ def test_plan_switches_to_main_once_the_stack_merged(repo: Path):
     plan = sync.make_plan(repo, state, "upstream", _git(repo, "rev-parse", "HEAD"))
     assert plan.stack_merged and plan.base_ref == "upstream/main" and not plan.up_to_date
     assert plan.conflicts == ()
+
+
+def test_plan_honours_a_recorded_squash_merge(repo: Path):
+    """After a squash merge the stack head is never an ancestor of main; the state flag is the override."""
+    _advance_upstream(repo, "main", "common.txt", "squashed stack\n", "squash merge of the stack")
+    state = sync.load_state(_state_path(repo))
+    assert not sync.make_plan(repo, state, "upstream", _git(repo, "rev-parse", "HEAD")).stack_merged
+
+    state["stack"]["merged_into_main"] = True
+    plan = sync.make_plan(repo, state, "upstream", _git(repo, "rev-parse", "HEAD"))
+    assert plan.stack_merged and plan.base_ref == "upstream/main" and not plan.up_to_date
+
+
+def test_conflict_report_names_the_rebase_continue_command(tmp_path: Path):
+    report = sync.conflict_report(tmp_path, (), "base", "upstream/main", "", rebase=True)
+    assert "rebasing onto upstream/main" in report and "git rebase --continue" in report
 
 
 def test_preview_conflicts_names_the_conflicting_file(repo: Path):

@@ -13,8 +13,9 @@ Args:
   --branch: fork branch that must be checked out (default: from the state file).
   --remote: upstream remote name (default: from the state file).
   --rebase: ``git rebase`` onto the base instead of ``git merge --no-ff``.
-  --check: report only (fetch, choose the base, preview conflicts); exit 1 when
-    a sync is needed, 0 when the fork already contains the base.
+  --check: report only (fetch, choose the base, preview conflicts); exit 0 when
+    the fork already contains the base, 1 when a sync is needed, 2 when the
+    preview shows conflicts.
   --dry-run: never run a mutating git command (no fetch, merge, state write).
   --no-tests: skip the fast test run after a clean merge.
   --python: interpreter for the tests (default: $MILES_FAST_PYTHON or this one).
@@ -45,6 +46,7 @@ EXIT_OK, EXIT_SYNC_NEEDED, EXIT_CONFLICT, EXIT_PREFLIGHT, EXIT_TESTS_FAILED = 0,
 
 _PYTEST_SUMMARY = re.compile(r"(\d+) (passed|failed|error|errors|skipped|xfailed|xpassed|deselected)")
 _CONFLICT_MARKER = re.compile(r"^<{7} ", re.MULTILINE)
+_BACKTICKED = re.compile(r"`([^`]+)`")
 
 
 @dataclass(frozen=True)
@@ -107,18 +109,26 @@ def preview_conflicts(repo: Path, head: str, base_ref: str) -> tuple[str, ...]:
 
 
 def fork_rationale(fork_md: str, paths: tuple[str, ...]) -> dict[str, str]:
-    """FORK.md table rows (``| `path` | rationale | ... |``) keyed by path, for the paths given."""
-    rows = {}
+    """FORK.md table rows (``| `path` | rationale | ... |``) keyed by path, for the paths given.
+
+    A row's first cell may list several backticked paths and carry a qualifier
+    (``\`a.py\`, \`b.py\``, ``\`runtime.py\` (sampling functions)``); every path of
+    every matching row contributes, so a file with two rows gets both rationales.
+    """
+    rows = []
     for line in fork_md.splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) >= 2 and cells[0].startswith("`") and cells[0].endswith("`"):
-            rows[cells[0].strip("`")] = cells[1]
+        if len(cells) >= 2 and cells[0].startswith("`"):
+            rows.append((tuple(_BACKTICKED.findall(cells[0])), cells[1]))
     rationale = {}
     for path in paths:
-        for listed, why in rows.items():
-            if path == listed or (listed.endswith("/") and path.startswith(listed)):
-                rationale[path] = why
-                break
+        found = [
+            why
+            for listed_paths, why in rows
+            if any(path == listed or (listed.endswith("/") and path.startswith(listed)) for listed in listed_paths)
+        ]
+        if found:
+            rationale[path] = " | ".join(found)
     return rationale
 
 
@@ -126,9 +136,12 @@ def count_conflict_hunks(text: str) -> int:
     return len(_CONFLICT_MARKER.findall(text))
 
 
-def conflict_report(repo: Path, files: tuple[str, ...], merge_base: str, base_ref: str, fork_md: str) -> str:
+def conflict_report(
+    repo: Path, files: tuple[str, ...], merge_base: str, base_ref: str, fork_md: str, rebase: bool = False
+) -> str:
     rationale = fork_rationale(fork_md, files)
-    lines = [f"CONFLICTS ({len(files)} files) merging {base_ref}; resolve, `git add`, then `git merge --continue`:"]
+    action, resume = ("rebasing onto", "git rebase --continue") if rebase else ("merging", "git merge --continue")
+    lines = [f"CONFLICTS ({len(files)} files) {action} {base_ref}; resolve, `git add`, then `{resume}`:"]
     for path in files:
         full = repo / path
         hunks = count_conflict_hunks(full.read_text(errors="replace")) if full.is_file() else 0
@@ -180,8 +193,10 @@ def preflight(repo: Path, branch: str) -> list[str]:
 
 
 def make_plan(repo: Path, state: dict, remote: str, head: str) -> SyncPlan:
+    """``merged_into_main`` in the state file is sticky: once true (recorded by a sync, or set by hand
+    after a squash merge whose head never becomes an ancestor of main) the stack branch is not consulted."""
     stack = state["stack"]
-    stack_merged = is_ancestor(repo, stack["head"], f"{remote}/main")
+    stack_merged = bool(stack.get("merged_into_main")) or is_ancestor(repo, stack["head"], f"{remote}/main")
     base_ref = choose_base(remote, "main", stack["branch"], stack_merged)
     base_commit = git(repo, "rev-parse", base_ref)
     up_to_date = is_ancestor(repo, base_commit, head)
@@ -260,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     if integrate(repo, plan, args.rebase) != 0:
         files = tuple(git(repo, "diff", "--name-only", "--diff-filter=U").splitlines())
         fork_md = (repo / "FORK.md").read_text() if (repo / "FORK.md").is_file() else ""
-        print(conflict_report(repo, files, merge_base, plan.base_ref, fork_md))
+        print(conflict_report(repo, files, merge_base, plan.base_ref, fork_md, rebase=args.rebase))
         return EXIT_CONFLICT
 
     tests = "skipped"
