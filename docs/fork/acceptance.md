@@ -155,7 +155,7 @@ clients' own logs. Peak = 989 TFLOPS/GPU (H200 bf16), 8 training GPUs.
 | `tinker_mfu_bench.py` 128 x 8192 tokens/step | **36.8% MFU**, 93k tok/s, 11.3 s/step (5 units) | **40.2% MFU**, 102k tok/s, 10.3 s/step |
 | cookbook `math_rl` arithmetic async smoke (20 steps) | completes; 0.24 s train steps | not run |
 | cookbook `guess_number` async, 25 steps | **27% MFU** on ~370k-token steps (7-10 s train, ~60 s/step incl. sampling); lr 3e-5 (recipe default): eval 0.31 -> 0.65 at step 5 then oscillates 0.2-0.35 (alpha 64: collapses to 0.06); **lr 1e-5: eval 0.32 -> 0.40 -> 0.51 -> 0.58 -> 0.66 at step 20, train reward 0.74, KL ~0.002** | **lr 1e-6: eval 0.32 -> 0.44 -> 0.57 -> 0.70 (step 15) -> 0.66 (step 20), train reward up to 0.82, KL 0.001-0.01; 24-32% MFU, 6-10 s train steps** |
-| platoon textcraft synth (SDK 0.16.1, cispo, save every step) | 5 steps complete through the litellm->tinker proxy; 3 of 5 batches had reward variance and trained (73k tokens, 35% MFU); medium tasks mostly score 0 with the reduced rollout budget | see `runs/platoon-textcraft-full` |
+| platoon textcraft synth (SDK 0.16.1, cispo, save every step) | 5 steps complete through the litellm->tinker proxy; 3 of 5 batches had reward variance and trained (73k tokens, 35% MFU); medium tasks mostly score 0 with the reduced rollout budget | 5 steps complete (264 s, `CKPT_EVERY=5`); 2 batches trained on the base weights (117k and 92k tokens, 19-20% MFU on these small units), one batch reached task reward 0.31 |
 | Full-weight push fidelity (`--check-weight-update-equal`: poison engines, push, compare) | n/a | all 8 engines `Success` |
 
 Notes:
