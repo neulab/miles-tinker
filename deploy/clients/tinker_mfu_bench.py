@@ -75,6 +75,18 @@ def resolve_base_url(args) -> str:
     return os.environ["TINKER_BASE_URL"]
 
 
+def unload_model(base_url: str, model_id: str) -> None:
+    """POST /api/v1/unload_model with this client's API key (a gateway route without an SDK method)."""
+    import httpx
+
+    httpx.post(
+        f"{base_url.rstrip('/')}/api/v1/unload_model",
+        json={"model_id": model_id},
+        headers={"X-API-Key": os.environ["TINKER_API_KEY"]},
+        timeout=120,
+    ).raise_for_status()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint-file")
@@ -87,10 +99,13 @@ def main() -> None:
     parser.add_argument("--loss-fn", default="importance_sampling", choices=["importance_sampling", "cross_entropy"])
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--perf-jsonl")
+    parser.add_argument("--keep-model", action="store_true", help="leave the model loaded at exit")
     args = parser.parse_args()
+    base_url = resolve_base_url(args)
 
-    service = tinker.ServiceClient(base_url=resolve_base_url(args))
+    service = tinker.ServiceClient(base_url=base_url)
     training = service.create_lora_training_client(base_model=args.base_model, rank=args.lora_rank)
+    model_id = training.get_info().model_id
     datums = build_datums(args.num_datums, args.seq_len, args.loss_fn)
     tokens_per_step = args.num_datums * args.seq_len
     adam = types.AdamParams(learning_rate=args.learning_rate)
@@ -118,6 +133,8 @@ def main() -> None:
         print(f"  fwdbwd metrics: { {k: round(v, 4) for k, v in (fb_result.metrics or {}).items()} }")
         for record in perf_records_since(perf_path, started):
             print(f"  perf.jsonl: {json.dumps(record)}")
+    if not args.keep_model:
+        unload_model(base_url, model_id)
 
 
 if __name__ == "__main__":

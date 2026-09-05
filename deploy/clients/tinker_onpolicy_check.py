@@ -76,6 +76,18 @@ def training_datums(tokenizer, seq_len: int = 512, count: int = 32, seed: int = 
     return datums
 
 
+def unload_model(base_url: str, model_id: str) -> None:
+    """POST /api/v1/unload_model with this client's API key (a gateway route without an SDK method)."""
+    import httpx
+
+    httpx.post(
+        f"{base_url.rstrip('/')}/api/v1/unload_model",
+        json={"model_id": model_id},
+        headers={"X-API-Key": os.environ["TINKER_API_KEY"]},
+        timeout=120,
+    ).raise_for_status()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint-file")
@@ -86,11 +98,14 @@ def main() -> int:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--keep-model", action="store_true", help="leave the model loaded at exit (default: unload so single-tenant gateways free the slot)")
     args = parser.parse_args()
+    base_url = resolve_base_url(args)
 
-    service = tinker.ServiceClient(base_url=resolve_base_url(args))
+    service = tinker.ServiceClient(base_url=base_url)
     training = service.create_lora_training_client(base_model=args.base_model, rank=args.lora_rank)
     tokenizer = training.get_tokenizer()
+    model_id = training.get_info().model_id
 
     datums = training_datums(tokenizer)
     adam = types.AdamParams(learning_rate=args.learning_rate)
@@ -138,6 +153,8 @@ def main() -> int:
     )
     verdict = "PASS" if np.abs(all_delta).mean() < 0.02 and kl_est < 0.005 else "FAIL"
     print(f"{verdict}: sampler and trainer agree at the same version" if verdict == "PASS" else f"{verdict}: systematic sampler/trainer gap")
+    if not args.keep_model:
+        unload_model(base_url, model_id)
     return 0 if verdict == "PASS" else 1
 
 
