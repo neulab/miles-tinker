@@ -102,6 +102,7 @@ class TestBuildTrainData:
         assert train_data["tokens"] == [[1, 2, 3], [4, 5], PAD_ROW["tokens"], PAD_ROW["tokens"]]
         assert train_data["response_lengths"] == [2, 1, 1, 1]
         assert train_data["loss_weights"] == [[1.0, 1.0], [1.0], [0.0], [0.0]]
+        assert train_data["loss_masks"] == [[1, 1], [1], [0], [0]], "pad rows are masked out under every loss"
         assert train_data["adapter_slots"] == [3, 5, 3, 3], "pad rows ride on the first real row's slot"
         assert train_data["sample_indices"] == [0, 1, 2, 3]
 

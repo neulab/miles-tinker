@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 # internal row key -> trainer batch key
 ROW_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
 
-# Units are padded to a multiple of dp_size with rows that contribute nothing
-# (weight/advantage 0); their outputs are stripped before leaving the backend.
+# Units are padded to a multiple of dp_size with rows that contribute nothing:
+# weight/advantage 0 and an all-zero loss mask (every Tinker loss drops such a
+# datum, tinker_losses._finish); their outputs are stripped before leaving the backend.
 PAD_TOKEN_ID = 0
 PAD_ROW = {
     "tokens": [PAD_TOKEN_ID, PAD_TOKEN_ID],
@@ -36,6 +37,7 @@ PAD_ROW = {
     "weights": [0.0],
     "advantages": [0.0],
     "sampling_logprobs": [0.0],
+    "pad": True,
 }
 PERF_LOG_NAME = "perf.jsonl"
 
@@ -213,7 +215,7 @@ def _build_train_data(slot_rows: list, *, dp_size: int = 1, with_adapter_slots: 
     rows = [row for _, row in padded]
     train_data = {
         "tokens": [row["tokens"] for row in rows],
-        "loss_masks": [[1] * row["target_len"] for row in rows],
+        "loss_masks": [[0 if row.get("pad") else 1] * row["target_len"] for row in rows],
         "response_lengths": [row["target_len"] for row in rows],
         "total_lengths": [len(row["tokens"]) for row in rows],
         "sample_indices": list(range(len(rows))),

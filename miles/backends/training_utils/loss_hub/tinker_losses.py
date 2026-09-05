@@ -72,12 +72,23 @@ def _like(values, reference: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(values, dtype=reference.dtype, device=reference.device)
 
 
+def _drop_masked_out(batch: RolloutBatch, per_sample_loss: list[torch.Tensor]) -> list[torch.Tensor]:
+    """A datum whose loss mask is all zero (the runtime's DP padding rows) contributes
+    nothing under any loss, including terms that do not go through weights/advantages
+    (the DRO divergence penalty)."""
+    masks = batch.get("loss_masks")
+    if masks is None or not per_sample_loss:
+        return per_sample_loss
+    return [loss * mask.any() for loss, mask in zip(per_sample_loss, masks, strict=True)]
+
+
 def _finish(
     batch: RolloutBatch,
     logits: torch.Tensor,
     log_probs: list[torch.Tensor],
     per_sample_loss: list[torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    per_sample_loss = _drop_masked_out(batch, per_sample_loss)
     if per_sample_loss:
         loss = torch.stack(per_sample_loss).sum()
     else:
