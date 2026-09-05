@@ -413,10 +413,17 @@ class TrainerController:
     async def unload_slot(self, slot: int) -> None:
         await self._execute_slots("unload_slot", slot=slot)
 
-    async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> None:
+    async def discard_grads(self, slot: int) -> None:
+        await self._execute_slots("discard_grads", slot=slot)
+
+    async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> int | None:
+        """Publish a slot to the engines; answers the engine weight version (full fine-tuning) or None (LoRA)."""
         info = await self._inference_controller.start_update_weights()
-        await self._execute_slots("push_slot", info=info, slot=slot, lora_name=lora_name, rank=rank, alpha=alpha)
+        versions = await self._execute_slots(
+            "push_slot", info=info, slot=slot, lora_name=lora_name, rank=rank, alpha=alpha
+        )
         await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        return versions[0]
 
     async def unload_adapter(self, lora_name: str) -> None:
         info = await self._inference_controller.start_update_weights()

@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
+from miles.backends.megatron_utils.full import executor as full_executor
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
 from miles.backends.megatron_utils.lora import executor as lora_executor
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
@@ -403,24 +404,39 @@ class MegatronTrainRayActor(TrainRayActor):
                 fp32_output=False,
             )
 
+    # ------------------------ Tinker slot commands ------------------------
+    # Dispatch on --tinker-train-mode: "lora" trains multi-LoRA slots, "full"
+    # trains the base weights as slot 0 (single tenant).
+
+    def _tinker_full_mode(self) -> bool:
+        mode = getattr(self.args, "tinker_train_mode", "lora")
+        if mode == "full":
+            assert not self.args.multi_lora, "--tinker-train-mode full is exclusive with --multi-lora-n-adapters"
+            return True
+        assert self.args.multi_lora, "Tinker LoRA commands need --multi-lora-n-adapters > 0"
+        return False
+
     @with_logs
     def forward_backward(self, unit_id: int, rollout_data_ref: Box) -> dict:
-        assert self.args.multi_lora, "forward_backward is a multi-LoRA slot command"
+        executor = full_executor if self._tinker_full_mode() else lora_executor
         self._heartbeat.bump()
         with ExitStack() as stack:
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
             stack.enter_context(store_get_result)
-            return lora_executor.forward_backward(self.args, unit_id, self.model, self.optimizer, rollout_data)
+            return executor.forward_backward(self.args, unit_id, self.model, self.optimizer, rollout_data)
 
     @with_logs
-    def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, float]:
-        assert self.args.multi_lora, "optim_step is a multi-LoRA slot command"
+    def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
+        """Per stepped slot a metrics dict (grad_norm, skipped, lr, perf/actor_train_*)."""
         self._heartbeat.bump()
-        return lora_executor.optim_step(self.model, self.optimizer, adam_params_by_slot)
+        if not self._tinker_full_mode():
+            return lora_executor.optim_step(self.args, self.model, self.optimizer, adam_params_by_slot)
+        assert set(adam_params_by_slot) == {0}, f"full fine-tuning steps slot 0 only, got {set(adam_params_by_slot)}"
+        return {0: full_executor.optim_step(self.args, self.model, self.optimizer, adam_params_by_slot[0])}
 
     @with_logs
     def forward_only_logprobs(self, unit_id: int, rollout_data_ref: Box) -> Box | None:
-        assert self.args.multi_lora, "forward_only_logprobs is a multi-LoRA slot command"
+        self._tinker_full_mode()
         self._heartbeat.bump()
         with ExitStack() as stack:
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
@@ -442,20 +458,41 @@ class MegatronTrainRayActor(TrainRayActor):
     def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> None:
-        assert self.args.multi_lora, "load_slot is a multi-LoRA slot command"
+        """LoRA: init the slot's adapter (rank/alpha) and optionally restore a checkpoint. Full
+        fine-tuning: rank/alpha are ignored; ckpt_path None resets slot 0 to the pristine base."""
+        if self._tinker_full_mode():
+            assert slot == 0, f"full fine-tuning serves slot 0 only, got {slot}"
+            if ckpt_path is None:
+                full_executor.reset_to_base(self.args, self.model, self.optimizer)
+            else:
+                full_executor.load_state(self.args, self.model, self.optimizer, ckpt_path, load_optimizer)
+            return
         lora_executor.load_slot(self.model, self.optimizer, slot, rank, alpha)
         if ckpt_path is not None:
             lora_checkpoint.load_slot(self.model, self.optimizer, slot, ckpt_path, load_optimizer)
 
     @with_logs
     def save_slot(self, slot: int, path: str) -> None:
-        assert self.args.multi_lora, "save_slot is a multi-LoRA slot command"
-        lora_checkpoint.save_slot(self.model, self.optimizer, slot, path)
+        if self._tinker_full_mode():
+            full_executor.save_state(self.args, self.model, self.optimizer, path)
+        else:
+            lora_checkpoint.save_slot(self.model, self.optimizer, slot, path)
 
     @with_logs
     def unload_slot(self, slot: int) -> None:
-        assert self.args.multi_lora, "unload_slot is a multi-LoRA slot command"
-        lora_executor.unload_slot(self.model, self.optimizer, slot)
+        if self._tinker_full_mode():
+            full_executor.discard_grads(self.model, self.optimizer)
+        else:
+            lora_executor.unload_slot(self.model, self.optimizer, slot)
+
+    @with_logs
+    def discard_grads(self, slot: int) -> None:
+        """Zero a slot's accumulated gradients (poisoned optim window)."""
+        self._heartbeat.bump()
+        if self._tinker_full_mode():
+            full_executor.discard_grads(self.model, self.optimizer)
+        else:
+            lora_executor.discard_grads(self.model, slot)
 
     @with_logs
     @event_logger_context(
@@ -776,17 +813,21 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @with_logs
-    def push_slot(self, info: "UpdatableEngines", slot: int, lora_name: str, rank: int, alpha: float) -> None:
-        assert self.args.multi_lora, "push_slot is a multi-LoRA slot command"
+    def push_slot(self, info: "UpdatableEngines", slot: int, lora_name: str, rank: int, alpha: float) -> int | None:
+        """LoRA: push the slot's adapter under ``lora_name`` (versioned, no base version bump) and
+        answer None. Full fine-tuning: a full base weight sync; answers the new engine weight version."""
+        if self._tinker_full_mode():
+            return self.update_weights(info)
         self._heartbeat.bump()
         self._ensure_engines_connected(
             info.rollout_engines, info.snapshot_cell_id_to_hashes, info.engine_gpu_counts, info.engine_gpu_offsets
         )
         self.weight_updater.push_adapter(lora_name, AdapterSpec(slot=slot, rank=rank, alpha=alpha))
+        return None
 
     @with_logs
     def unload_adapter(self, info: "UpdatableEngines", lora_name: str) -> None:
-        assert self.args.multi_lora, "unload_adapter is a multi-LoRA slot command"
+        assert not self._tinker_full_mode(), "unload_adapter is a LoRA-only command"
         self._heartbeat.bump()
         if dist.get_rank() == 0:
             async_utils.wait_futures(

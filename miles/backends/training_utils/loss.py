@@ -197,7 +197,9 @@ def loss_function(
     # Multi-LoRA: samples enter the gradient buffers with weight 1; per-adapter
     # normalization (1/adapter_global_batch_size, a constant known in advance)
     # is applied to the accumulated slot gradient at optimizer-step time.
-    if is_multi_lora_enabled(args):
+    # Tinker units (batch carries loss_fn) are exact sums over datums in every
+    # mode: normalization is the client's, via weights/advantages.
+    if is_multi_lora_enabled(args) or batch.get("loss_fn") is not None:
         global_batch_size = 1
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
