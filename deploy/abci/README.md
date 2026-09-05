@@ -141,7 +141,7 @@ accepts and ignores `lora_config` (`lora_rank` on the client is a no-op) and
 | Launcher / head / worker logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head,ray-worker}.log`, `container_args.txt`, `worker.sh`, `nodes.tsv` |
 | PBS stdout/err | `/home/aci18912it/miles-tinker/logs/<jobname>.o<jobid>` |
 | Ray session logs (node-local, gone with the job) | `/local/<jobid>/miles/tmp/ray/session_latest/logs` |
-| miles perf metrics (`perf/actor_train_mfu` ...) | `head.log` lines `perf <step>: {...}`; wandb offline dir `$PROJECT_ROOT/jobs/<RUN_NAME>/wandb` when `WANDB_MODE=offline` |
+| Gateway MFU / step metrics (`actor_train_mfu`, `num_tokens` ... per `optim_step`) | `$PROJECT_ROOT/checkpoints/<RUN_NAME>/perf.jsonl` (one line per slot per optim window), the same records as `tinker perf: {...}` lines in `head.log`, and the client's `metrics.jsonl` (`docs/fork/acceptance.md` section C) |
 | Client logs | the `log_path` you pass: cookbook `metrics.jsonl`, `checkpoints.jsonl`; platoon `<log_path>/<experiment>/<trial>/` |
 
 ## 6. Stop, restart, troubleshoot
