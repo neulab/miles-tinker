@@ -141,3 +141,32 @@ For each of the four combinations (A/B x lora/full) keep: the job id and
 `perf.jsonl`, the MFU summary above, and the pass-criteria checklist. Put
 them under `$P/runs/<name>/ACCEPTANCE.md`; do not commit run artifacts to the
 repo.
+
+## D. Measured results (2026-09-06, hnode019 trainer + hnode0xx engines)
+
+All numbers come from `<checkpoint_root>/perf.jsonl` / `OptimStepResponse.metrics`
+(server-side `actor_train` window: forward + backward + optimizer step) and the
+clients' own logs. Peak = 989 TFLOPS/GPU (H200 bf16), 8 training GPUs.
+
+| Check | LoRA gateway (rank 32, alpha 32) | Full fine-tuning gateway |
+|---|---|---|
+| `tinker_sdk_smoke.py` (SDK 0.27.1: train, unnamed + named saves, resume with optimizer, stop ids/strings) | all PASS | all PASS (`--unload-before-resume`, single tenant) |
+| `tinker_onpolicy_check.py` (sampler vs trainer at the same version) | mean abs delta 0.015 nats, KL 0.0013 | 0.012 nats, KL 0.0013 (after the retract fix; `in_place` pausing gave 0.065 nats from stale prefix-cache KV) |
+| `tinker_mfu_bench.py` 128 x 8192 tokens/step | **36.8% MFU**, 93k tok/s, 11.3 s/step (5 units) | **40.2% MFU**, 102k tok/s, 10.3 s/step |
+| cookbook `math_rl` arithmetic async smoke (20 steps) | completes; 0.24 s train steps | not run |
+| cookbook `guess_number` async, 25 steps | **27% MFU** on ~370k-token steps (7-10 s train, ~60 s/step incl. sampling); lr 3e-5 (recipe default): eval 0.31 -> 0.65 at step 5 then oscillates 0.2-0.35 (alpha 64: collapses to 0.06); **lr 1e-5: eval 0.32 -> 0.40 -> 0.51 -> 0.58 -> 0.66 at step 20, train reward 0.74, KL ~0.002** | see the run log `runs/guess-number-full` (lr 1e-6) |
+| platoon textcraft synth (SDK 0.16.1, cispo, save every step) | 5 steps complete through the litellm->tinker proxy; 3 of 5 batches had reward variance and trained (73k tokens, 35% MFU); medium tasks mostly score 0 with the reduced rollout budget | see `runs/platoon-textcraft-full` |
+| Full-weight push fidelity (`--check-weight-update-equal`: poison engines, push, compare) | n/a | all 8 engines `Success` |
+
+Notes:
+- The recipe's `test/env/all/reward/total >= 0.8 by step 20` figure is for its default
+  model `Qwen/Qwen3.5-4B`; on Qwen3-4B-Instruct-2507 the LoRA rate has to drop to 1e-5
+  (Tinker's fixed alpha of 32 is what `hyperparam_utils` assumes; alpha 64 doubles the
+  effective rate). The gateway is not the limiting factor: the on-policy probe shows the
+  sampler and trainer agree, and the loss/optimizer semantics are Tinker's raw token sums.
+- Full fine-tuning must push with `--pause-generation-mode retract` (enforced by the serve
+  validation): a base-weight push invalidates every cached KV entry and `in_place` keeps
+  the radix cache. LoRA pushes are keyed by adapter name and may keep it.
+- Slots: finished SDK 0.27.1 clients do not send SESSION_END (only fatal errors do), so a
+  slot is reclaimed after the 600 s lease; `POST /api/v1/unload_model` with the tenant's
+  `X-API-Key` frees it immediately. The launcher serves 8 LoRA slots by default.

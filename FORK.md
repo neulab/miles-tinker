@@ -67,7 +67,7 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
 | `miles/tinker/runtime.py` (MilesBackend) | dp padding of units and output stripping; FFT `train_data` without `adapter_slots`; optim_step metrics passthrough and `<checkpoint_root>/perf.jsonl` (per-slot MFU records) | yes |
 | `serve_tinker.py` | `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode | yes |
-| `miles/utils/arguments.py` | the `--tinker-*` flags above | yes |
+| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA) | yes |
 | `miles/utils/train_metric_utils.py`, `miles/utils/timer.py`, `miles/utils/flops_utils.py` | only if needed for per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`) | yes |
 | `tests/fast/tinker/test_runtime.py`, `tests/fast/tinker/test_full_executor.py`, `tests/fast/backends/` | padding, FFT executor and metrics tests | yes |
 

@@ -124,3 +124,14 @@ gateway's mode (`UserInputError`).
   (~0.1-0.2 s) plus Adam on 0.5 B params per rank.
 - `--tinker-train-mode full` rejects `--multi-lora-n-adapters` and
   `--lora-rank`; the launcher's `full` mode emits none of the LoRA flags.
+
+## Prefix cache and weight pushes
+
+A full-weight push invalidates every KV entry SGLang cached under the previous
+weights, and full mode sends no `lora_path`, so radix-cache keys do not change
+between versions. The serve validation therefore forces
+`--pause-generation-mode retract` (miles' default) in full mode: engines drop
+their cache during the push and re-prefill in-flight requests. `in_place`
+pausing is only sound for LoRA adapter pushes, whose cache keys include the
+adapter name. (A possible follow-up is a per-version `cache_salt` on
+`/generate`, which would make `in_place` safe for full mode too.)
