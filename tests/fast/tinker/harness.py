@@ -1,6 +1,7 @@
 """Shared fakes for the tinker gateway suite."""
 
 import asyncio
+import tempfile
 
 from miles.tinker.core.promise import PENDING, Promise
 from miles.tinker.core.service import ExecutorBackend, TinkerService
@@ -18,11 +19,15 @@ ADAM = {
 
 class FakeBackend(ExecutorBackend):
     """Records every call; returns deterministic shapes. Set ``fail_next`` to
-    make the next backend call raise it."""
+    make the next backend call raise it. ``full`` mimics the FFT executor:
+    push_slot returns a growing engine weight version."""
 
-    def __init__(self) -> None:
+    def __init__(self, full: bool = False) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.fail_next: Exception | None = None
+        self.full = full
+        self.weight_version = 0
+        self.warmed_up = False
 
     def _record(self, name: str, **kwargs) -> None:
         self.calls.append((name, kwargs))
@@ -55,13 +60,30 @@ class FakeBackend(ExecutorBackend):
 
     async def optim_step(self, adam_params_by_slot):
         self._record("optim_step", adam_params_by_slot=adam_params_by_slot)
-        return {slot: 0.5 + slot for slot in adam_params_by_slot}
+        return {
+            slot: {"grad_norm": 0.5 + slot, "skipped": 0, "lr": params["learning_rate"], "num_units": 1}
+            for slot, params in adam_params_by_slot.items()
+        }
+
+    async def discard_grads(self, slot):
+        self._record("discard_grads", slot=slot)
 
     async def save_slot(self, slot, path):
         self._record("save_slot", slot=slot, path=path)
 
     async def push_slot(self, slot, lora_name, rank, alpha):
         self._record("push_slot", slot=slot, lora_name=lora_name, rank=rank, alpha=alpha)
+        if not self.full:
+            return None
+        self.weight_version += 1
+        return self.weight_version
+
+    async def unload_adapter(self, lora_name):
+        self._record("unload_adapter", lora_name=lora_name)
+
+    async def warmup(self):
+        self._record("warmup")
+        self.warmed_up = True
 
     async def sample(self, payload, lora_name):
         self._record("sample", payload=payload, lora_name=lora_name)
@@ -74,12 +96,13 @@ class FakeBackend(ExecutorBackend):
 
 
 def make_config(**overrides) -> GatewayConfig:
-    defaults = dict(base_model="base", n_slots=2, checkpoint_root="/tmp/tinker-test")
+    defaults = dict(base_model="base", n_slots=2, checkpoint_root=tempfile.mkdtemp(prefix="tinker-test-"))
     return GatewayConfig(**{**defaults, **overrides})
 
 
 def make_service(**config_overrides) -> TinkerService:
-    return TinkerService(FakeBackend(), make_config(**config_overrides))
+    config = make_config(**config_overrides)
+    return TinkerService(FakeBackend(full=not config.is_lora), config)
 
 
 def row(tokens: int = 3) -> dict:
@@ -96,8 +119,12 @@ def command(model_id: str, seq_id: int, kind: str, payload: dict, arrival: int) 
     )
 
 
-async def created_model(service: TinkerService, tenant: str = "tenant") -> str:
-    _, model_id = service.create_model(tenant, {"base_model": service.config.base_model, "lora_config": {"rank": 8}})
+def create_model_payload(service: TinkerService, **extra) -> dict:
+    return {"base_model": service.config.base_model, "lora_config": {"rank": 8}, **extra}
+
+
+async def created_model(service: TinkerService, tenant: str = "tenant", **extra) -> str:
+    _, model_id = service.create_model(tenant, create_model_payload(service, **extra))
     await asyncio.sleep(0.01)  # let the slot-init task run against the fake backend
     return model_id
 

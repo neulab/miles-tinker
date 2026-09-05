@@ -2,10 +2,11 @@
 
 The HTTP side reads, the execution side writes; this is the only interface
 between the two worlds. Promises live in memory: a gateway restart answers
-410 and the SDK resubmits the original request, which the stream dedup makes
-safe.
+410, which the SDK treats as a retryable "promise expired" for sampling and
+as fatal for training (the stream dedup makes a resubmit safe either way).
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ class Promise:
     error_category: str | None = None
     finished_at: float | None = None
     created_at: float = field(default_factory=time.monotonic)
+    settled: asyncio.Event = field(default_factory=asyncio.Event)  # long-poll wake-up
 
 
 class PromiseStore:
@@ -46,6 +48,7 @@ class PromiseStore:
         promise.state = DONE
         promise.result = result
         promise.finished_at = time.monotonic()
+        promise.settled.set()
 
     def fail(self, request_id: str, error: str, category: str) -> None:
         promise = self._promises[request_id]
@@ -53,10 +56,10 @@ class PromiseStore:
         promise.error = error
         promise.error_category = category
         promise.finished_at = time.monotonic()
+        promise.settled.set()
 
     def get(self, request_id: str, tenant: str) -> Promise | None:
-        """None means unknown/expired: the HTTP layer answers 410 and the SDK
-        resubmits the original request."""
+        """None means unknown/expired: the HTTP layer answers 410."""
         self._sweep()
         promise = self._promises.get(request_id)
         if promise is None:
