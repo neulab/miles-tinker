@@ -10,7 +10,7 @@ JSON floats. The schema ships with the tinker pip package.
 import numpy as np
 
 from miles.tinker.core.types import UserInputError
-from miles.tinker.server.encoding import build_row
+from miles.tinker.server.encoding import build_row, forward_backward_metrics
 from tinker.proto import tinker_public_pb2 as public_pb
 
 PROTO_CONTENT_TYPE = "application/x-protobuf"
@@ -54,9 +54,18 @@ def decode_forward_backward_request(body: bytes) -> tuple[str, dict]:
         "seq_id": message.seq_id,
         "rows": rows,
         "loss_fn": message.loss_fn,
-        "loss_fn_config": dict(message.loss_fn_config),
+        "loss_fn_config": _decode_loss_fn_config(message),
     }
     return ("forward_only" if message.forward_only else "forward_backward"), decoded
+
+
+def _decode_loss_fn_config(message) -> dict:
+    """The SDK dual-writes numbers into the legacy map and everything (numbers
+    and strings) into loss_fn_config_v2; v2 wins where both are present."""
+    config = dict(message.loss_fn_config)
+    for key, value in message.loss_fn_config_v2.items():
+        config[key] = value.text if value.WhichOneof("value") == "text" else value.number
+    return config
 
 
 def _decode_tensor(name: str, tensor) -> list:
@@ -82,7 +91,8 @@ def encode_forward_backward_output(result: dict) -> bytes:
     message = public_pb.ForwardBackwardOutput()
     message.loss_fn_output_type = "ArrayRecord"
     outputs = result["outputs"]
-    message.metrics["loss:sum"] = float(sum(output["loss"] for output in outputs))
+    for name, value in forward_backward_metrics(outputs).items():
+        message.metrics[name] = value
 
     record = message.loss_fn_outputs.add()
     record.num_datums = len(outputs)

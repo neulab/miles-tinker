@@ -110,3 +110,29 @@ def test_the_sdk_parses_our_sample_response():
     assert (list(sequence.tokens), sequence.stop_reason) == ([5, 6], "length")
     assert list(sequence.logprobs) == pytest.approx([-0.5, -0.6])
     assert list(parsed.prompt_logprobs) == pytest.approx([-1.0, -2.0])
+
+
+def test_string_loss_fn_config_comes_from_the_v2_map():
+    datum = types.Datum(
+        model_input=types.ModelInput.from_ints(TOKENS[:-1]), loss_fn_inputs={"target_tokens": TOKENS[1:]}
+    )
+    request = types.ForwardBackwardRequest(
+        model_id="model-x",
+        seq_id=1,
+        forward_backward_input=types.ForwardBackwardInput(
+            data=[datum], loss_fn="cispo", loss_fn_config={"mode": "ratio", "clip_low_threshold": 0.8}
+        ),
+    )
+    _, decoded = decode_forward_backward_request(forward_backward_request_to_proto(request).SerializeToString())
+    assert decoded["loss_fn_config"] == {"mode": "ratio", "clip_low_threshold": 0.8}
+
+
+def test_our_forward_backward_metrics_carry_token_and_datum_counts():
+    encoded = encode_forward_backward_output(
+        {
+            "kind": "forward_backward",
+            "outputs": [{"loss": 1.0, "logprobs": [-0.1, -0.2]}, {"loss": 1.0, "logprobs": [-0.3]}],
+        }
+    )
+    parsed = deserialize_forward_backward_output(encoded)
+    assert parsed.metrics == {"loss:sum": 2.0, "num_tokens:sum": 3.0, "num_datums:sum": 2.0}
