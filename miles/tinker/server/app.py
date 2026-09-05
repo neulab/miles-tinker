@@ -189,6 +189,7 @@ def build_app(service: TinkerService) -> FastAPI:
                 return JSONResponse(
                     status_code=408, content={"type": "try_again", "request_id": request_id, "queue_state": "active"}
                 )
+        service.promises.delivered(promise)
         if promise.state == FAILED:
             return JSONResponse({"error": promise.error, "category": promise.error_category})
         encoder = PROTO_ENCODERS.get(promise.result["kind"])

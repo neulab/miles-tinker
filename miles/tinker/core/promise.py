@@ -17,7 +17,11 @@ PENDING = "pending"
 DONE = "done"
 FAILED = "failed"
 
-_FINISHED_TTL_S = 3600.0
+_FINISHED_TTL_S = 3600.0  # an undelivered result waits this long for its poller
+# A delivered result only serves a retry of a lost response, so it leaves much sooner:
+# at hundreds of samples per second an hour of results is GBs of heap, and every full
+# GC pass and expiry sweep walks all of it (1 s and 0.2 s per million results).
+_DELIVERED_TTL_S = 60.0
 _SWEEP_INTERVAL_S = 60.0  # full expiry pass; the polled promise itself is always checked
 
 
@@ -31,6 +35,7 @@ class Promise:
     error: str | None = None
     error_category: str | None = None
     finished_at: float | None = None
+    delivered_at: float | None = None  # first time the result left through the HTTP layer
     created_at: float = field(default_factory=time.monotonic)
     settled: asyncio.Event = field(default_factory=asyncio.Event)  # long-poll wake-up
 
@@ -60,6 +65,11 @@ class PromiseStore:
         promise.finished_at = time.monotonic()
         promise.settled.set()
 
+    def delivered(self, promise: Promise) -> None:
+        """The settled result reached its poller; the promise now expires on the short TTL."""
+        if promise.delivered_at is None:
+            promise.delivered_at = time.monotonic()
+
     def get(self, request_id: str, tenant: str) -> Promise | None:
         """None means unknown/expired: the HTTP layer answers 410."""
         self._sweep()
@@ -83,4 +93,6 @@ class PromiseStore:
 
 
 def _expired(promise: Promise, now: float) -> bool:
+    if promise.delivered_at is not None and now - promise.delivered_at > _DELIVERED_TTL_S:
+        return True
     return promise.finished_at is not None and now - promise.finished_at > _FINISHED_TTL_S
