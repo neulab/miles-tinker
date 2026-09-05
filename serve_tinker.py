@@ -3,6 +3,11 @@ import logging
 
 import uvicorn
 
+try:
+    import uvloop
+except ImportError:  # optional: the sglang image ships it, a bare miles install may not
+    uvloop = None
+
 from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.train.group import TrainerController
 from miles.ray.wiring import launch_worker_manager
@@ -66,7 +71,16 @@ async def serve(args):
     service = TinkerService(backend, config)
 
     server = uvicorn.Server(
-        uvicorn.Config(build_app(service), host="0.0.0.0", port=args.tinker_server_port, log_level="info")
+        uvicorn.Config(
+            build_app(service),
+            host="0.0.0.0",
+            port=args.tinker_server_port,
+            log_level="info",
+            # one log line per request costs the loop 5-20% of its time at hundreds of requests per second
+            access_log=False,
+            # idle keep-alive sockets outlive a stall; at the 5 s default a slow GC pass drops them (SDK ReadError)
+            timeout_keep_alive=60,
+        )
     )
     logger.info(f"tinker gateway serving {config.base_model} on :{args.tinker_server_port}")
     await asyncio.gather(service.run(), server.serve())
@@ -77,4 +91,5 @@ if __name__ == "__main__":
     # commands ship one work unit at a time; its size is the batch size
     args.use_dynamic_global_batch_size = True
     args.delay_split_train_data_by_dp = True
-    asyncio.run(serve(args))
+    # one loop serves HTTP and drives the trainer; uvloop (with uvicorn's httptools) cuts its per-request cost by a quarter
+    (uvloop.run if uvloop is not None else asyncio.run)(serve(args))
