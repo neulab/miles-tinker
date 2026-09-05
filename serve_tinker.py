@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 async def serve(args):
-    assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
+    train_mode = args.tinker_train_mode
+    assert train_mode == "full" or args.multi_lora, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
     configure_logger(args, source=MainProcessIdentity())
 
     # no RolloutExecutor here; the gateway posts /generate itself
@@ -46,12 +47,21 @@ async def serve(args):
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
-        n_slots=args.multi_lora_n_adapters,
+        # full fine-tuning: one tenant, slot 0 is the base model
+        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
         checkpoint_root=checkpoint_root,
-        lora_alpha=args.lora_alpha,
+        lora_alpha=args.lora_alpha if train_mode == "lora" else None,
+        lease_timeout_s=args.tinker_lease_timeout_s,
+        unit_token_budget=args.tinker_unit_token_budget,
+        train_mode=train_mode,
+        retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
+        sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
+        coalesce_wait_s=args.tinker_coalesce_wait_s,
+        max_concurrent_samples=args.tinker_max_concurrent_samples,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-    service = TinkerService(MilesBackend(args, trainer, router_url), config)
+    backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)
+    service = TinkerService(backend, config)
 
     server = uvicorn.Server(
         uvicorn.Config(build_app(service), host="0.0.0.0", port=args.tinker_server_port, log_level="info")

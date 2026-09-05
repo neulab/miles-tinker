@@ -8,48 +8,89 @@ place allowed to import miles.ray / miles.backends.
 """
 
 import asyncio
+import json
+import logging
+import time
 import uuid
 from argparse import Namespace
+from pathlib import Path
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.service import ExecutorBackend
 from miles.tinker.core.types import UserInputError
 from miles.utils import object_store
 from miles.utils.http_utils import post
+from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
+
+logger = logging.getLogger(__name__)
 
 # internal row key -> trainer batch key
 ROW_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
 
+# Units are padded to a multiple of dp_size with rows that contribute nothing
+# (weight/advantage 0); their outputs are stripped before leaving the backend.
+PAD_TOKEN_ID = 0
+PAD_ROW = {
+    "tokens": [PAD_TOKEN_ID, PAD_TOKEN_ID],
+    "target_len": 1,
+    "weights": [0.0],
+    "advantages": [0.0],
+    "sampling_logprobs": [0.0],
+}
+PERF_LOG_NAME = "perf.jsonl"
+
 
 class MilesBackend(ExecutorBackend):
-    def __init__(self, args: Namespace, trainer, router_url: str) -> None:
+    def __init__(self, args: Namespace, trainer, router_url: str, inference_controller=None) -> None:
         self.args = args
         self.trainer = trainer
         self.router_url = router_url
+        self.inference_controller = inference_controller
+        self.train_mode = getattr(args, "tinker_train_mode", "lora")
+        self.dp_size = _actor_dp_size(args)
+        checkpoint_root = getattr(args, "tinker_checkpoint_root", None)
+        self.perf_log_path = Path(checkpoint_root) / PERF_LOG_NAME if checkpoint_root else None
+        # exact (unpadded) per-slot counts of the open optim window
+        self._window_counts: dict[int, dict[str, int]] = {}
+
+    async def warmup(self) -> None:
+        """Make the engines router-visible: a full base sync for full fine-tuning,
+        an empty update-weights round for LoRA (adapters are pushed per version)."""
+        if self.train_mode == "full":
+            await self.trainer.update_weights()
+            return
+        info = await self.inference_controller.start_update_weights()
+        await self.inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> None:
-        await self.trainer.load_slot(slot, rank, alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer)
+        # full fine-tuning: the actor ignores rank/alpha and maps ckpt_path None to reset_to_base
+        await self.trainer.load_slot(
+            slot=slot, rank=rank, alpha=alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer
+        )
 
     async def unload_slot(self, slot: int) -> None:
+        self._window_counts.pop(slot, None)
         await self.trainer.unload_slot(slot)
 
     async def forward_backward(self, unit_id: int, slot_rows: list, loss_fn: str, loss_fn_config: dict) -> list[dict]:
-        train_data = _build_train_data(slot_rows)
+        train_data = self._build_train_data(slot_rows)
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
         worker_results = await self._run_unit("forward_backward", unit_id, train_data)
+        self._note_window(slot_rows)
         by_index: dict[int, dict] = {}
         for result in worker_results:
             for item in result["per_datum"]:
                 index = int(item["sample_index"])
                 if index not in by_index:
                     by_index[index] = {"loss": float(item["loss"]), "logprobs": item["logprobs"].tolist()}
+        # padded rows sit past len(slot_rows) and are dropped here
         return [by_index[index] for index in range(len(slot_rows))]
 
     async def forward_only(self, unit_id: int, slot_rows: list, loss_fn: str, loss_fn_config: dict) -> list[dict]:
-        worker_results = await self._run_unit("forward_only_logprobs", unit_id, _build_train_data(slot_rows))
+        worker_results = await self._run_unit("forward_only_logprobs", unit_id, self._build_train_data(slot_rows))
         by_index: dict[int, dict] = {}
         for box in worker_results:
             if box is None:
@@ -60,15 +101,46 @@ class MilesBackend(ExecutorBackend):
                     by_index[index] = {"loss": 0.0, "logprobs": logprobs.tolist()}
         return [by_index[index] for index in range(len(slot_rows))]
 
-    async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, float]:
+    async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
         worker_results = await self.trainer.optim_step(adam_params_by_slot=adam_params_by_slot)
-        return worker_results[0]
+        metrics_by_slot = {}
+        for slot, metrics in worker_results[0].items():
+            counts = self._window_counts.pop(slot, _empty_window())
+            metrics_by_slot[slot] = {**metrics, **counts}
+            self._log_perf(slot, metrics_by_slot[slot])
+        return metrics_by_slot
+
+    async def discard_grads(self, slot: int) -> None:
+        self._window_counts.pop(slot, None)
+        await self.trainer.discard_grads(slot=slot)
 
     async def save_slot(self, slot: int, path: str) -> None:
         await self.trainer.save_slot(slot=slot, path=path)
 
-    async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> None:
-        await self.trainer.push_slot(slot=slot, lora_name=lora_name, rank=rank, alpha=alpha)
+    async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> int | None:
+        return await self.trainer.push_slot(slot=slot, lora_name=lora_name, rank=rank, alpha=alpha)
+
+    async def unload_adapter(self, lora_name: str) -> None:
+        await self.trainer.unload_adapter(lora_name=lora_name)
+
+    def _build_train_data(self, slot_rows: list) -> dict:
+        return _build_train_data(slot_rows, dp_size=self.dp_size, with_adapter_slots=self.train_mode != "full")
+
+    def _note_window(self, slot_rows: list) -> None:
+        touched = set()
+        for slot, row in slot_rows:
+            counts = self._window_counts.setdefault(slot, _empty_window())
+            counts["num_tokens"] += len(row["tokens"])
+            counts["num_datums"] += 1
+            if slot not in touched:
+                counts["num_units"] += 1
+                touched.add(slot)
+
+    def _log_perf(self, slot: int, metrics: dict) -> None:
+        record = {"time": time.time(), "slot": slot, **metrics}
+        logger.info(f"tinker perf: {json.dumps(record)}")
+        if self.perf_log_path is not None:
+            _append_json_line(self.perf_log_path, record)
 
     async def _run_unit(self, method: str, unit_id: int, train_data: dict) -> list:
         store = object_store.get_instance()
@@ -121,21 +193,49 @@ class MilesBackend(ExecutorBackend):
         return request
 
 
-def _build_train_data(slot_rows: list) -> dict:
-    rows = [row for _, row in slot_rows]
+def _actor_dp_size(args: Namespace) -> int:
+    """Trainer data-parallel size: every unit is split round-robin across it."""
+    actor_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    return max(1, actor_gpus // compute_megatron_world_size_except_dp(args))
+
+
+def _pad_slot_rows(slot_rows: list, dp_size: int) -> list:
+    """Append no-op rows so every DP rank gets the same number of rows (the
+    trainer schedules ``len(rows) // dp_size`` per rank and asserts one step)."""
+    assert slot_rows, "a unit carries at least one row"
+    pad_count = -len(slot_rows) % dp_size
+    pad_slot = slot_rows[0][0]
+    return [*slot_rows, *([(pad_slot, PAD_ROW)] * pad_count)]
+
+
+def _build_train_data(slot_rows: list, *, dp_size: int = 1, with_adapter_slots: bool = True) -> dict:
+    padded = _pad_slot_rows(slot_rows, dp_size)
+    rows = [row for _, row in padded]
     train_data = {
         "tokens": [row["tokens"] for row in rows],
         "loss_masks": [[1] * row["target_len"] for row in rows],
         "response_lengths": [row["target_len"] for row in rows],
         "total_lengths": [len(row["tokens"]) for row in rows],
         "sample_indices": list(range(len(rows))),
-        "adapter_slots": [slot for slot, _ in slot_rows],
         "dynamic_global_batch_size": len(rows),
     }
+    if with_adapter_slots:
+        train_data["adapter_slots"] = [slot for slot, _ in padded]
+    # optional keys follow the first (real) row; pad rows carry every key
     for row_key, batch_key in ROW_TO_BATCH_KEYS.items():
         if row_key in rows[0]:
             train_data[batch_key] = [row[row_key] for row in rows]
     return train_data
+
+
+def _empty_window() -> dict[str, int]:
+    return {"num_tokens": 0, "num_datums": 0, "num_units": 0}
+
+
+def _append_json_line(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def _box_get(box):
