@@ -19,7 +19,21 @@ def _request(params: dict, args: Namespace | None = None, **payload_extra) -> di
         "topk_prompt_logprobs": 0,
         **payload_extra,
     }
-    return MilesBackend(args or Namespace(), None, "http://router")._generate_request(payload, lora_name="m@1")
+    return MilesBackend(_args(args), None, "http://router")._generate_request(payload, lora_name="m@1")
+
+
+def _args(overrides: Namespace | None) -> Namespace:
+    """The topology the backend derives its DP size from, plus any test overrides."""
+    base = dict(
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=1,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        tinker_train_mode="lora",
+        tinker_checkpoint_root=None,
+    )
+    return Namespace(**{**base, **(vars(overrides) if overrides is not None else {})})
 
 
 def test_stop_tokens_stay_in_the_output():

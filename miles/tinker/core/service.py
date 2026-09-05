@@ -10,6 +10,7 @@ see a single totally ordered unit stream.
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -769,9 +770,17 @@ def _no_slot_message(config: GatewayConfig) -> str:
 
 
 def _plain_metrics(metrics) -> dict:
-    if isinstance(metrics, dict):
-        return {key: (float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()}
-    return {"grad_norm": float(metrics)}
+    """Wire-safe optim metrics: the SDK types them as dict[str, float] and JSON has
+    no NaN, so a vetoed step's non-finite grad norm becomes 0.0 (its ``skipped``
+    flag carries the meaning)."""
+    if not isinstance(metrics, dict):
+        metrics = {"grad_norm": metrics}
+    return {key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()}
+
+
+def _finite_float(value) -> float:
+    value = float(value)
+    return value if math.isfinite(value) else 0.0
 
 
 def sidecar_meta(record: ModelRecord, config: GatewayConfig, kind: str, name: str) -> dict:
