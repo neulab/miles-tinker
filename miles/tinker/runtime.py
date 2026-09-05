@@ -15,11 +15,12 @@ import uuid
 from argparse import Namespace
 from pathlib import Path
 
+import aiohttp
+
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.service import ExecutorBackend
 from miles.tinker.core.types import UserInputError
 from miles.utils import object_store
-from miles.utils.http_utils import post
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,9 @@ PAD_ROW = {
     "pad": True,
 }
 PERF_LOG_NAME = "perf.jsonl"
+# /generate retries mirror miles.utils.http_utils.post: a bounded count with a pause between attempts
+GENERATE_MAX_RETRIES = 3
+GENERATE_RETRY_PAUSE_S = 1.0
 
 
 class MilesBackend(ExecutorBackend):
@@ -54,6 +58,8 @@ class MilesBackend(ExecutorBackend):
         self.perf_log_path = Path(checkpoint_root) / PERF_LOG_NAME if checkpoint_root else None
         # exact (unpadded) per-slot counts of the open optim window
         self._window_counts: dict[int, dict[str, int]] = {}
+        # bound lazily to the serving loop; see _generate_session
+        self._generate_client: aiohttp.ClientSession | None = None
 
     async def warmup(self) -> None:
         """Make the engines router-visible: a full base sync for full fine-tuning,
@@ -165,9 +171,10 @@ class MilesBackend(ExecutorBackend):
 
     async def sample(self, payload: dict, lora_name: str | None) -> dict:
         request = self._generate_request(payload, lora_name)
+        session = self._generate_session()
         responses = await asyncio.gather(
             *[
-                post(f"{self.router_url}/generate", per_sample, max_retries=3)
+                post_generate(session, f"{self.router_url}/generate", per_sample)
                 for per_sample in _per_sample_requests(request, payload["num_samples"])
             ]
         )
@@ -177,6 +184,18 @@ class MilesBackend(ExecutorBackend):
         if payload["topk_prompt_logprobs"]:
             result["topk_prompt_logprobs"] = _topk_prompt_logprobs(responses[0], payload["topk_prompt_logprobs"])
         return result
+
+    def _generate_session(self) -> aiohttp.ClientSession:
+        """The /generate client. aiohttp rather than the shared httpx client of
+        miles.utils.http_utils: httpcore's pool rescans (and poll()s the socket of)
+        every pooled connection on each request event, which costs the gateway's
+        event loop 4-12 ms per sample and collapses throughput past ~100 in flight.
+        In-flight posts are bounded by the service's sample semaphore."""
+        if self._generate_client is None or self._generate_client.closed:
+            self._generate_client = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0), timeout=aiohttp.ClientTimeout(total=None)
+            )
+        return self._generate_client
 
     def _generate_request(self, payload: dict, lora_name: str | None) -> dict:
         params = payload["sampling_params"]
@@ -211,6 +230,23 @@ class MilesBackend(ExecutorBackend):
         if lora_name is not None:
             request["lora_path"] = lora_name
         return request
+
+
+async def post_generate(
+    session: aiohttp.ClientSession, url: str, payload: dict, max_retries: int = GENERATE_MAX_RETRIES
+) -> dict:
+    """POST one /generate body; transport and HTTP errors are retried like http_utils.post."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.post(url, json=payload) as response:
+                response.raise_for_status()
+                return await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            logger.info(f"Error: {error!r}, retrying... (attempt {attempt}/{max_retries}, url={url})")
+            if attempt >= max_retries:
+                raise
+            await asyncio.sleep(GENERATE_RETRY_PAUSE_S)
+    raise AssertionError("unreachable")
 
 
 def _clamp_max_new_tokens(max_tokens: int, prompt_len: int, context_len: int | None) -> int:

@@ -4,10 +4,18 @@ context clamping, abort as a failure)."""
 
 from argparse import Namespace
 
+import aiohttp
 import pytest
+from aiohttp import web
 
 from miles.tinker.core.types import UserInputError
-from miles.tinker.runtime import MilesBackend, _clamp_max_new_tokens, _per_sample_requests, _to_sequence
+from miles.tinker.runtime import (
+    GENERATE_MAX_RETRIES,
+    MilesBackend,
+    _clamp_max_new_tokens,
+    _per_sample_requests,
+    _to_sequence,
+)
 
 
 def _request(params: dict, args: Namespace | None = None, **payload_extra) -> dict:
@@ -74,14 +82,14 @@ def test_an_aborted_generation_is_a_failure_not_a_stop():
         _to_sequence(response)
 
 
-async def test_sample_posts_once_per_sample_with_bounded_retries(monkeypatch):
+async def test_sample_posts_once_per_sample(monkeypatch):
     posted = []
 
-    async def fake_post(url, payload, max_retries=60, **kwargs):
+    async def fake_post(session, url, payload, max_retries=GENERATE_MAX_RETRIES):
         posted.append((url, payload, max_retries))
         return {"meta_info": {"output_token_logprobs": [(-0.1, 5)], "finish_reason": {"type": "stop"}}}
 
-    monkeypatch.setattr("miles.tinker.runtime.post", fake_post)
+    monkeypatch.setattr("miles.tinker.runtime.post_generate", fake_post)
     backend = MilesBackend(_args(None), None, "http://router")
     payload = {
         "prompt_tokens": [1],
@@ -91,6 +99,52 @@ async def test_sample_posts_once_per_sample_with_bounded_retries(monkeypatch):
         "topk_prompt_logprobs": 0,
     }
     result = await backend.sample(payload, lora_name=None)
+    await backend._generate_client.close()
     assert len(result["sequences"]) == 2
-    assert [entry[2] for entry in posted] == [3, 3]
+    assert [entry[0] for entry in posted] == ["http://router/generate"] * 2
     assert [entry[1]["sampling_params"]["sampling_seed"] for entry in posted] == [7, 8]
+
+
+@pytest.fixture
+async def flaky_router():
+    """A /generate that answers 503 to its first ``failures`` calls, then a one-token sequence."""
+    state = {"failures": 1, "calls": 0}
+
+    async def generate(request):
+        state["calls"] += 1
+        if state["calls"] <= state["failures"]:
+            return web.Response(status=503, text="engine busy")
+        return web.json_response(
+            {"meta_info": {"output_token_logprobs": [(-0.1, 5)], "finish_reason": {"type": "stop"}}}
+        )
+
+    app = web.Application()
+    app.router.add_post("/generate", generate)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield state, f"http://127.0.0.1:{port}"
+    await runner.cleanup()
+
+
+async def test_generate_posts_retry_a_bounded_number_of_times(monkeypatch, flaky_router):
+    monkeypatch.setattr("miles.tinker.runtime.GENERATE_RETRY_PAUSE_S", 0.0)
+    state, router_url = flaky_router
+    backend = MilesBackend(_args(None), None, router_url)
+    payload = {
+        "prompt_tokens": [1],
+        "sampling_params": {"max_tokens": 2},
+        "num_samples": 1,
+        "prompt_logprobs": False,
+        "topk_prompt_logprobs": 0,
+    }
+    result = await backend.sample(payload, lora_name=None)
+    assert result["sequences"][0]["tokens"] == [5] and state["calls"] == 2, "one 503, one retry"
+
+    state["failures"], state["calls"] = 10, 0
+    with pytest.raises(aiohttp.ClientResponseError):
+        await backend.sample(payload, lora_name=None)
+    assert state["calls"] == GENERATE_MAX_RETRIES, "a persistent failure gives up after the bounded retries"
+    await backend._generate_client.close()
