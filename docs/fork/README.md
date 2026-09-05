@@ -42,7 +42,7 @@ Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gatew
 ## Interface summary (from the design contract)
 
 - `GatewayConfig` (`miles/tinker/core/types.py`): `train_mode`, `n_slots`,
-  `lease_timeout_s` (3600 s), `retrieve_poll_timeout_s` (20 s long-poll, below
+  `lease_timeout_s` (600 s), `retrieve_poll_timeout_s` (20 s long-poll, below
   the SDK's 45 s), `sampler_versions_to_keep` (3), `coalesce_wait_s` /
   `coalesce_max_wait_s` (0.3 / 2.0 s: wait for more chunks of an open
   forward_backward window before training a unit), `max_concurrent_samples`

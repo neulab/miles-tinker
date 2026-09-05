@@ -100,7 +100,7 @@ instead of stepping; `load_weights` clears the flag.
 | Field | Default | Meaning |
 |---|---|---|
 | `train_mode` (`--tinker-train-mode`) | `lora` | `lora` (multi-slot adapters) or `full` (one model, latest-only sampling) |
-| `lease_timeout_s` (`--tinker-lease-timeout-s`) | 3600 | heartbeat silence after which a session's models and samplers are reclaimed |
+| `lease_timeout_s` (`--tinker-lease-timeout-s`) | 600 | heartbeat silence after which a session's models and samplers are reclaimed |
 | `retrieve_poll_timeout_s` (`--tinker-retrieve-poll-timeout-s`) | 20 | long-poll cap on `retrieve_future`; keep it under the SDK's 45 s request timeout |
 | `sampler_versions_to_keep` (`--tinker-sampler-versions-to-keep`) | 3 | LoRA adapter versions kept resident per model |
 | `unit_token_budget` (`--tinker-unit-token-budget`) | 262144 | tokens packed into one trainer call across models |

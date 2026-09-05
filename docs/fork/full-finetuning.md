@@ -24,7 +24,7 @@ Code: `miles/backends/megatron_utils/full/executor.py` (P2),
   `learning_rate=1e-6`; the LoRA default is 3e-5).
 - A second concurrent training client gets `UserInputError("this full
   fine-tuning gateway serves one model at a time")` until the first model's
-  lease expires (`--tinker-lease-timeout-s`, default 3600 s after the last
+  lease expires (`--tinker-lease-timeout-s`, default 600 s after the last
   heartbeat) or its session ends. Run one client at a time.
 - Every fresh `create_model` starts from the pristine base: `load_slot(slot=0,
   ckpt_path=None)` reloads the weights the server started from (the HF

@@ -26,7 +26,7 @@ class GatewayConfig:
     max_tokens_per_datum: int = 32768
     max_tokens_per_request: int = 4_000_000
     lora_alpha: float | None = None  # None: 2 * rank
-    lease_timeout_s: float = 3600.0  # sessions silent beyond this lose their sampling, models, and slots
+    lease_timeout_s: float = 600.0  # SDK heartbeats every 10 s from a background thread; silence means the client is gone
     unit_token_budget: int = 262_144  # packing bound per work unit
     train_mode: str = "lora"  # "lora" | "full"
     retrieve_poll_timeout_s: float = 20.0  # long-poll cap on /retrieve_future (< the SDK's 45 s)

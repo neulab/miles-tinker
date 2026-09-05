@@ -38,7 +38,7 @@ the rationale column of this table, so keep one row per file or directory
 
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
-| `miles/tinker/core/types.py` | `GatewayConfig` gains train_mode, lease_timeout_s (3600, G21), retrieve_poll_timeout_s, sampler_versions_to_keep, coalesce_wait_s, max_concurrent_samples; `ModelRecord.is_lora/sdk_version`, `lora_rank` int (0 = FFT) | yes |
+| `miles/tinker/core/types.py` | `GatewayConfig` gains train_mode, lease_timeout_s (600 s; SDK heartbeats every 10 s, G21), retrieve_poll_timeout_s, sampler_versions_to_keep, coalesce_wait_s, max_concurrent_samples; `ModelRecord.is_lora/sdk_version`, `lora_rank` int (0 = FFT) | yes |
 | `miles/tinker/core/service.py` | `end_session` (SESSION_END -> immediate lease expiry); wire-safe optim metrics (non-finite -> 0.0); abstract `ExecutorBackend` (optim_step metrics dict, discard_grads, unload_adapter, warmup, push_slot version); unnamed sampler saves return `sampling_session_id` (G1); per-session leases and X-API-Key tenant (G4); `/weights_info` + sidecar-based resume (G5); idempotent create_model (G19); sampler-version GC via unload_adapter (G10); UserInputError instead of 500s (G13); FFT latest-only sampler resolution (G18) | yes |
 | `miles/tinker/core/planner.py` | coalesce forward_backward chunks of one window (coalesce_wait_s / max_wait) so an SDK request split into chunks trains as one unit | yes |
 | `miles/tinker/core/stream.py` | loss class keyed by the set of optional inputs present (G11) | yes |
