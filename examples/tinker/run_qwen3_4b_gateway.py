@@ -12,11 +12,24 @@ Requires: a Ray cluster already joined by both nodes (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
-  --mode: ``lora`` (multi-slot adapters) or ``full`` (full fine-tuning).
-  --hf-checkpoint: local HF snapshot of Qwen/Qwen3-4B-Instruct-2507.
+  --mode: ``lora`` (multi-slot adapters) or ``full`` (full fine-tuning, emits
+    ``--tinker-train-mode full``).
+  --hf-checkpoint: local HF snapshot of Qwen/Qwen3-4B-Instruct-2507 (default
+    ``<model-dir>/Qwen3-4B-Instruct-2507``, bridge mode, no conversion).
   --tinker-port: HTTP port the gateway binds on 0.0.0.0.
   --checkpoint-root: where ``tinker://`` checkpoints are written.
+  --n-adapters / --lora-rank / --lora-alpha / --target-modules: LoRA slot pool
+    (``--mode lora``); the SGLang ``max_loras_per_batch`` follows ``--n-adapters``
+    (``--sglang-max-loras-per-batch`` is shadowed by miles for multi-LoRA).
   --max-tokens-per-gpu: packed tokens per training microbatch (raise until OOM).
+  --recompute-args: extra Megatron recompute flags, e.g.
+    ``"--recompute-granularity full --recompute-method block --recompute-num-layers 8"``.
+  --pause-generation-mode: how engines pause during weight pushes; ``in_place``
+    keeps the prefix cache (default ``retract`` refills it on every push).
+  --update-weight-buffer-size: bytes per weight-update batch (1 GiB).
+  --sglang-mem-fraction-static / --sglang-context-length /
+    --sglang-chunked-prefill-size / --sglang-max-running-requests: engine knobs.
+  --extra-args: appended verbatim to the ``serve_tinker.py`` argv.
 
 Example:
   MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
@@ -61,9 +74,15 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 16384
     recompute_args: str = ""
 
+    # Weight pushes: in_place keeps in-flight requests and the prefix cache across a push.
+    pause_generation_mode: str = "in_place"
+    update_weight_buffer_size: int = 1024**3
+
     # Sampling engines.
     sglang_mem_fraction_static: float = 0.85
     sglang_context_length: int = 32768
+    sglang_chunked_prefill_size: int = 4096
+    sglang_max_running_requests: int = 512
 
     tinker_port: int = 10613
     extra_args: str = ""
@@ -74,6 +93,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.checkpoint_root is None:
             self.checkpoint_root = f"{self.output_dir}/tinker/{self.run_id}"
         assert self.mode in ("lora", "full"), f"--mode must be lora or full, got {self.mode!r}"
+        assert self.pause_generation_mode in ("abort", "retract", "in_place"), self.pause_generation_mode
 
 
 @app.command()
@@ -126,6 +146,13 @@ def serve(args: ScriptArgs):
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
         f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
         f"--sglang-context-length {args.sglang_context_length} "
+        f"--sglang-chunked-prefill-size {args.sglang_chunked_prefill_size} "
+        f"--sglang-max-running-requests {args.sglang_max_running_requests} "
+    )
+
+    update_weight_args = (
+        f"--pause-generation-mode {args.pause_generation_mode} "
+        f"--update-weight-buffer-size {args.update_weight_buffer_size} "
     )
 
     topology_args = (
@@ -141,7 +168,7 @@ def serve(args: ScriptArgs):
 
     train_args = (
         f"{ckpt_args} {mode_args} {tinker_args} {optimizer_args} "
-        f"{perf_args} {sglang_args} {topology_args} {misc_args} {args.extra_args} "
+        f"{perf_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {args.extra_args} "
     )
 
     U.execute_train(

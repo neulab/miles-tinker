@@ -1,0 +1,114 @@
+#!/bin/bash
+#PBS -P gai51740
+#PBS -q R9920261300
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1:mpiprocs=8
+#PBS -l walltime=00:40:00
+#PBS -N miles-tinker-smoke
+#PBS -j oe
+#PBS -o /home/aci18912it/miles-tinker/logs/
+#
+# One-node container check for the Tinker gateway image + rootfs + fork checkout, using the same
+# binds and environment as tinker_gateway.pbs. Every section prints its own header; nothing here
+# starts Ray or a gateway. Run it after pull_image.pbs, after changing the rootfs/extra-site, or
+# when the gateway job fails before "gateway healthy".
+#   qsub deploy/abci/smoke_container.pbs                           # defaults below
+#   qsub -v MILES_SIF=...,MILES_SRC=...,SECTIONS="1 2 4" deploy/abci/smoke_container.pbs
+set -uo pipefail
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load singularity-ce/4.4.1 2>/dev/null || true
+
+GROUPS_ROOT=/groups/gai51740/aci18912it
+PROJECT_ROOT=${PROJECT_ROOT:-$GROUPS_ROOT/miles-tinker}
+SIF=${MILES_SIF:-$PROJECT_ROOT/images/miles-latest-cu13.sif}
+ROOTFS=${ROOTFS:-$PROJECT_ROOT/rootfs}
+MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}
+EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}
+HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
+MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-4B-Instruct-2507}
+SECTIONS=${SECTIONS:-"1 2 3 4 5 6 7 8"}
+NL=${PBS_LOCALDIR:?}/miles; mkdir -p "$NL/tmp"; chmod 1777 "$NL/tmp"
+
+echo "=== $(hostname -s) $(date) sif=$SIF src=$MILES_SRC ==="; ls -la "$SIF"
+[[ -f $SIF.sha256 ]] && (cd "$(dirname "$SIF")" && sha256sum -c "$(basename "$SIF").sha256") || echo "no sha256 sidecar"
+echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD) $(git -C "$MILES_SRC" branch --show-current)"
+ulimit -n "$(ulimit -Hn)"; ulimit -s unlimited 2>/dev/null || true
+export NVIDIA_VISIBLE_DEVICES=all
+echo "=== ulimits on host ==="; ulimit -n -s -l
+
+# Same container arguments as tinker_gateway.pbs (keep the two in step).
+CONTAINER_ARGS=(
+  --nv --cleanenv --containall --no-mount cwd
+  --bind /dev/infiniband:/dev/infiniband
+  --bind "$NL/tmp:/tmp"
+  --home "$ROOTFS:/root"
+  --bind "$MILES_SRC:/root/miles"
+  --bind "$GROUPS_ROOT:$GROUPS_ROOT"
+  --pwd /root/miles
+  --env TMPDIR=/tmp --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 --env PYTHONNOUSERSITE=1
+  --env "PYTHONPATH=/root/miles:/root/Megatron-LM:$EXTRA_SITE"
+  --env "HF_HOME=$HF_HOME" --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1
+  --env XDG_CACHE_HOME=/tmp/xdg --env TRITON_CACHE_DIR=/tmp/triton --env TORCHINDUCTOR_CACHE_DIR=/tmp/inductor
+  --env FLASHINFER_WORKSPACE_DIR=/tmp/flashinfer --env TORCH_EXTENSIONS_DIR=/tmp/torch-ext --env CUDA_CACHE_PATH=/tmp/nv-cache
+  --env DG_JIT_CACHE_DIR=/tmp/deepgemm --env RAY_TMPDIR=/tmp/ray
+)
+run_in_sif() { singularity exec "${CONTAINER_ARGS[@]}" "$SIF" /bin/bash -c "$*"; }
+want() { [[ " $SECTIONS " == *" $1 "* ]]; }
+
+want 1 && {
+  echo "=== [1] container basics ==="
+  run_in_sif 'id; echo HOME=$HOME; ls -ld /root /root/miles /root/Megatron-LM /sgl-workspace/sglang 2>&1; echo PYTHONPATH=$PYTHONPATH; python --version; which python; nvidia-smi -L | head -2; df -h /tmp /dev/shm | tail -2; ulimit -n -s -l; ls /dev/infiniband | head -3'
+}
+want 2 && {
+  echo "=== [2] python imports and versions ==="
+  cat > "$NL/tmp/imports.py" <<'PY2'
+import importlib
+def v(m):
+    try:
+        mod = importlib.import_module(m); print(f"{m:55s} OK  {getattr(mod, '__version__', '')}  {getattr(mod, '__file__', '')}")
+    except Exception as e:
+        print(f"{m:55s} FAIL {type(e).__name__}: {str(e)[:160]}")
+for m in ["torch","ray","sglang","megatron.core","megatron.training","megatron.bridge","megatron.bridge.peft.multi_lora_layers","transformer_engine","flash_attn","miles","miles.tinker.core.service","miles.tinker.server.app","miles.tinker.server.proto_codec","miles.tinker.runtime","miles.backends.megatron_utils.lora.executor","miles.backends.megatron_utils.full.executor","miles.backends.megatron_utils.actor","tinker","tinker.proto.tinker_public_pb2","fastapi","uvicorn","zstandard","numpy","transformers","torch_memory_saver","flashinfer","sglang_router"]:
+    v(m)
+import torch; print("cuda", torch.version.cuda, "devices", torch.cuda.device_count(), torch.cuda.get_device_name(0) if torch.cuda.device_count() else "none")
+import os; print("HOME", os.environ.get("HOME"), "expanduser", os.path.expanduser("~"))
+PY2
+  run_in_sif 'python /tmp/imports.py'
+}
+want 3 && {
+  echo "=== [3] pinned trees (rootfs Megatron clone vs image) ==="
+  run_in_sif 'cd /root/Megatron-LM && git log --oneline -1 2>&1; pip show megatron-core 2>/dev/null | head -3; pip show megatron-bridge 2>/dev/null | head -3; pip list 2>/dev/null | grep -iE "^(sglang|sgl|ray|torch |megatron|transformer|flash|tinker|fastapi|uvicorn|protobuf|zstandard|httpx|numpy) "'
+}
+want 4 && {
+  echo "=== [4] fast tinker tests inside the container ==="
+  run_in_sif 'cd /root/miles && python -m pytest tests/fast/tinker tests/fast/fork -q -p no:cacheprovider --confcutdir=tests/fast/tinker -o addopts="" 2>&1 | tail -15'
+}
+want 5 && {
+  echo "=== [5] serve_tinker --help and the gateway launcher ==="
+  run_in_sif 'cd /root/miles && python serve_tinker.py --help 2>&1 | grep -E "tinker|multi-lora|pause-generation" | head -20; python examples/tinker/run_qwen3_4b_gateway.py serve --help 2>&1 | tail -5'
+}
+want 6 && {
+  echo "=== [6] NCCL all-reduce across 8 GPUs (torchrun) ==="
+  run_in_sif 'cd /tmp && cat > ar.py <<PY
+import torch, torch.distributed as dist, time
+dist.init_process_group("nccl"); r=dist.get_rank(); torch.cuda.set_device(r)
+x=torch.ones(256*1024*1024, device="cuda")*(r+1)
+torch.cuda.synchronize(); t=time.time()
+for _ in range(10): dist.all_reduce(x)
+torch.cuda.synchronize(); dt=(time.time()-t)/10
+if r==0: print(f"all_reduce 1GiB x10 avg {dt*1000:.1f} ms, busbw ~{2*(dist.get_world_size()-1)/dist.get_world_size()*1.0/dt:.1f} GB/s, value {x[0].item()}")
+dist.destroy_process_group()
+PY
+timeout 300 torchrun --nproc_per_node 8 ar.py 2>&1 | grep -v Warning | tail -5'
+}
+want 7 && {
+  echo "=== [7] HF snapshot visible and tokenizer loads offline ==="
+  run_in_sif "python -c \"
+from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('$MODEL_NAME'); print('tokenizer ok', len(t))
+import glob; print(glob.glob('$HF_HOME/hub/models--${MODEL_NAME//\//--}/snapshots/*'))\""
+}
+want 8 && {
+  echo "=== [8] sgl-router / gateway binary ==="
+  run_in_sif 'which sgl-model-gateway sglang-router 2>&1; python -c "import sglang_router; print(sglang_router.__file__)" 2>&1 | tail -1'
+}
+echo "=== done $(date) ==="
