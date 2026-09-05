@@ -794,6 +794,7 @@ def sidecar_meta(record: ModelRecord, config: GatewayConfig, kind: str, name: st
         "is_lora": record.is_lora,
         "lora_rank": record.lora_rank,
         "lora_alpha": record.lora_alpha,
+        "slot": record.slot,
         "kind": kind,
         "name": name,
         "sampler_version": record.sampler_version,

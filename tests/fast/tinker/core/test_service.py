@@ -256,11 +256,12 @@ async def test_save_then_load_roundtrip_paths(service):
     saved_path = (await await_settled(service, "tenant", save)).result["path"]
     assert saved_path == f"tinker://{model_id}/weights/ckpt"
     sidecar = read_sidecar(f"{service.config.checkpoint_root}/{model_id}/weights/ckpt")
-    assert (sidecar["tenant"], sidecar["lora_rank"], sidecar["kind"], sidecar["train_mode"]) == (
+    assert (sidecar["tenant"], sidecar["lora_rank"], sidecar["kind"], sidecar["train_mode"], sidecar["slot"]) == (
         "tenant",
         8,
         "weights",
         "lora",
+        service.models[model_id].slot,
     )
 
     load = service.submit(
