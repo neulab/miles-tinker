@@ -18,6 +18,7 @@ DONE = "done"
 FAILED = "failed"
 
 _FINISHED_TTL_S = 3600.0
+_SWEEP_INTERVAL_S = 60.0  # full expiry pass; the polled promise itself is always checked
 
 
 @dataclass
@@ -37,6 +38,7 @@ class Promise:
 class PromiseStore:
     def __init__(self) -> None:
         self._promises: dict[str, Promise] = {}
+        self._last_sweep = time.monotonic()
 
     def create(self, model_id: str, tenant: str) -> Promise:
         promise = Promise(request_id=f"req-{uuid.uuid4().hex}", model_id=model_id, tenant=tenant)
@@ -64,16 +66,21 @@ class PromiseStore:
         promise = self._promises.get(request_id)
         if promise is None:
             return None
+        if _expired(promise, time.monotonic()):
+            del self._promises[request_id]
+            return None
         if promise.tenant != tenant:
             raise OwnershipError(f"request {request_id} does not belong to this tenant")
         return promise
 
     def _sweep(self) -> None:
         now = time.monotonic()
-        expired = [
-            rid
-            for rid, p in self._promises.items()
-            if p.finished_at is not None and now - p.finished_at > _FINISHED_TTL_S
-        ]
-        for rid in expired:
+        if now - self._last_sweep < _SWEEP_INTERVAL_S:
+            return  # every poll would otherwise walk every promise of the last hour
+        self._last_sweep = now
+        for rid in [rid for rid, p in self._promises.items() if _expired(p, now)]:
             del self._promises[rid]
+
+
+def _expired(promise: Promise, now: float) -> bool:
+    return promise.finished_at is not None and now - promise.finished_at > _FINISHED_TTL_S
