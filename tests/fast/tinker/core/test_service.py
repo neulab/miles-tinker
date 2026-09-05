@@ -132,6 +132,22 @@ async def test_a_failed_unit_poisons_the_window_until_the_next_optim_step(servic
     assert (await await_settled(service, "tenant", optim)).state == DONE, "the flag clears with the failed step"
 
 
+async def test_a_backend_returning_the_wrong_output_count_fails_the_riders_not_the_loop(service):
+    model_id = await created_model(service)
+
+    async def short_forward_backward(unit_id, slot_rows, loss_fn, loss_fn_config):
+        return [{"loss": 1.0, "logprobs": [0.0]}]  # one output for two rows
+
+    service.backend.forward_backward = short_forward_backward
+    broken = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row(), row()]))
+    promise = await await_settled(service, "tenant", broken)
+    assert (promise.state, promise.error_category) == (FAILED, "server") and "2 rows" in promise.error
+
+    service.backend.forward_backward = type(service.backend).forward_backward.__get__(service.backend)
+    healthy = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [row()]))
+    assert (await await_settled(service, "tenant", healthy)).state == DONE, "the dispatch loop must survive"
+
+
 async def test_a_dirty_stream_does_not_block_a_merged_clean_one(service):
     service.config.coalesce_wait_s = 0.0  # keep the two windows in separate units
     dirty = await created_model(service)

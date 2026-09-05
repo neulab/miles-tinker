@@ -527,7 +527,11 @@ class TinkerService:
             self._fail_riders(refs, f"{type(error).__name__}: {error}", "server", poison=poison)
             return
 
-        assert len(outputs) == len(refs), f"unit returned {len(outputs)} outputs for {len(refs)} rows"
+        if len(outputs) != len(refs):  # a backend contract breach fails the riders, never the loop
+            self._fail_riders(
+                refs, f"unit returned {len(outputs)} outputs for {len(refs)} rows", "server", poison=poison
+            )
+            return
         for ref, output in zip(refs, outputs, strict=True):
             request = ref.request
             request.outputs[ref.local_index] = output
