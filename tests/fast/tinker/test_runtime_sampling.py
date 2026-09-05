@@ -82,7 +82,7 @@ async def test_sample_posts_once_per_sample_with_bounded_retries(monkeypatch):
         return {"meta_info": {"output_token_logprobs": [(-0.1, 5)], "finish_reason": {"type": "stop"}}}
 
     monkeypatch.setattr("miles.tinker.runtime.post", fake_post)
-    backend = MilesBackend(Namespace(), None, "http://router")
+    backend = MilesBackend(_args(None), None, "http://router")
     payload = {
         "prompt_tokens": [1],
         "sampling_params": {"max_tokens": 2, "seed": 7},
