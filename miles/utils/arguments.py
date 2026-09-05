@@ -23,6 +23,7 @@ from miles.utils.lora import is_lora_enabled
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
+from miles.utils.tinker_args import validate_tinker_serve_args
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
@@ -1857,6 +1858,52 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Directory for tinker:// checkpoints (default: <save>/tinker)",
             )
             parser.add_argument(
+                "--tinker-train-mode",
+                type=str,
+                choices=["lora", "full"],
+                default="lora",
+                help=(
+                    "What the Tinker gateway trains: 'lora' serves multi-LoRA slots "
+                    "(--multi-lora-n-adapters > 0); 'full' fine-tunes the base weights for a single tenant"
+                ),
+            )
+            parser.add_argument(
+                "--tinker-lease-timeout-s",
+                type=float,
+                default=3600.0,
+                help="Seconds without a heartbeat before a Tinker session's models are released (default: 3600)",
+            )
+            parser.add_argument(
+                "--tinker-sampler-versions-to-keep",
+                type=int,
+                default=3,
+                help="LoRA: sampler adapter versions kept loaded on the engines per model (default: 3)",
+            )
+            parser.add_argument(
+                "--tinker-coalesce-wait-s",
+                type=float,
+                default=0.3,
+                help="Seconds the planner waits for more chunks of an open forward_backward window (default: 0.3)",
+            )
+            parser.add_argument(
+                "--tinker-max-concurrent-samples",
+                type=int,
+                default=512,
+                help="Maximum in-flight /generate posts per gateway (default: 512)",
+            )
+            parser.add_argument(
+                "--tinker-retrieve-poll-timeout-s",
+                type=float,
+                default=20.0,
+                help="Long-poll cap on /retrieve_future in seconds; keep below the SDK's 45 s (default: 20)",
+            )
+            parser.add_argument(
+                "--tinker-unit-token-budget",
+                type=int,
+                default=262_144,
+                help="Maximum tokens the planner packs into one training work unit (default: 262144)",
+            )
+            parser.add_argument(
                 "--multi-lora-n-adapters",
                 type=int,
                 default=0,
@@ -3517,6 +3564,9 @@ def miles_validate_args(args):
             assert args.num_rollout is not None, (
                 "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
             )
+
+    if args.entry == "serve":
+        validate_tinker_serve_args(args)
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"

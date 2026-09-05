@@ -45,10 +45,14 @@ def _record_per_datum(batch: RolloutBatch, log_probs: list[torch.Tensor], per_sa
         return
     sample_indices = batch.get("sample_indices")
     assert sample_indices is not None, "per-datum outputs need sample_indices in the batch"
-    for index, log_prob, loss in zip(sample_indices, log_probs, per_sample_loss, strict=True):
-        _per_datum_outputs.append(
-            {"sample_index": index, "logprobs": log_prob.detach().cpu(), "loss": loss.detach().cpu()}
-        )
+    if not per_sample_loss:
+        return
+    # one device sync per microbatch instead of two per datum
+    flat_log_probs = torch.cat([lp.detach() for lp in log_probs]).cpu()
+    losses = torch.stack([loss.detach() for loss in per_sample_loss]).cpu()
+    per_datum_log_probs = torch.split(flat_log_probs, [lp.numel() for lp in log_probs])
+    for index, log_prob, loss in zip(sample_indices, per_datum_log_probs, losses, strict=True):
+        _per_datum_outputs.append({"sample_index": index, "logprobs": log_prob, "loss": loss})
 
 
 def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
@@ -68,12 +72,23 @@ def _like(values, reference: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(values, dtype=reference.dtype, device=reference.device)
 
 
+def _drop_masked_out(batch: RolloutBatch, per_sample_loss: list[torch.Tensor]) -> list[torch.Tensor]:
+    """A datum whose loss mask is all zero (the runtime's DP padding rows) contributes
+    nothing under any loss, including terms that do not go through weights/advantages
+    (the DRO divergence penalty)."""
+    masks = batch.get("loss_masks")
+    if masks is None or not per_sample_loss:
+        return per_sample_loss
+    return [loss * mask.any() for loss, mask in zip(per_sample_loss, masks, strict=True)]
+
+
 def _finish(
     batch: RolloutBatch,
     logits: torch.Tensor,
     log_probs: list[torch.Tensor],
     per_sample_loss: list[torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    per_sample_loss = _drop_masked_out(batch, per_sample_loss)
     if per_sample_loss:
         loss = torch.stack(per_sample_loss).sum()
     else:

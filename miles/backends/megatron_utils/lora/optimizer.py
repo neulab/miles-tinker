@@ -14,6 +14,8 @@ from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 
+from miles.backends.megatron_utils.adam_params import should_veto_step
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,14 +164,16 @@ def step_adapter_slots(
     clip_grad: float,
 ) -> dict[int, float]:
     """Step exactly the slots in ``step_batch_sizes`` (slot -> batch size), retaining all other slots' gradients;
-    scales each slot's accumulated grad sum by 1/batch_size and returns the grad norm per stepped slot."""
+    scales each slot's accumulated grad sum by 1/batch_size and returns the grad norm per stepped slot.
+    A slot with non-finite grads is vetoed: its grads are zeroed, no step, NaN norm."""
     grad_norms: dict[int, float] = {}
 
     for slot, batch_size in step_batch_sizes.items():
         children = _slot_children(optimizer, slot)
         # Copy accumulated main_grads into the owned masters' grads, then scale the sum to the adapter-batch mean.
+        found_inf = False
         for child in children:
-            child.prepare_grads()
+            found_inf |= bool(child.prepare_grads())
             for main_param in child.get_parameters():
                 if main_param.grad is not None:
                     main_param.grad.mul_(1.0 / batch_size)
@@ -180,7 +184,13 @@ def step_adapter_slots(
         for child in children:
             grads_for_norm += child.get_grads_for_grad_norm()
             slot_params += child.get_parameters()
+        # world-wide reduction, so every rank takes the same veto decision
         slot_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        if should_veto_step(found_inf, slot_norm):
+            logger.warning(f"slot {slot}: non-finite gradients (found_inf={found_inf}, norm={slot_norm}); step vetoed")
+            zero_adapter_slot_grads(model, slot)
+            grad_norms[slot] = float("nan")
+            continue
         if clip_grad > 0.0 and slot_params:
             clip_grad_by_total_norm_fp32(slot_params, clip_grad, slot_norm, False)
         grad_norms[slot] = float(slot_norm)
