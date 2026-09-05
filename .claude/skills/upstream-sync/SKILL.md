@@ -9,8 +9,9 @@ The fork (`FORK.md`) is based on the multi-LoRA v2 PR stack (#2839-#2849,
 `upstream/yueming/multi-lora-example`) until that stack lands on
 `upstream/main`; then it tracks `upstream/main`. `tools/fork/upstream_sync.py`
 decides which base applies from the recorded stack head in
-`tools/fork/upstream_state.json` (`git merge-base --is-ancestor`), merges it
-with `--no-ff`, and records the result. Never sync by hand; the tool keeps the
+`tools/fork/upstream_state.json` (`git merge-base --is-ancestor`, or the
+sticky `merged_into_main: true` flag, which you set by hand after a squash
+merge), merges it with `--no-ff`, and records the result. Never sync by hand; the tool keeps the
 state file honest.
 
 ## Commands

@@ -18,7 +18,9 @@ Branch: `miles-tinker`. Base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
    `tools/fork/upstream_sync.py` merges `upstream/yueming/multi-lora-example`.
 2. **Later:** once the stack head is an ancestor of `upstream/main`
    (`git merge-base --is-ancestor`), the same tool switches the base to
-   `upstream/main` automatically and records `merged_into_main: true`.
+   `upstream/main` automatically and records `merged_into_main: true`. If the
+   stack is squash-merged (its head never becomes an ancestor of `main`), set
+   `merged_into_main: true` in the state file by hand; the flag is sticky.
 3. Everything the fork adds is either a candidate for an upstream PR
    ("upstream-worthy? yes" below) or deliberately fork-only (deployment for one
    cluster, client launchers, this file).

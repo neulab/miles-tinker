@@ -46,8 +46,13 @@ Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gatew
   the SDK's 45 s), `sampler_versions_to_keep` (3), `coalesce_wait_s` /
   `coalesce_max_wait_s` (0.3 / 2.0 s: wait for more chunks of an open
   forward_backward window before training a unit), `max_concurrent_samples`
-  (512), `unit_token_budget` (262,144 tokens). Every field has a
-  `--tinker-*` flag in `serve_tinker.py`.
+  (512), `unit_token_budget` (262,144 tokens). `serve_tinker.py` sets them
+  from `--tinker-train-mode`, `--tinker-lease-timeout-s`,
+  `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`,
+  `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s` and
+  `--tinker-unit-token-budget` (`n_slots` comes from `--multi-lora-n-adapters`,
+  `base_model` / `checkpoint_root` from `--tinker-base-model` /
+  `--tinker-checkpoint-root`; `coalesce_max_wait_s` keeps its default).
 - `ExecutorBackend` (`miles/tinker/core/service.py`): `load_slot`,
   `unload_slot`, `forward_backward`, `forward_only`, `optim_step` (returns a
   per-slot metrics dict: `grad_norm`, `skipped`, `lr`, `num_tokens`,
