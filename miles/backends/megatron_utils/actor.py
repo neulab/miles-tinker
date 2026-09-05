@@ -468,8 +468,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 full_executor.load_state(self.args, self.model, self.optimizer, ckpt_path, load_optimizer)
             return
         lora_executor.load_slot(self.model, self.optimizer, slot, rank, alpha)
-        if ckpt_path is not None:
+        if ckpt_path is None:
+            return
+        try:
             lora_checkpoint.load_slot(self.model, self.optimizer, slot, ckpt_path, load_optimizer)
+        except lora_checkpoint.SlotCheckpointError:
+            # raised on every rank together; leave the slot as create_model made it (fresh adapter,
+            # zeroed Adam state) rather than half-loaded, so the model stays usable
+            lora_executor.load_slot(self.model, self.optimizer, slot, rank, alpha)
+            raise
 
     @with_logs
     def save_slot(self, slot: int, path: str) -> None:
