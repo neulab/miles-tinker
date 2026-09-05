@@ -39,11 +39,11 @@ the rationale column of this table, so keep one row per file or directory
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
 | `miles/tinker/core/types.py` | `GatewayConfig` gains train_mode, lease_timeout_s (3600, G21), retrieve_poll_timeout_s, sampler_versions_to_keep, coalesce_wait_s, max_concurrent_samples; `ModelRecord.is_lora/sdk_version`, `lora_rank` int (0 = FFT) | yes |
-| `miles/tinker/core/service.py` | abstract `ExecutorBackend` (optim_step metrics dict, discard_grads, unload_adapter, warmup, push_slot version); unnamed sampler saves return `sampling_session_id` (G1); per-session leases and X-API-Key tenant (G4); `/weights_info` + sidecar-based resume (G5); idempotent create_model (G19); sampler-version GC via unload_adapter (G10); UserInputError instead of 500s (G13); FFT latest-only sampler resolution (G18) | yes |
+| `miles/tinker/core/service.py` | `end_session` (SESSION_END -> immediate lease expiry); wire-safe optim metrics (non-finite -> 0.0); abstract `ExecutorBackend` (optim_step metrics dict, discard_grads, unload_adapter, warmup, push_slot version); unnamed sampler saves return `sampling_session_id` (G1); per-session leases and X-API-Key tenant (G4); `/weights_info` + sidecar-based resume (G5); idempotent create_model (G19); sampler-version GC via unload_adapter (G10); UserInputError instead of 500s (G13); FFT latest-only sampler resolution (G18) | yes |
 | `miles/tinker/core/planner.py` | coalesce forward_backward chunks of one window (coalesce_wait_s / max_wait) so an SDK request split into chunks trains as one unit | yes |
 | `miles/tinker/core/stream.py` | loss class keyed by the set of optional inputs present (G11) | yes |
 | `miles/tinker/core/promise.py` | per-promise event for the long-poll of `/retrieve_future` (G3) | yes |
-| `miles/tinker/server/app.py` | X-API-Key tenant (G4); long-poll retrieve_future capped below the SDK's 45 s (G3); `/weights_info` (G5); `GET/DELETE training_runs` (G6); richer `get_info` (G7); `GET /samplers/{id}` (G8); `POST /forward` for SDK 0.16.1 (G9); category `server` (G12) | yes |
+| `miles/tinker/server/app.py` | X-API-Key tenant (G4); long-poll retrieve_future capped below the SDK's 45 s (G3); `/weights_info` (G5); `GET/DELETE training_runs` (G6); richer `get_info` (G7); `GET /samplers/{id}` (G8); `POST /forward` for SDK 0.16.1 (G9); category `server` (G12); `/telemetry` releases a session's slots on the SDK's SESSION_END event | yes |
 | `miles/tinker/server/encoding.py` | default chunk `type` for SDK 0.16.1 (G2); NaN-safe JSON and 0.16.1 topk shape (G14); unknown AdamParams keys warned, not rejected (G20); request-level `num_tokens:sum`/`num_datums:sum` metrics | yes |
 | `miles/tinker/server/proto_codec.py` | protobuf face kept in step with the encoding changes above | yes |
 | `miles/tinker/runtime.py` (sampling functions) | `no_stop_trim` so the stop token is returned (G15); per-sample seed offset (G16); `stop=[]` -> `ignore_eos` (G17); context-length clamp and single-retry sampling posts (S9) | yes |
@@ -61,6 +61,7 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/backends/megatron_utils/lora/executor.py` | `actor_train` timer + `log_perf_data` on the tinker path (MFU instrumentation, E5); `discard_grads` | yes |
 | `miles/backends/megatron_utils/lora/optimizer.py` | non-finite step veto (`skipped` metric) and per-slot metrics dict returned from optim_step | yes |
 | `miles/backends/training_utils/loss.py` | sum-reduction scaling keyed on the tinker train mode, not only `is_multi_lora_enabled` | yes |
+| `miles/ray/rollout/train_data_conversion.py` | `advantages` shipped with every DP shard (the client's advantages never reached the trainer: every RL loss crashed) | yes |
 | `miles/backends/training_utils/data.py` | units padded to a multiple of dp_size with dummy rows so small SDK chunks do not divide by zero (E6) | yes |
 | `miles/backends/training_utils/loss_hub/tinker_losses.py` | loss fixes found in the review (E2) | yes |
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
@@ -79,7 +80,7 @@ the rationale column of this table, so keep one row per file or directory
 | `tests/fast/fork/` | tests for the sync tool | no |
 | `.claude/skills/upstream-sync/` | Claude Code skill wrapping the sync tool and the conflict policy | no |
 | `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node), `pull_image.pbs`, `smoke_container.pbs`, README runbook | no |
-| `deploy/clients/` | login-node client launchers: cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke | no |
+| `deploy/clients/` | login-node client launchers: cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | `execute_train`-shaped launcher for the gateway (lora/full) on 8 + 8 GPUs | maybe (as `examples/tinker/`) once FFT lands upstream |
 | `docs/fork/` | fork overview, full fine-tuning semantics, acceptance procedure | no |
 
