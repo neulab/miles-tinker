@@ -31,7 +31,7 @@ exec "$PLATOON_PYTHON" -m platoon.textcraft.train_scripts.tinker.train_tinker_sy
   --train.workflow_config.group_size "${GROUP_SIZE:-4}" \
   --train.num_concurrent_rollout_workflow_workers "${WORKERS:-4}" \
   --train.workflow_config.rollout_config.max_steps "${ROLLOUT_MAX_STEPS:-30}" \
-  --train.context_window_length "${CONTEXT_LEN:-4096}" \
+  --train.context_window_length "${CONTEXT_LEN:-8192}" \
   --eval.every "${EVAL_EVERY:-100}" \
   --checkpoint.every "${CKPT_EVERY:-1}" \
   "$@"
