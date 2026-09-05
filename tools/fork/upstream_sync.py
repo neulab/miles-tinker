@@ -109,7 +109,7 @@ def preview_conflicts(repo: Path, head: str, base_ref: str) -> tuple[str, ...]:
 
 
 def fork_rationale(fork_md: str, paths: tuple[str, ...]) -> dict[str, str]:
-    """FORK.md table rows (``| `path` | rationale | ... |``) keyed by path, for the paths given.
+    r"""FORK.md table rows (``| `path` | rationale | ... |``) keyed by path, for the paths given.
 
     A row's first cell may list several backticked paths and carry a qualifier
     (``\`a.py\`, \`b.py\``, ``\`runtime.py\` (sampling functions)``); every path of
