@@ -127,6 +127,19 @@ def check_stop_strings(checks: Checks, tokenizer, sampling_client) -> None:
     checks.check("sample with stop strings stops at the string", text.rstrip().endswith(","), f"text={text!r}")
 
 
+def unload_model(base_url: str, model_id: str) -> None:
+    """POST /api/v1/unload_model with this client's API key (a gateway route without an SDK method)."""
+    import httpx
+
+    response = httpx.post(
+        f"{base_url.rstrip('/')}/api/v1/unload_model",
+        json={"model_id": model_id},
+        headers={"X-API-Key": os.environ["TINKER_API_KEY"]},
+        timeout=120,
+    )
+    response.raise_for_status()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--endpoint-file")
@@ -134,6 +147,7 @@ def main() -> int:
     parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--unload-before-resume", action="store_true", help="free the first model before resuming (full fine-tuning gateways serve one model at a time)")
     args = parser.parse_args()
     base_url = resolve_base_url(args)
     checks = Checks()
@@ -159,6 +173,10 @@ def main() -> int:
     name = f"smoke-{int(time.time())}"
     state_path = client.save_state(name).result().path
     checks.check("named save_state", state_path.startswith("tinker://") and "/weights/" in state_path, state_path)
+    if args.unload_before_resume:
+        # single-tenant (full fine-tuning) gateways serve one model at a time; the SDK has no unload call
+        unload_model(base_url, info.model_id)
+        checks.check("unload_model before resume", True, info.model_id)
     weights_info = service.create_rest_client().get_weights_info_by_tinker_path(state_path).result()
     checks.check(
         "weights_info",
