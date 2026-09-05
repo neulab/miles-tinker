@@ -52,5 +52,18 @@ def test_the_polled_promise_expires_inline_and_the_rest_on_the_sweep_interval(mo
     assert other.request_id not in store._promises, "the periodic pass drops the rest"
 
 
+def test_a_delivered_result_expires_on_the_short_ttl(monkeypatch):
+    store = PromiseStore()
+    delivered, undelivered = store.create("model", "tenant"), store.create("model", "tenant")
+    for promise in (delivered, undelivered):
+        store.resolve(promise.request_id, {"kind": "sample"})
+    store.delivered(delivered)
+    assert store.get(delivered.request_id, "tenant") is not None, "a retry of a lost response still finds it"
+
+    monkeypatch.setattr(promise_module, "_DELIVERED_TTL_S", -1.0)
+    assert store.get(delivered.request_id, "tenant") is None
+    assert store.get(undelivered.request_id, "tenant") is not None, "an unpolled result keeps the long TTL"
+
+
 def test_unknown_request_returns_none():
     assert PromiseStore().get("req-nope", "tenant") is None

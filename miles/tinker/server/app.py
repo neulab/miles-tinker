@@ -11,7 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from miles.tinker.core.promise import FAILED, PENDING
@@ -35,9 +35,13 @@ COMMAND_ROUTES = {
 }
 
 
-def _tenant(x_api_key: str | None, authorization: str | None) -> str:
-    if x_api_key:
-        return x_api_key.strip()
+def _tenant(request: Request) -> str:
+    """Read straight from the headers: FastAPI Header() dependencies cost a
+    tenth of a request's event-loop time at load."""
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        return api_key.strip()
+    authorization = request.headers.get("authorization")
     if authorization:
         return authorization.removeprefix("Bearer ").strip()
     return "anonymous"
@@ -94,13 +98,9 @@ def build_app(service: TinkerService) -> FastAPI:
         return {"status": "accepted"}
 
     @app.post("/api/v1/create_session")
-    async def create_session(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def create_session(request: Request):
         payload = await request.json()
-        session_id = service.create_session(_tenant(x_api_key, authorization), payload)
+        session_id = service.create_session(_tenant(request), payload)
         return {"type": "create_session", "session_id": session_id}
 
     @app.post("/api/v1/session_heartbeat")
@@ -115,23 +115,15 @@ def build_app(service: TinkerService) -> FastAPI:
         return {"supported_models": [{"model_name": service.config.base_model, "trainable": True, "sampleable": True}]}
 
     @app.post("/api/v1/create_model")
-    async def create_model(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def create_model(request: Request):
         payload = await request.json()
-        request_id, model_id = service.create_model(_tenant(x_api_key, authorization), payload)
+        request_id, model_id = service.create_model(_tenant(request), payload)
         return {"request_id": request_id, "model_id": model_id}
 
     @app.post("/api/v1/get_info")
-    async def get_info(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def get_info(request: Request):
         payload = await request.json()
-        record = service.get_model(_tenant(x_api_key, authorization), payload["model_id"])
+        record = service.get_model(_tenant(request), payload["model_id"])
         lora_rank = record.lora_rank if record.is_lora else None
         return {
             "type": "get_info",
@@ -148,49 +140,33 @@ def build_app(service: TinkerService) -> FastAPI:
         }
 
     @app.post("/api/v1/unload_model")
-    async def unload_model(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def unload_model(request: Request):
         payload = await request.json()
-        request_id = service.unload_model(_tenant(x_api_key, authorization), payload["model_id"])
+        request_id = service.unload_model(_tenant(request), payload["model_id"])
         return {"request_id": request_id, "model_id": payload["model_id"]}
 
     @app.post("/api/v1/forward_backward")
-    async def forward_backward(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def forward_backward(request: Request):
         if PROTO_CONTENT_TYPE in request.headers.get("content-type", ""):
             body = maybe_decompress(await request.body(), request.headers.get("content-encoding"))
             kind, payload = decode_forward_backward_request(body)
         else:
             kind, payload = decode_command("forward_backward", await request.json())
-        request_id = service.submit(_tenant(x_api_key, authorization), kind, payload)
+        request_id = service.submit(_tenant(request), kind, payload)
         return {"request_id": request_id, "model_id": payload["model_id"]}
 
     @app.post("/api/v1/forward")
-    async def forward(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def forward(request: Request):
         kind, payload = decode_forward_request(await request.json())
-        request_id = service.submit(_tenant(x_api_key, authorization), kind, payload)
+        request_id = service.submit(_tenant(request), kind, payload)
         return {"request_id": request_id, "model_id": payload["model_id"]}
 
     for route, route_kind in COMMAND_ROUTES.items():
 
         def _make(route_kind: str):
-            async def command(
-                request: Request,
-                x_api_key: str | None = Header(default=None),
-                authorization: str | None = Header(default=None),
-            ):
+            async def command(request: Request):
                 kind, payload = decode_command(route_kind, await request.json())
-                request_id = service.submit(_tenant(x_api_key, authorization), kind, payload)
+                request_id = service.submit(_tenant(request), kind, payload)
                 return {"request_id": request_id, "model_id": payload["model_id"]}
 
             return command
@@ -198,14 +174,10 @@ def build_app(service: TinkerService) -> FastAPI:
         app.post(route)(_make(route_kind))
 
     @app.post("/api/v1/retrieve_future")
-    async def retrieve_future(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def retrieve_future(request: Request):
         payload = await request.json()
         request_id = payload["request_id"]
-        promise = service.retrieve(_tenant(x_api_key, authorization), request_id)
+        promise = service.retrieve(_tenant(request), request_id)
         if promise is None:
             return JSONResponse(status_code=410, content={"error": "unknown or expired promise"})
         if promise.state == PENDING:
@@ -217,86 +189,63 @@ def build_app(service: TinkerService) -> FastAPI:
                 return JSONResponse(
                     status_code=408, content={"type": "try_again", "request_id": request_id, "queue_state": "active"}
                 )
+        service.promises.delivered(promise)
         if promise.state == FAILED:
-            return {"error": promise.error, "category": promise.error_category}
+            return JSONResponse({"error": promise.error, "category": promise.error_category})
         encoder = PROTO_ENCODERS.get(promise.result["kind"])
         if encoder is not None and PROTO_CONTENT_TYPE in request.headers.get("accept", ""):
             return Response(content=encoder(promise.result), media_type=PROTO_CONTENT_TYPE)
-        return render_result(promise.result)
+        # an explicit JSONResponse: returning the dict would first send every token and
+        # logprob through FastAPI's jsonable_encoder
+        return JSONResponse(render_result(promise.result))
 
     @app.post("/api/v1/cancel_future")
-    async def cancel_future(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def cancel_future(request: Request):
         payload = await request.json()
-        service.cancel(_tenant(x_api_key, authorization), payload["request_id"])
+        service.cancel(_tenant(request), payload["request_id"])
         return {"status": "ok"}
 
     @app.post("/api/v1/create_sampling_session")
-    async def create_sampling_session(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def create_sampling_session(request: Request):
         payload = await request.json()
-        sampling_session_id = service.create_sampling_session(_tenant(x_api_key, authorization), payload)
+        sampling_session_id = service.create_sampling_session(_tenant(request), payload)
         return {"type": "create_sampling_session", "sampling_session_id": sampling_session_id}
 
     @app.post("/api/v1/asample")
-    async def asample(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def asample(request: Request):
         payload = decode_sample_request(await request.json())
-        request_id, sequence_ids = service.submit_sample(_tenant(x_api_key, authorization), payload)
+        request_id, sequence_ids = service.submit_sample(_tenant(request), payload)
         return {"request_id": request_id, "sample_sequence_ids": sequence_ids}
 
     @app.get("/api/v1/samplers/{sampling_session_id}")
-    async def get_sampler(
-        sampling_session_id: str,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def get_sampler(request: Request, sampling_session_id: str):
         try:
-            return service.get_sampler(_tenant(x_api_key, authorization), sampling_session_id)
+            return service.get_sampler(_tenant(request), sampling_session_id)
         except UserInputError as error:
             return JSONResponse(status_code=404, content={"error": str(error)})
 
     @app.post("/api/v1/weights_info")
-    async def weights_info(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
+    async def weights_info(request: Request):
         payload = await request.json()
         try:
-            return service.weights_info(_tenant(x_api_key, authorization), payload["tinker_path"])
+            return service.weights_info(_tenant(request), payload["tinker_path"])
         except UserInputError as error:
             return JSONResponse(status_code=404, content={"error": str(error)})
 
     @app.get("/api/v1/training_runs/{model_id}")
-    async def training_run(
-        model_id: str, x_api_key: str | None = Header(default=None), authorization: str | None = Header(default=None)
-    ):
+    async def training_run(request: Request, model_id: str):
         try:
-            return render_training_run(service.training_run(_tenant(x_api_key, authorization), model_id))
+            return render_training_run(service.training_run(_tenant(request), model_id))
         except UserInputError as error:
             return JSONResponse(status_code=404, content={"error": str(error)})
 
     @app.delete("/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_id:path}")
-    async def delete_checkpoint(
-        model_id: str,
-        checkpoint_id: str,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        service.delete_checkpoint(_tenant(x_api_key, authorization), model_id, checkpoint_id)
+    async def delete_checkpoint(request: Request, model_id: str, checkpoint_id: str):
+        service.delete_checkpoint(_tenant(request), model_id, checkpoint_id)
         return Response(status_code=204)
 
     return app
+
 
 async def _json_or_empty(request: Request) -> dict:
     try:
