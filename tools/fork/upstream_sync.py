@@ -26,6 +26,8 @@ Example:
   python tools/fork/upstream_sync.py --dry-run --check
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
