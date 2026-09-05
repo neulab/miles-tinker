@@ -101,7 +101,8 @@ def sample_once(sampling_client, prompt_ids: list[int], stop, max_tokens: int = 
 
 def chat_prompt(tokenizer, text: str) -> list[int]:
     messages = [{"role": "user", "content": text}]
-    return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+    rendered = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    return [int(token) for token in tokenizer.encode(rendered, add_special_tokens=False)]
 
 
 def check_stop_ids(checks: Checks, tokenizer, sampling_client) -> None:
