@@ -386,10 +386,20 @@ class TrainerController:
 
     # ------------------------ API :: multi-LoRA slot commands ------------------------
 
-    async def _execute_slots(self, fn_name: str, **kwargs) -> list:
-        results = await asyncio.gather(*[cell.execute(fn_name, **kwargs) for cell in self._cells])
+    async def _execute_slots(self, fn_name: str, *, kill_on_failure: bool = True, **kwargs) -> list:
+        results = await asyncio.gather(
+            *[cell.execute(fn_name, kill_on_failure=kill_on_failure, **kwargs) for cell in self._cells]
+        )
         # one trainer cell; its result is the per-actor list
         return results[0]
+
+    def _survives_checkpoint_failure(self) -> bool:
+        """LoRA slot checkpoints (lora/checkpoint.py) fail on every rank together with no collective
+        left pending, so a bad or unwritable client checkpoint must not take the trainer down. Full
+        fine-tuning goes through Megatron's dist checkpointing, and slot init / forward_backward /
+        optim_step can raise from inside a collective: only recycling the cell gets those ranks back
+        in step, so they keep cell.execute's default."""
+        return getattr(self.args, "tinker_train_mode", "lora") == "lora"
 
     async def forward_backward(self, unit_id: int, data_ref) -> list:
         return await self._execute_slots("forward_backward", unit_id=unit_id, rollout_data_ref=data_ref)
@@ -403,12 +413,21 @@ class TrainerController:
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> None:
+        survivable = ckpt_path is not None and self._survives_checkpoint_failure()
         await self._execute_slots(
-            "load_slot", slot=slot, rank=rank, alpha=alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer
+            "load_slot",
+            kill_on_failure=not survivable,
+            slot=slot,
+            rank=rank,
+            alpha=alpha,
+            ckpt_path=ckpt_path,
+            load_optimizer=load_optimizer,
         )
 
     async def save_slot(self, slot: int, path: str) -> None:
-        await self._execute_slots("save_slot", slot=slot, path=path)
+        await self._execute_slots(
+            "save_slot", kill_on_failure=not self._survives_checkpoint_failure(), slot=slot, path=path
+        )
 
     async def unload_slot(self, slot: int) -> None:
         await self._execute_slots("unload_slot", slot=slot)

@@ -310,6 +310,34 @@ async def test_load_state_takes_rank_and_alpha_from_the_sidecar(service):
     assert (service.backend.named("load_slot")[-1]["rank"], service.models[other].lora_rank) == (8, 8)
 
 
+@pytest.mark.parametrize(
+    "error, category",
+    [
+        (RuntimeError("load_slot(slot=1) failed on 8/8 rank(s)"), "server"),
+        (UserInputError("not this gateway's"), "user"),
+    ],
+)
+async def test_a_failed_load_state_fails_its_promise_and_keeps_the_model_usable(service, error, category):
+    model_id = await created_model(service)
+    slot = service.models[model_id].slot
+    save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
+    saved_path = (await await_settled(service, "tenant", save)).result["path"]
+
+    service.backend.fail_next = error
+    load = service.submit(
+        "tenant", "load_state", {"model_id": model_id, "seq_id": 2, "path": saved_path, "optimizer": True}
+    )
+    promise = await await_settled(service, "tenant", load)
+    assert (promise.state, promise.error_category) == (FAILED, category)
+
+    # the slot stays allocated (the backend re-initialized it) and the stream keeps flowing
+    assert model_id in service.models and slot not in service.free_slots
+    fb = service.submit("tenant", "forward_backward", fb_payload(model_id, 3, [row()]))
+    step = service.submit("tenant", "optim_step", _optim_payload(model_id, 4))
+    assert (await await_settled(service, "tenant", fb)).state == DONE
+    assert (await await_settled(service, "tenant", step)).state == DONE
+
+
 async def test_a_foreign_checkpoint_is_rejected_as_a_user_error(service):
     victim = await created_model(service, tenant="tenant-a")
     thief = await created_model(service, tenant="tenant-b")

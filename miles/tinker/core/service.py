@@ -620,6 +620,8 @@ class TinkerService:
             write_sidecar(path, sidecar_meta(record, self.config, "weights", name))
             return [{"kind": "save_state", "path": f"tinker://{record.model_id}/weights/{name}"}]
         if unit.kind == "load_state":
+            # a raise here fails this promise only (_run_barrier); the backend leaves the slot freshly
+            # initialized, so the model stays usable and its window keeps whatever dirt it had
             await self._load_state(record, payload)
             stream.dirty = None
             return [{"kind": "load_state"}]
