@@ -60,6 +60,15 @@ class MilesBackend(ExecutorBackend):
         an empty update-weights round for LoRA (adapters are pushed per version)."""
         if self.train_mode == "full":
             await self.trainer.update_weights()
+            if getattr(self.args, "check_weight_update_equal", False):
+                # same post-push audit train.py runs: engines compare their weights against the checkpoint
+                mismatches = await self.inference_controller.check_weights(
+                    action="compare",
+                    allow_quant_error=self.args.check_weight_update_allow_quant_error,
+                    selector=self.args.check_weight_update_selector,
+                    skip_list=self.args.check_weight_update_skip_list,
+                )
+                logger.info(f"tinker warmup: check_weights(compare) -> {mismatches}")
             return
         info = await self.inference_controller.start_update_weights()
         await self.inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
