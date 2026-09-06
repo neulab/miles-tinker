@@ -75,3 +75,16 @@ base, and the FORK.md rationale for the file. Resolve with:
 - [ ] `tools/fork/upstream_state.json` committed with the new `base_commit` and date
 - [ ] `FORK.md` table still describes every fork delta (removed ones deleted, new ones added)
 - [ ] summary to the user: base used, whether the stack has merged into main, files that conflicted and how each was resolved, test counts
+
+
+## Keeping the GitHub mirror branches current
+
+`neulab/miles-tinker` publishes `main` as an untouched mirror of upstream `main`
+and `upstream/multi-lora-v2` as the PR-stack head the fork is built on (see
+"Repository layout" in FORK.md). After a sync, refresh them from the fork clone:
+
+```bash
+python tools/fork/upstream_sync.py --check --push-mirror     # pushes refs/remotes/upstream/main -> origin main (+ the stack head while unmerged)
+```
+
+Never commit on `main`; GitHub's `main...miles-tinker` compare view is the fork delta.

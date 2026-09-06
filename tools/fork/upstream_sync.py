@@ -17,6 +17,9 @@ Args:
     the fork already contains the base, 1 when a sync is needed, 2 when the
     preview shows conflicts.
   --dry-run: never run a mutating git command (no fetch, merge, state write).
+  --push-mirror: after the fetch, push upstream ``main`` to the fork's origin
+    ``main`` (an untouched mirror) and the unmerged stack head to
+    ``upstream/multi-lora-v2``, so GitHub shows the fork delta.
   --no-tests: skip the fast test run after a clean merge.
   --python: interpreter for the tests (default: $MILES_FAST_PYTHON or this one).
   --state: path of the state json (default: tools/fork/upstream_state.json).
@@ -229,6 +232,23 @@ def record_state(path: Path, state: dict, plan: SyncPlan, fork_commit: str, test
     path.write_text(json.dumps(updated, indent=2) + "\n")
 
 
+def mirror_refspecs(remote: str, main_branch: str, stack_branch: str, stack_merged: bool) -> tuple[str, ...]:
+    """Ref specs that publish the upstream branches the fork is measured against:
+    ``main`` as an untouched mirror of upstream main (GitHub's compare view then
+    shows the fork delta) and, while the PR stack is unmerged, its head under
+    ``upstream/multi-lora-v2``."""
+    specs = [f"refs/remotes/{remote}/{main_branch}:refs/heads/{main_branch}"]
+    if not stack_merged:
+        specs.append(f"refs/remotes/{remote}/{stack_branch}:refs/heads/upstream/multi-lora-v2")
+    return tuple(specs)
+
+
+def push_mirror(repo: Path, origin: str, refspecs: tuple[str, ...]) -> None:
+    for spec in refspecs:
+        git(repo, "push", origin, spec)
+        print(f"mirrored {spec} -> {origin}")
+
+
 def integrate(repo: Path, plan: SyncPlan, rebase: bool) -> int:
     if rebase:
         return subprocess.run(["git", "-C", str(repo), "rebase", plan.base_ref]).returncode
@@ -245,6 +265,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-tests", action="store_true")
+    parser.add_argument(
+        "--push-mirror",
+        action="store_true",
+        help="also push upstream main (and the unmerged stack head) to the fork's origin as mirror branches",
+    )
+    parser.add_argument("--origin", default="origin", help="remote that holds the fork (for --push-mirror)")
     parser.add_argument("--python", default=os.environ.get("MILES_FAST_PYTHON", sys.executable))
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH)
     return parser.parse_args(argv)
@@ -262,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
     head = git(repo, "rev-parse", "HEAD")
     plan = make_plan(repo, state, remote, head)
     print(describe_plan(plan, branch, args.rebase))
+    if args.push_mirror and not args.dry_run:
+        push_mirror(
+            repo,
+            args.origin,
+            mirror_refspecs(remote, "main", state["stack"]["branch"], plan.stack_merged),
+        )
     if plan.up_to_date:
         return EXIT_OK
     if args.check or args.dry_run:

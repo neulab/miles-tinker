@@ -11,6 +11,16 @@ Branch: `miles-tinker`. Base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
 `upstream/yueming/multi-lora-example` @ `06716481e`), see
 `tools/fork/upstream_state.json` for the recorded sync state.
 
+## Repository layout (github.com/neulab/miles-tinker)
+
+| Branch | Content | Rule |
+|---|---|---|
+| `miles-tinker` (default) | upstream base + every fork commit | all fork work lands here; PRs target it |
+| `main` | untouched mirror of `radixark/miles` `main` | never commit to it; refreshed by `upstream_sync.py --push-mirror` (or `git push origin upstream/main:main`) so GitHub's compare view (`main...miles-tinker`) shows the fork delta |
+| `upstream/multi-lora-v2` | the upstream PR-stack head the fork is currently based on | bookkeeping only; dropped once the stack merges upstream |
+
+Remotes on a working clone: `origin` = neulab/miles-tinker, `upstream` = https://github.com/radixark/miles.git.
+
 ## Base branch strategy
 
 1. **Now:** the fork is based on the open PR stack because the Tinker gateway
@@ -75,6 +85,7 @@ the rationale column of this table, so keep one row per file or directory
 
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
+| `README.md` | fork banner prepended above upstream's README (conflict policy: keep the banner, take upstream's body) | no |
 | `FORK.md` | this file | no |
 | `tools/fork/` | `upstream_sync.py` + `upstream_state.json`: base selection, merge/rebase, conflict report, fast tests, state record | no |
 | `tests/fast/fork/` | tests for the sync tool | no |

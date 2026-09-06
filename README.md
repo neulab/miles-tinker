@@ -1,3 +1,11 @@
+> **This is `neulab/miles-tinker`, a fork of [radixark/miles](https://github.com/radixark/miles).**
+> It adds a [Tinker](https://tinker-docs.thinkingmachines.ai)-compatible training and sampling
+> service (`serve_tinker.py`) with LoRA and full fine-tuning so unmodified `tinker-cookbook` and
+> `platoon` clients can train on a miles cluster. Branch `miles-tinker` carries the fork; `main` is an
+> untouched mirror of upstream `main`; `upstream/multi-lora-v2` is the upstream PR stack the fork is
+> built on. Every fork change is listed in [FORK.md](FORK.md); sync with
+> `tools/fork/upstream_sync.py` (or the `upstream-sync` skill). Upstream's README follows.
+
 <div align="center">
 
 <img src="https://raw.githubusercontent.com/radixark/miles/main/docs/assets/images/brand/miles_logo.png" alt="Miles Logo" width="340">

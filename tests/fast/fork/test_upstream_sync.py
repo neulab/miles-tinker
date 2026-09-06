@@ -189,3 +189,13 @@ def test_conflict_stops_with_a_report(repo: Path, capsys):
     assert code == sync.EXIT_CONFLICT
     assert "CONFLICTS (1 files)" in out and "common.txt: 1 conflict hunk(s)" in out
     assert "not listed -> prefer upstream" in out
+
+
+def test_mirror_refspecs_publish_main_and_the_unmerged_stack_head():
+    assert sync.mirror_refspecs("upstream", "main", "yueming/multi-lora-example", stack_merged=False) == (
+        "refs/remotes/upstream/main:refs/heads/main",
+        "refs/remotes/upstream/yueming/multi-lora-example:refs/heads/upstream/multi-lora-v2",
+    )
+    assert sync.mirror_refspecs("upstream", "main", "yueming/multi-lora-example", stack_merged=True) == (
+        "refs/remotes/upstream/main:refs/heads/main",
+    )
