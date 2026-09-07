@@ -119,11 +119,40 @@ EOF
 pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
 WORKER_PID=$!
 
-cleanup() { local st=$?; trap - EXIT; echo "cleanup status=$st $(date)"
-  [[ -n ${HEAD_PID:-} ]] && kill -TERM "$HEAD_PID" 2>/dev/null || true
-  kill -TERM "$WORKER_PID" 2>/dev/null || true; sleep 5
-  kill -KILL "$WORKER_PID" 2>/dev/null || true; kill -KILL "${HEAD_PID:-0}" 2>/dev/null || true
-  rm -f "$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint"; wait 2>/dev/null || true; exit "$st"; }
+# ---------------------------------------------------------------- teardown
+# PBS ends the job only when this batch shell exits, so teardown must (1) never block and (2) leave no
+# process behind: killing singularity's starter orphans everything it spawned (ray daemons, actors,
+# SGLang engines holding the GPUs), so each node runs kill-leftovers.sh before the shell exits.
+cat > "$JOBDIR/kill-leftovers.sh" <<'EOF'
+#!/bin/bash
+# usage: kill-leftovers.sh [logdir]  (with logdir, appends to <logdir>/teardown-<host>.log)
+[[ $(hostname -s) == login* ]] && { echo "refusing to run on $(hostname -s)" >&2; exit 1; }
+[[ -n ${1:-} ]] && exec >> "$1/teardown-$(hostname -s).log" 2>&1
+me=$(id -un)
+NAMES='python|python3|raylet|gcs_server|starter|starter-suid|sinit'
+CMDS='^(ray::|sglang::|/usr/bin/singularity)'
+left=$( { pgrep -u "$me" -a -x "$NAMES"; pgrep -u "$me" -a -f "$CMDS"; } 2>/dev/null | sort -u)
+n=$(printf '%s' "$left" | grep -c .)
+echo "$(hostname -s): $n leftover process(es) $(date +%T)"; printf '%s\n' "$left" | head -12 | cut -c1-160
+if (( n > 0 )); then
+  pkill -KILL -u "$me" -x "$NAMES" 2>/dev/null; pkill -KILL -u "$me" -f "$CMDS" 2>/dev/null
+  sleep 2; echo "$(hostname -s): $(pgrep -u "$me" -x "$NAMES" | wc -l) left after kill"
+fi
+exit 0
+EOF
+chmod +x "$JOBDIR/kill-leftovers.sh"
+
+cleanup() { local st=$?; trap - EXIT TERM INT; echo "cleanup status=$st $(date)"
+  rm -f "$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint"
+  local pids=(${HEAD_PID:-} "$WORKER_PID")
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  for t in $(seq 1 30); do kill -0 "${pids[@]}" 2>/dev/null || break; sleep 1; done
+  kill -KILL "${pids[@]}" 2>/dev/null || true
+  # wait on these pids only: a bare `wait` blocks forever on the tee process substitution behind launcher.log
+  wait "${pids[@]}" 2>/dev/null || true
+  bash "$JOBDIR/kill-leftovers.sh" || true
+  pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash "$JOBDIR/kill-leftovers.sh" "$JOBDIR" || true
+  echo "teardown done $(date)"; exit "$st"; }
 trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
 
 # ---------------------------------------------------------------- head + driver + gateway (node 0)

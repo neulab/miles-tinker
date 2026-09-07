@@ -113,7 +113,8 @@ ABCI login nodes are shared and monitored; a Tinker client (rollouts, rendering,
 core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`; the
 launcher starts it once the gateway is healthy with `TINKER_BASE_URL`, `ENDPOINT_FILE`, `JOBDIR`, `RUN_NAME`,
 `HF_HOME` and `no_proxy` exported, logs it to `$JOBDIR/client.log` (exit code in `client.status`), and ends the
-job when the client finishes (`KEEP_GATEWAY=1` keeps serving). Ready-made scripts:
+job when the client finishes (the nodes are released about ten seconds later; `KEEP_GATEWAY=1` keeps
+serving). Ready-made scripts:
 
 ```bash
 # SDK smoke + sampler/trainer probe + short MFU benchmark (LoRA or full)
@@ -138,7 +139,7 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 | Artifact | Path |
 |---|---|
 | Gateway checkpoints (`tinker://<model_id>/weights/<name>`, `.../sampler_weights/<name>`, `tinker_meta.json` sidecars) | `$PROJECT_ROOT/checkpoints/<RUN_NAME>/<model_id>/...` (`--checkpoint-root`) |
-| Launcher / head / worker logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head,ray-worker}.log`, `container_args.txt`, `worker.sh`, `nodes.tsv` |
+| Launcher / head / worker / client logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head,ray-worker}.log`, `client.log` + `client.status` (`CLIENT_SCRIPT`), `teardown-<worker>.log`, `container_args.txt`, `worker.sh`, `nodes.tsv` |
 | PBS stdout/err | `/home/aci18912it/miles-tinker/logs/<jobname>.o<jobid>` |
 | Ray session logs (node-local, gone with the job) | `/local/<jobid>/miles/tmp/ray/session_latest/logs` |
 | Gateway MFU / step metrics (`actor_train_mfu`, `num_tokens` ... per `optim_step`) | `$PROJECT_ROOT/checkpoints/<RUN_NAME>/perf.jsonl` (one line per slot per optim window), the same records as `tinker perf: {...}` lines in `head.log`, and the client's `metrics.jsonl` (`docs/fork/acceptance.md` section C) |
@@ -146,10 +147,12 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 
 ## 6. Stop, restart, troubleshoot
 
-- Stop: `qdel <jobid>`. The job's `cleanup` trap TERMs the head container and
-  the worker `pbsdsh`, removes the endpoint file and exits; nothing survives on
-  the nodes (each node runs a single `singularity exec` with its own PID
-  namespace).
+- Stop: `qdel <jobid>`, or let the client finish (the job ends by itself unless `KEEP_GATEWAY=1`). The
+  `cleanup` trap TERMs the two containers (each is its own PID namespace, so every ray / SGLang process
+  goes down with it within seconds), waits on those two pids only, then runs `kill-leftovers.sh` on both
+  nodes as a safety net and logs what it found in `launcher.log` (head) and `teardown-<worker>.log`; PBS
+  releases the nodes about ten seconds after the client exits. A bare `wait` in the trap blocks forever on
+  the `tee` behind `launcher.log` (bash 5.1), which is how a finished job once held both nodes until `qdel`.
 - Clients survive a gateway restart only through checkpoints: cookbook resumes
   from `checkpoints.jsonl` with `behavior_if_log_dir_exists=resume`, platoon
   through its restart wrapper; both call `/weights_info` + `load_state` on the
