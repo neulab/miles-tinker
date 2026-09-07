@@ -30,6 +30,9 @@ class ExecutorBackend:
     """What runtime.py implements. Speaks rows and plain lists; core stays
     torch-free and miles-free."""
 
+    # R3 (rollout routing replay): sequences carry routing_id, datums may carry routing_handle
+    routing_replay: bool = False
+
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> None:
@@ -72,10 +75,15 @@ class ExecutorBackend:
         raise NotImplementedError
 
     async def sample(self, payload: dict, lora_name: str | None) -> dict:
-        """-> {"sequences": [{"tokens", "logprobs", "stop_reason"}],
+        """-> {"sequences": [{"tokens", "logprobs", "stop_reason", "routing_id"?}],
         "prompt_logprobs"?, "topk_prompt_logprobs"?}. lora_name None: base
-        weights (LoRA) or the latest pushed weights (FFT)."""
+        weights (LoRA) or the latest pushed weights (FFT). payload["tenant"]
+        names the caller (R3 routing is cached per tenant)."""
         raise NotImplementedError
+
+    def sweep(self) -> None:
+        """Periodic housekeeping from the lease sweep (R3 cache TTL / byte cap); no-op by default."""
+        return None
 
 
 class TinkerService:
@@ -267,6 +275,8 @@ class TinkerService:
             raise UserInputError(
                 f"{total_tokens} tokens exceeds max_tokens_per_request={self.config.max_tokens_per_request}"
             )
+        if kind == "forward_backward" and self.backend.routing_replay and not any("routing_handle" in r for r in rows):
+            logger.warning(f"R3 enabled but no datum carries routing_handle ({len(rows)} datums in this request)")
 
     def retrieve(self, tenant: str, request_id: str) -> Promise | None:
         """None -> the HTTP layer answers 410."""
@@ -317,6 +327,7 @@ class TinkerService:
         lora_name = self._resolve_sampler(tenant, model_path) if model_path else None
         promise = self.promises.create(model_path or "base", tenant)
         sequence_ids = [f"seq-{uuid.uuid4().hex}" for _ in range(payload.get("num_samples", 1))]
+        payload = {**payload, "tenant": tenant}  # R3 caches routing per tenant
         task = asyncio.create_task(self._run_sample(promise.request_id, payload, lora_name))
         self._sample_tasks[promise.request_id] = (task, tenant, sampling_session_id, lora_name, dedup_key)
         task.add_done_callback(lambda _t, rid=promise.request_id: self._sample_done(rid))
@@ -401,6 +412,13 @@ class TinkerService:
         while True:
             await asyncio.sleep(30)
             await self._sweep_once()
+            self._sweep_backend()
+
+    def _sweep_backend(self) -> None:
+        try:
+            self.backend.sweep()
+        except Exception as error:  # noqa: BLE001  housekeeping never stops the lease sweep
+            logger.warning(f"backend sweep failed: {type(error).__name__}: {error}")
 
     async def _sweep_once(self) -> None:
         now = time.monotonic()
@@ -525,7 +543,8 @@ class TinkerService:
     async def _run_work(self, unit: WorkUnit) -> None:
         # slot-contiguous order; outputs come back aligned to it
         refs = sorted(unit.rows, key=lambda ref: ref.stream.slot)
-        slot_rows = [(ref.stream.slot, ref.row) for ref in refs]
+        # rows are tagged with their tenant (R3 routing is cached per tenant); shallow copies
+        slot_rows = [(ref.stream.slot, {**ref.row, "tenant": ref.stream.tenant}) for ref in refs]
         self._unit_counter += 1
         run = self.backend.forward_backward if unit.kind == "forward_backward" else self.backend.forward_only
         poison = unit.kind == "forward_backward"
@@ -786,7 +805,9 @@ def _plain_metrics(metrics) -> dict:
     flag carries the meaning)."""
     if not isinstance(metrics, dict):
         metrics = {"grad_norm": metrics}
-    return {key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()}
+    return {
+        key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()
+    }
 
 
 def _finite_float(value) -> float:

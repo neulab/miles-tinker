@@ -31,7 +31,12 @@ ADAM_PARAM_DEFAULTS = {
 }
 
 # wire loss_fn_inputs key -> internal row key
-INPUT_ROW_KEYS = {"weights": "weights", "advantages": "advantages", "logprobs": "sampling_logprobs"}
+INPUT_ROW_KEYS = {
+    "weights": "weights",
+    "advantages": "advantages",
+    "logprobs": "sampling_logprobs",
+    "routing_handle": "routing_handle",  # R3: int64 [1] = routing_id of the sample call the datum came from
+}
 
 
 def decode_command(kind: str, payload: dict) -> tuple[str, dict]:
@@ -100,9 +105,19 @@ def build_row(input_tokens: list[int], inputs: dict[str, list], index: int) -> d
         )
     row = {"tokens": input_tokens + targets[-1:], "target_len": len(targets)}
     for wire_key, row_key in INPUT_ROW_KEYS.items():
-        if wire_key in inputs:
+        if wire_key not in inputs:
+            continue
+        if wire_key == "routing_handle":
+            row[row_key] = _routing_handle(inputs[wire_key], index)
+        else:
             row[row_key] = [float(value) for value in inputs[wire_key]]
     return row
+
+
+def _routing_handle(values: list, index: int) -> int:
+    if len(values) != 1:
+        raise UserInputError(f"datum {index}: routing_handle must hold exactly one value, got {len(values)}")
+    return int(values[0])
 
 
 def _decode_inputs(loss_fn_inputs: dict) -> dict[str, list]:
