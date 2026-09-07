@@ -61,6 +61,7 @@ from miles.backends.megatron_utils.model import (
 )
 from miles.backends.training_utils.data import get_data_iterator
 from miles.backends.training_utils.log_utils import aggregate_train_losses
+from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.backends.training_utils.loss_hub.tinker_losses import drain_per_datum_outputs, start_per_datum_outputs
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.replay_data import rollout_replay_stage
@@ -114,7 +115,7 @@ def forward_backward(
     start_per_datum_outputs()
     try:
         with rollout_replay_stage(args, model, data_iterator, num_microbatches, rollout_data, stage="replay_backward"):
-            with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+            with timer(tinker_perf.ACTOR_TRAIN_TIMER), fused_lm_head.maybe_activate(args, model):
                 losses_reduced = run_forward_backward_pass(
                     args, dumper_phase_util, data_iterator, model, num_microbatches[0], num_rollouts=None
                 )

@@ -17,6 +17,7 @@ from miles.backends.megatron_utils.full import executor as full_executor
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
 from miles.backends.megatron_utils.lora import executor as lora_executor
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
+from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
@@ -392,7 +393,7 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
-        with timer(f"{store_prefix}log_probs"):
+        with timer(f"{store_prefix}log_probs"), fused_lm_head.maybe_activate(self.args, self.model):
             return forward_only(
                 get_log_probs_and_entropy,
                 self.args,

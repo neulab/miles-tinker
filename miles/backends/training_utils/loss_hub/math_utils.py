@@ -13,6 +13,7 @@ from miles.backends.training_utils.cp_utils import (
     slice_log_prob_with_cp,
     slice_loss_masks_for_local_cp,
 )
+from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.backends.training_utils.parallel import get_parallel_state
 
 _LOG_RATIO_EXP_CLAMP = 20.0
@@ -970,6 +971,16 @@ def calculate_log_probs_and_entropy(
     sampling_mask: torch.Tensor | None = None,
     temperature: float = 1.0,
 ):
+    if fused_lm_head.is_active():
+        # `logits` are the TP-mapped hidden rows [R, H]; the fused head projects them in chunks.
+        assert not with_entropy, "the fused lm head computes target log-probs only (no entropy)"
+        assert not true_on_policy, "the fused lm head does not support --true-on-policy-mode"
+        assert sampling_mask is None, "the fused lm head does not support sampling masks"
+        log_prob = fused_lm_head.target_logprobs(
+            logits, tokens, tp_group, temperature=temperature, chunk_size=fused_lm_head.chunk_size()
+        )
+        return log_prob.unsqueeze(-1), None
+
     if true_on_policy:
         assert temperature == 1.0, "true-on-policy scales logits in _iter_response_chunks"
         return _calculate_log_probs_and_entropy_true_on_policy(
