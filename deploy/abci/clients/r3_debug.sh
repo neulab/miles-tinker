@@ -42,7 +42,10 @@ expect_log "every registered router got its rows" 'R3 fill rollout_routed_expert
 step 4 "prefix-parent hits (routing_cache cut ladder)"
 grep -E 'prefix parent hit' "$HEAD_LOG" | head -5
 expect_log "gateway saw a prefix-parent hit on an extended turn" 'prefix parent hit .*routed_experts_start_len=[1-9]'
-expect_log "optim metrics count prefix-parent hits" '"routing_prefix_hits": [1-9]'
+# the driver's "tinker perf" line can trail the probe's exit by a second, so allow head.log
+# a few retries and accept the probe's own printout of the same metrics
+expect_metric() { local what=$1 pattern=$2 i; for i in 1 2 3 4 5; do if grep -qE -- "$pattern" "$HEAD_LOG" "$JOBDIR/client.log" 2>/dev/null; then echo "PASS $what: $(grep -hE -- "$pattern" "$HEAD_LOG" "$JOBDIR/client.log" | head -1 | cut -c1-200)"; return; fi; sleep 2; done; echo "FAIL $what: /$pattern/ not in head.log or client.log"; FAILED=$((FAILED + 1)); }
+expect_metric "optim metrics count prefix-parent hits" "routing_prefix_hits.: [1-9]"
 
 step 5 "no replay error, no opaque router IndexError"
 if grep -qE 'ReplayError|pop_forward out of range' "$HEAD_LOG"; then
