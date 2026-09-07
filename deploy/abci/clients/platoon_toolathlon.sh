@@ -6,9 +6,11 @@
 # chains secrets.env, mode 0600) - never in the batch shell, the service helper or any container.
 # Knobs: CONFIG (plugin-relative yaml), WORKERS (3), MAX_RESTARTS (20), RESTART_DELAY (700 s >= lease 600 + sweep 30
 # + margin), KEEP_CKPTS (2), WANDB_MODE (online), WANDB_TRIAL (RUN_NAME), EXTRA (verbatim platoon --a.b.c overrides).
-# Restart/resume: platoon.train.tinker.restart_wrapper restarts the trainer on the watchdog exit code (2); the
-# gateway frees the single full-FT slot on SESSION_END (TINKER_TELEMETRY=1) or lease expiry (600 s), so the next
-# attempt re-acquires it after RESTART_DELAY and rl.py resumes from <log_path>/<experiment>/<trial>/checkpoints.jsonl.
+# Restart/resume: platoon.train.tinker.restart_wrapper restarts the trainer on the watchdog exit code (2). The SDK
+# sends SESSION_END (TINKER_TELEMETRY=1) only from a fatal-exception path - never on a clean exit, an os._exit(2) or
+# the graceful SIGTERM exit of rl.py - so in practice the gateway frees the single full-FT slot on lease expiry
+# (600 s + <= 30 s sweep), which RESTART_DELAY covers; the next attempt then re-acquires it and rl.py resumes from
+# <log_path>/<experiment>/<trial>/checkpoints.jsonl.
 set -euo pipefail
 MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}
 source "$MILES_SRC/deploy/clients/hostguard.sh"
