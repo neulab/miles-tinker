@@ -33,6 +33,7 @@ from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
 from miles.utils.memory_utils import clear_memory
 from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.replay_base import all_replay_managers
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
 
@@ -146,6 +147,13 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    # The replay managers are process-wide singletons and every MoE router appends
+    # itself to manager.replays as it is constructed, so a rebuild in this process
+    # must start from an empty registration list (otherwise the live routers sit at
+    # stream indices the fill never reaches).
+    for manager in all_replay_managers:
+        manager.reset_registrations()
+
     # Multi-LoRA and single-LoRA (actor, bridge) both build via the bridge helper,
     # which picks the adapter type internally.
     if is_multi_lora_enabled(args) or (
@@ -163,6 +171,12 @@ def setup_model_and_optimizer(
 
             provider_func = wrap_model_provider_with_inkling_lora(provider_func, args)
         model = get_model(provider_func, ModelType.encoder_or_decoder)
+
+    for manager in all_replay_managers:
+        logger.info(
+            f"R3 registration ({role}): {manager.name} replay manager enabled={manager.enabled}, "
+            f"{len(manager.replays)} routers registered by this model build"
+        )
 
     if args.debug_disable_optimizer:
         if is_first_replica_megatron_main_rank():
@@ -468,11 +482,16 @@ def run_forward_backward_pass(args, dumper_phase_util, data_iterator, model, num
 
             set_tokens_per_adapter_slot(model, batch["adapter_token_counts"])
 
-        from miles.utils.replay_base import all_replay_managers
+        from miles.utils.replay_base import REPLAY_STAGES, all_replay_managers
 
+        # Only a manager whose queues were loaded for this pass takes the forward
+        # stream. A manager left at "fallthrough" (nothing filled) or "record" keeps
+        # its stage: forcing "replay_forward" on an enabled-but-unfilled manager made
+        # every router pop from an empty queue.
         old_stages = [m.stage for m in all_replay_managers]
         for m in all_replay_managers:
-            m.stage = "replay_forward"
+            if m.stage in REPLAY_STAGES:
+                m.stage = "replay_forward"
 
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"

@@ -30,6 +30,16 @@ class _FakeIterator:
         return {key: self._batch[key] for key in keys}
 
 
+class _FakeReplay:
+    """A registered module's queue: fill_replay_data only counts the rows it appends."""
+
+    def __init__(self):
+        self.top_indices_list = []
+
+    def record(self, rows):
+        self.top_indices_list.append(rows)
+
+
 def _rows(num_tokens: int, base: int) -> torch.Tensor:
     # row i of a sample = the routing used when token i was the input: one row per token but the last
     return (torch.arange((num_tokens - 1) * NUM_LAYERS * TOPK, dtype=torch.int32) + base).reshape(
@@ -49,9 +59,13 @@ def _fill(monkeypatch, *, tp_rank: int, tp_size: int, sequence_parallel: bool):
     rollout_data = {DATA_KEY: samples, "tokens": tokens}
     iterator = _FakeIterator({DATA_KEY: samples, "tokens": tokens, "max_seq_lens": [4]})
     registered = []
+    replay_list = [_FakeReplay()]
 
     def register(replay_list, replay_data, *, models, **_kwargs):
         registered.append(replay_data)
+        for replay in replay_list:
+            replay.record(replay_data)
+        return len(replay_list)
 
     fill_replay_data(
         args=args,
@@ -60,7 +74,7 @@ def _fill(monkeypatch, *, tp_rank: int, tp_size: int, sequence_parallel: bool):
         num_microbatches=[1],
         rollout_data=rollout_data,
         data_key=DATA_KEY,
-        replay_list=[],
+        replay_list=replay_list,
         register_replay_list_func=register,
         if_sp_region=True,
     )

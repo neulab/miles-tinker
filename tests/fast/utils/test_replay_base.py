@@ -2,9 +2,10 @@ from tests.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
 
+import pytest
 import torch
 
-from miles.utils.replay_base import BaseReplayManager
+from miles.utils.replay_base import BaseReplayManager, ReplayError
 
 
 class _FakeReplay:
@@ -87,3 +88,65 @@ def test_get_topk_fn_preserves_partial_padding():
     topk_fn = manager.get_topk_fn(_topk, return_probs=False)
 
     torch.testing.assert_close(topk_fn(scores, 3), replayed_top_indices)
+
+
+# ------------------------------- registration bookkeeping -------------------------------
+
+
+class _Router(torch.nn.Module):
+    """The surface register_to_module touches (a Megatron TopKRouter registers itself in __init__)."""
+
+    def forward(self, x):
+        return x
+
+
+def _enabled_manager():
+    manager = BaseReplayManager()
+    manager.enabled = True
+    return manager
+
+
+def test_register_to_module_is_idempotent_per_module_instance():
+    # a router that registers twice would push every later router one stream along,
+    # and register_replay_list_* would then fill the stale half of manager.replays
+    manager = _enabled_manager()
+    router = _Router()
+
+    manager.register_to_module(router, "routing_replay")
+    manager.register_to_module(router, "routing_replay")
+
+    assert len(manager.replays) == 1
+    assert router.routing_replay is manager.replays[0]
+
+
+def test_reset_registrations_drops_a_previous_model_builds_routers():
+    # setup_model_and_optimizer calls this before the build: the managers are process-wide
+    # singletons, so without it a second build leaves the live routers at streams 40..79
+    manager = _enabled_manager()
+    first = [_Router() for _ in range(3)]
+    for router in first:
+        manager.register_to_module(router, "routing_replay")
+
+    manager.reset_registrations()
+    second = [_Router() for _ in range(3)]
+    for router in second:
+        manager.register_to_module(router, "routing_replay")
+
+    assert len(manager.replays) == 3
+    assert [router.routing_replay.index for router in second] == [0, 1, 2]
+    assert manager.get_current() is None
+
+
+def test_an_exhausted_replay_raises_a_typed_error_naming_the_manager_and_its_queues():
+    manager = _enabled_manager()
+    for _ in range(3):
+        manager.register_to_module(_Router(), "routing_replay")
+    # record() pins host memory (CUDA-only); the queue itself is a plain list
+    manager.replays[0].top_indices_list.append(torch.zeros(2, 2, dtype=torch.int32))
+
+    with pytest.raises(ReplayError) as excinfo:
+        manager.replays[2].pop_forward()
+
+    message = str(excinfo.value)
+    assert "pop_forward out of range" in message
+    assert "replays=3" in message and "non_empty=1" in message and "rows_per_replay=[0, 1]" in message

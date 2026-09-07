@@ -1,17 +1,22 @@
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Protocol
 
 import torch
 
-from miles.utils.replay_base import BaseReplayManager, all_replay_managers
+from miles.utils.replay_base import BaseReplayManager, ReplayError, all_replay_managers
 
 from .cp_utils import slice_with_cp
 from .parallel import get_parallel_state
 
+logger = logging.getLogger(__name__)
+
 
 class RegisterReplayListFunc(Protocol):
-    def __call__(self, replay_list: list, replay_data: torch.Tensor, **kwargs) -> None: ...
+    """Records one microbatch into the module replay queues; returns the stream count it mapped."""
+
+    def __call__(self, replay_list: list, replay_data: torch.Tensor, **kwargs) -> int | None: ...
 
 
 def register_replay_list_sequential(replay_list, replay_data, **_kwargs):
@@ -29,6 +34,7 @@ def register_replay_list_sequential(replay_list, replay_data, **_kwargs):
                 f"replay stream_idx {stream_idx} out of range " f"(replay_data has {replay_data.shape[1]} streams)"
             )
         replay.record(replay_data[:, stream_idx])
+    return len(replay_list)
 
 
 def fill_replay_data(
@@ -74,7 +80,18 @@ def fill_replay_data(
         )
         return torch.cat([data, pad_tensor], dim=0)
 
-    for _ in range(sum(num_microbatches)):
+    num_mbs = int(sum(num_microbatches))
+    if num_mbs <= 0 or not replay_list:
+        raise ReplayError(
+            f"{data_key}: nothing to fill (num_microbatches={list(num_microbatches)}, "
+            f"registered replays={len(replay_list)}). The pass still runs at least one forward "
+            "(forward_backward_no_pipelining always runs the last microbatch), so every router "
+            "would pop from an empty queue."
+        )
+    rows_before = [len(replay.top_indices_list) for replay in replay_list]
+    num_streams = None
+
+    for _ in range(num_mbs):
         batch = data_iterator[0].get_next([data_key, "tokens", "max_seq_lens"])
         replay_data = batch[data_key]
         tokens = batch["tokens"]
@@ -130,7 +147,20 @@ def fill_replay_data(
             start, end = seqlen // tp_size * tp_rank, seqlen // tp_size * (tp_rank + 1)
             replay_data = replay_data[start:end]
 
-        register_replay_list_func(replay_list, replay_data, models=models)
+        num_streams = register_replay_list_func(replay_list, replay_data, models=models)
+
+    recorded = [len(replay.top_indices_list) - before for replay, before in zip(replay_list, rows_before, strict=True)]
+    logger.info(
+        f"R3 fill {data_key}: microbatches={num_mbs} replays={len(replay_list)} streams={num_streams} "
+        f"rows_recorded={sum(recorded)} rows_per_replay={sorted(set(recorded))}"
+    )
+    if any(rows != num_mbs for rows in recorded):
+        raise ReplayError(
+            f"{data_key}: the fill left {sum(1 for rows in recorded if rows != num_mbs)} of {len(replay_list)} "
+            f"replays off the expected {num_mbs} rows (rows_per_replay={sorted(set(recorded))}); "
+            f"{getattr(register_replay_list_func, '__name__', register_replay_list_func)} "
+            "did not cover every registered router"
+        )
 
     del rollout_data[data_key]
 
@@ -155,6 +185,13 @@ def rollout_replay_stage(args, models, data_iterator, num_microbatches, rollout_
     stage falls through to the live router. Inactive managers are untouched.
     """
     active = active_rollout_replay_managers(args)
+    for m in all_replay_managers:
+        if m.enabled and m not in active:
+            logger.warning(
+                f"R3: the {m.name} replay manager is enabled (--use-{m.name}-replay) and its routers "
+                f"registered {len(m.replays)} replays, but --use-rollout-{m.name}-replay is off, so this pass "
+                "loads no rows and the routers stay on the live router"
+            )
     try:
         for m in active:
             fill_replay_data(

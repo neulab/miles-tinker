@@ -11,32 +11,65 @@ def _get_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+# The stages in which the router pops recorded rows instead of routing live.
+REPLAY_STAGES = ("replay_forward", "replay_backward")
+
+
+class ReplayError(RuntimeError):
+    """R3 replay bookkeeping is inconsistent.
+
+    Always a bug in the wiring (registration, fill, or stage handling), never a
+    data condition: an uncovered datum is expressed as all -1 rows, not as a
+    missing queue. Raised with the counts that identify which of the three is
+    broken instead of surfacing as an opaque IndexError deep inside the router.
+    """
+
+
 class Replay:
-    def __init__(self, stream_idx: int | None = None):
+    def __init__(self, stream_idx: int | None = None, manager=None, index: int = -1):
         self.stream_idx = stream_idx
         self.forward_index = 0
         self.backward_index = 0
         self.top_indices_list: list[torch.Tensor] = []
+        # identity for diagnostics: which manager registered this replay, and its
+        # position in manager.replays (= the stream index register_replay_list_* maps to)
+        self.manager = manager
+        self.index = index
 
     def record(self, top_indices: torch.Tensor):
         buf = torch.empty_like(top_indices, device="cpu", pin_memory=True)
         buf.copy_(top_indices)
         self.top_indices_list.append(buf)
 
+    def _exhausted(self, op: str, cursor: int) -> ReplayError:
+        shapes = [t.shape if isinstance(t, torch.Tensor) else f"non-tensor({type(t)})" for t in self.top_indices_list]
+        manager = self.manager
+        context = ""
+        if manager is not None:
+            lengths = [len(r.top_indices_list) for r in manager.replays]
+            context = (
+                f"; manager {manager.name}: enabled={manager.enabled} stage={manager.stage} "
+                f"replays={len(manager.replays)} non_empty={sum(1 for n in lengths if n)} "
+                f"rows_per_replay={sorted(set(lengths))}"
+            )
+        return ReplayError(
+            f"rank {_get_rank()}: {op} out of range on {getattr(manager, 'name', '?')} replay "
+            f"{self.index}: {op.split('_')[1]}_index={cursor}, "
+            f"len(top_indices_list)={len(self.top_indices_list)}, shapes={shapes}{context}. "
+            "The queues this router reads were never filled: check the 'R3 fill' and "
+            "'R3 registration' INFO lines for this rank."
+        )
+
     def pop_forward(self) -> torch.Tensor:
         if self.forward_index >= len(self.top_indices_list):
-            shapes = [
-                t.shape if isinstance(t, torch.Tensor) else f"non-tensor({type(t)})" for t in self.top_indices_list
-            ]
-            raise IndexError(
-                f"pop_forward out of range: forward_index={self.forward_index}, "
-                f"len(top_indices_list)={len(self.top_indices_list)}, shapes={shapes}"
-            )
+            raise self._exhausted("pop_forward", self.forward_index)
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
         return top_indices.to(torch.cuda.current_device())
 
     def pop_backward(self) -> torch.Tensor:
+        if self.backward_index >= len(self.top_indices_list):
+            raise self._exhausted("pop_backward", self.backward_index)
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
         return top_indices.to(torch.cuda.current_device())
@@ -66,9 +99,24 @@ class BaseReplayManager:
         self.register_replay_list_func = None
 
     def create_replay(self, stream_idx: int | None = None) -> Replay:
-        replay = Replay(stream_idx=stream_idx)
+        replay = Replay(stream_idx=stream_idx, manager=self, index=len(self.replays))
         self.replays.append(replay)
         return replay
+
+    def reset_registrations(self) -> None:
+        """Forget every registered replay.
+
+        ``register_to_module`` appends to ``self.replays`` and the managers are
+        process-wide singletons, so a model built twice in one process would
+        leave the live routers at stream indices past the ones
+        ``register_replay_list_*`` fills -- they would pop from empty queues.
+        Called once per model build, before the routers construct themselves.
+        """
+        self.replays = []
+        self.current = None
+
+    def queue_lengths(self) -> list[int]:
+        return [len(replay.top_indices_list) for replay in self.replays]
 
     def set_current(self, replay: Replay):
         self.current = replay
@@ -145,6 +193,12 @@ class BaseReplayManager:
 
     def register_to_module(self, module, attr_name: str, stream_idx: int | None = None):
         if not self.enabled:
+            return
+        existing = getattr(module, attr_name, None)
+        if isinstance(existing, Replay) and existing.manager is self:
+            # idempotent per module instance: a second registration on the same router
+            # would grow self.replays past the number of live routers and shift every
+            # stream mapping by one (the fill then feeds stale replays).
             return
         replay = self.create_replay(stream_idx=stream_idx)
         setattr(module, attr_name, replay)

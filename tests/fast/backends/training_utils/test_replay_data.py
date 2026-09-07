@@ -7,8 +7,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import miles.backends.training_utils.cp_utils as cp_utils_mod
 import miles.backends.training_utils.replay_data as replay_data_mod
-from miles.backends.training_utils.replay_data import register_replay_list_sequential, rollout_replay_stage
+from miles.backends.training_utils.replay_data import (
+    fill_replay_data,
+    register_replay_list_sequential,
+    rollout_replay_stage,
+)
+from miles.utils.replay_base import ReplayError
 
 
 class _Replay:
@@ -115,3 +121,93 @@ def test_rollout_replay_stage_leaves_inactive_managers_alone(monkeypatch, enable
         assert manager.stage == "fallthrough"
 
     assert fills == [] and manager.cleared == 0
+
+
+# ------------------------------- fill guards (job 2245536) -------------------------------
+
+
+class _Queue:
+    """A registered router's replay queue: fill_replay_data counts the rows it holds."""
+
+    def __init__(self):
+        self.top_indices_list = []
+
+    def record(self, rows):
+        self.top_indices_list.append(rows)
+
+
+def _fill_rig(monkeypatch):
+    state = SimpleNamespace(tp=SimpleNamespace(rank=0, size=1), cp=SimpleNamespace(rank=0, size=1))
+    monkeypatch.setattr(replay_data_mod, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(cp_utils_mod, "get_parallel_state", lambda: state)
+    args = SimpleNamespace(qkv_format="thd", data_pad_size_multiplier=1, allgather_cp=False, sequence_parallel=False)
+    rows = [torch.zeros(3, 2, 2, dtype=torch.int32)]
+    tokens = [torch.zeros(4, dtype=torch.int64)]
+    batch = {"rollout_routed_experts": rows, "tokens": tokens, "max_seq_lens": [4]}
+    return args, batch
+
+
+class _Iterator:
+    def __init__(self, batch):
+        self._batch = batch
+
+    def reset(self):
+        pass
+
+    def get_next(self, keys):
+        return {key: self._batch[key] for key in keys}
+
+
+def _fill(monkeypatch, *, num_microbatches, replay_list, register):
+    args, batch = _fill_rig(monkeypatch)
+    fill_replay_data(
+        args=args,
+        models=["model"],
+        data_iterator=[_Iterator(batch)],
+        num_microbatches=num_microbatches,
+        rollout_data=dict(batch),
+        data_key="rollout_routed_experts",
+        replay_list=replay_list,
+        register_replay_list_func=register,
+        if_sp_region=True,
+    )
+
+
+def test_a_fill_with_no_microbatches_fails_typed_instead_of_leaving_empty_queues(monkeypatch):
+    # forward_backward_no_pipelining always runs the last microbatch, so num_microbatches=0
+    # still forwards once: the routers would pop from queues the fill never touched
+    with pytest.raises(ReplayError, match="nothing to fill"):
+        _fill(monkeypatch, num_microbatches=[0], replay_list=[_Queue()], register=lambda *a, **k: 0)
+
+
+def test_a_fill_against_an_unregistered_manager_fails_typed(monkeypatch):
+    with pytest.raises(ReplayError, match="registered replays=0"):
+        _fill(monkeypatch, num_microbatches=[1], replay_list=[], register=lambda *a, **k: 0)
+
+
+def test_a_fill_that_leaves_a_registered_router_empty_fails_typed(monkeypatch):
+    """A model built twice in one process leaves manager.replays twice as long as the live
+    routers, and the moe mapping fills only the stale first half. Before, the second half
+    stayed empty and the run died with an opaque IndexError inside Megatron's router."""
+    stale, live = [_Queue(), _Queue()], [_Queue(), _Queue()]
+
+    def register_first_half(replay_list, replay_data, *, models, **_kwargs):
+        for replay in replay_list[: len(replay_list) // 2]:
+            replay.record(replay_data)
+        return len(replay_list) // 2
+
+    with pytest.raises(ReplayError, match=r"left 2 of 4 replays off the expected 1 rows"):
+        _fill(monkeypatch, num_microbatches=[1], replay_list=stale + live, register=register_first_half)
+
+
+def test_a_complete_fill_records_one_row_per_registered_router(monkeypatch):
+    queues = [_Queue(), _Queue()]
+
+    def register_all(replay_list, replay_data, *, models, **_kwargs):
+        for replay in replay_list:
+            replay.record(replay_data)
+        return len(replay_list)
+
+    _fill(monkeypatch, num_microbatches=[2], replay_list=queues, register=register_all)
+
+    assert [len(q.top_indices_list) for q in queues] == [2, 2]
