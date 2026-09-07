@@ -69,3 +69,33 @@ def test_optim_window_resolves_the_hf_layer_pattern_before_the_flops_model(monke
 
     assert order == ["pattern", "flops"]
     assert metrics["actor_train_tflops"] == pytest.approx(30.0)
+
+
+def test_peak_memory_metrics_are_absent_without_cuda_and_reset_the_peak(monkeypatch):
+    """Headroom per window: the numbers say whether a bigger --max-tokens-per-gpu fits (CP is always 1 here)."""
+    import miles.backends.megatron_utils.tinker_perf as tp
+
+    class _Cuda:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def is_available(self):
+            return True
+
+        def max_memory_allocated(self):
+            return 40 * 1024**3
+
+        def max_memory_reserved(self):
+            return 44 * 1024**3
+
+        def reset_peak_memory_stats(self):
+            self.reset_calls += 1
+
+    cuda = _Cuda()
+    monkeypatch.setattr(tp.torch, "cuda", cuda)
+    metrics = tp._peak_memory_metrics()
+    assert metrics == {"actor_peak_mem_alloc_gib": 40.0, "actor_peak_mem_reserved_gib": 44.0}
+    assert cuda.reset_calls == 1, "the peak must reset per window or it reports a startup transient forever"
+
+    monkeypatch.setattr(tp.torch, "cuda", type("_NoCuda", (), {"is_available": staticmethod(lambda: False)})())
+    assert tp._peak_memory_metrics() == {}

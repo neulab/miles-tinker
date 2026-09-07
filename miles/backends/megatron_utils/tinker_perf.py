@@ -11,6 +11,7 @@ computes the same values and the driver reads the first worker's.
 from argparse import Namespace
 from collections.abc import Iterable
 
+import torch
 import torch.distributed as dist
 
 from miles.utils.device_flops import local_peak_bf16_tflops
@@ -73,4 +74,29 @@ def pop_optim_window_metrics(args: Namespace) -> dict[str, float]:
         num_tokens=sum(seq_lens),
         peak_tflops=peak_tflops,
     )
-    return {**metrics, "num_tokens": sum(seq_lens), "num_datums": len(seq_lens), "num_units": num_units}
+    return {
+        **metrics,
+        **_peak_memory_metrics(),
+        "num_tokens": sum(seq_lens),
+        "num_datums": len(seq_lens),
+        "num_units": num_units,
+    }
+
+
+def _peak_memory_metrics() -> dict[str, float]:
+    """This rank's peak CUDA memory over the window, then reset the peak.
+
+    The headroom decides whether a bigger ``--max-tokens-per-gpu`` (or one more
+    row per DP rank) fits, and an OOM 20 h into a run is otherwise the first
+    time anyone learns how close it was. Reset per window so the number tracks
+    the current shape rather than a startup transient.
+    """
+    if not torch.cuda.is_available():
+        return {}
+    gib = 1024**3
+    peak = {
+        "actor_peak_mem_alloc_gib": torch.cuda.max_memory_allocated() / gib,
+        "actor_peak_mem_reserved_gib": torch.cuda.max_memory_reserved() / gib,
+    }
+    torch.cuda.reset_peak_memory_stats()
+    return peak
