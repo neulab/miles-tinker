@@ -317,7 +317,14 @@ CHECKPOINTS = [
 SESSION_URL = "http://10.0.0.42:8082"
 
 
-def _write_step9_artifacts(jobdir: Path, checkpoint_root: Path, *, good: bool) -> None:
+MCP_FAILURE = (
+    "Error in episode loop at step 0 (openhands/sdk/mcp/client.py:55 in connect)\n"
+    "MCPError: MCP Connection Failure\n"
+    "RuntimeError: Client failed to connect: fileno\n"
+)
+
+
+def _write_step9_artifacts(jobdir: Path, checkpoint_root: Path, *, good: bool, mcp_failures: int = 0) -> None:
     """Everything the assertions read, in the byte formats their producers use."""
     rundir = jobdir / "platoon-smoke" / "toolathlon-smoke" / "smoke-run-platoon-smoke"
     rollouts = rundir / "rollouts" / "train" / "0"
@@ -335,8 +342,21 @@ def _write_step9_artifacts(jobdir: Path, checkpoint_root: Path, *, good: bool) -
         events.append({"type": "trajectory_step_added", "trajectory_id": "t1", "step_index": index,
                        "step": {"action_events": [{"tool_name": "execute_bash", "tool_call_id": "c1"}]},
                        "reward": 0.0, "finish_message": None, "error_message": None})
+    # platoon.episode: one terminal record per trajectory; error_message carries the masked MCP failure
+    events.append({"type": "trajectory_finished", "trajectory_id": "t1", "reward": 1.0,
+                   "finish_message": "done", "error_message": None, "misc": {}})
     (rollouts / "events" / "events_task-1_coll1.jsonl").write_text(
         "".join(json.dumps(e) + "\n" for e in events)
+    )
+    # 9 more healthy trajectories, of which `mcp_failures` died at step 0 without an MCP bridge
+    siblings = []
+    for index in range(9):
+        failed = index < mcp_failures
+        siblings.append({"type": "trajectory_finished", "trajectory_id": f"s{index}", "reward": 0.0,
+                         "finish_message": None,
+                         "error_message": MCP_FAILURE if failed else None, "misc": {}})
+    (rollouts / "events" / "events_task-1_coll2.jsonl").write_text(
+        "".join(json.dumps(e) + "\n" for e in siblings)
     )
     # platoon.openreward.mcp_bridge._write_jsonl: json.dumps(record, sort_keys=True)
     bridge_events = [{"type": "session_started", "env": "toolathlongym", "session_url": SESSION_URL,
@@ -357,7 +377,8 @@ def _write_step9_artifacts(jobdir: Path, checkpoint_root: Path, *, good: bool) -
     )
 
 
-def _run_step9(tmp_path: Path, *, good: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+def _run_step9(tmp_path: Path, *, good: bool = True, mcp_failures: int = 0,
+               env: dict | None = None) -> subprocess.CompletedProcess:
     """Run the extracted step-9 block with a stub trainer instead of the real platoon client."""
     jobdir = tmp_path / "jobdir"
     jobdir.mkdir()
@@ -383,7 +404,7 @@ def _run_step9(tmp_path: Path, *, good: bool = True, env: dict | None = None) ->
     )
     stub.chmod(0o755)
     (tmp_path / "perf-new.jsonl").write_text("".join(json.dumps(r) + "\n" for r in PERF_NEW))
-    _write_step9_artifacts(jobdir, checkpoint_root, good=good)
+    _write_step9_artifacts(jobdir, checkpoint_root, good=good, mcp_failures=mcp_failures)
     script = tmp_path / "step9.sh"
     script.write_text(
         "set -uo pipefail\n" + _prelude() + _step9() + '\necho "FAILED=$FAILED"\nexit $(( FAILED > 0 ))\n'
@@ -427,13 +448,16 @@ def test_step9_passes_every_assertion_on_a_good_run(tmp_path):
                   "R3 left no datum uncovered", "gateway extended a turn-1 prefix",
                   "a recovery checkpoint record has a state_path", "episodes ran >= 2 agent steps",
                   "episodes emitted tool calls", "Toolathlon executed a tool",
-                  "the job's Toolathlon service served the run", "restart_wrapper saw a clean trainer exit",
+                  "the job's Toolathlon service served the run", "MCP bridges connected",
+                  "restart_wrapper saw a clean trainer exit",
                   "no watchdog kill", "no unhandled exception at exit"):
         assert f"PASS {check}" in out, (check, out)
     facts = (tmp_path / "jobdir" / "platoon-smoke" / "step9-facts.txt").read_text()
     assert "optim_windows_with_datums=2" in facts and "routing_uncovered_datums=0" in facts
     assert "routing_covered_datums=8" in facts and "routing_prefix_hits_delta=14" in facts
     assert "recovery_checkpoint_with_state_path=recovery-000001" in facts
+    assert "trajectories_finished=10 trajectories_errored=0 mcp_connection_failures=0" in facts
+    assert "mcp_failure_rate_pct=0" in facts
     assert "services-hnode001.log: 2 request lines" in out and "POST /toolathlongym/task" in out
 
 
@@ -457,3 +481,21 @@ def test_step9_reports_a_missing_perf_log_instead_of_passing_silently(tmp_path):
     out = proc.stdout + proc.stderr
     assert "FAIL trainer completed >= 2 optim steps" in out
     assert "optim_windows_with_datums=0" in out
+
+
+def test_step9_fails_when_mcp_bridges_stop_connecting(tmp_path):
+    """The 15-node regression: trajectories die at step 0 with `MCPError: MCP Connection Failure`."""
+    proc = _run_step9(tmp_path, mcp_failures=5)
+    out = proc.stdout + proc.stderr
+    assert "FAIL MCP bridges connected" in out, out
+    facts = (tmp_path / "jobdir" / "platoon-smoke" / "step9-facts.txt").read_text()
+    assert "trajectories_finished=10 trajectories_errored=5 mcp_connection_failures=5" in facts
+    assert "mcp_failure_rate_pct=50" in facts
+    assert proc.returncode == 1
+
+
+def test_step9_does_not_pass_the_mcp_check_when_no_trajectory_finished(tmp_path):
+    """rate 0 out of 0 must not read as a clean run."""
+    proc = _run_step9(tmp_path, env={"SMOKE_TRIAL": "no-such-trial"})
+    out = proc.stdout + proc.stderr
+    assert "FAIL MCP bridges connected" in out, out

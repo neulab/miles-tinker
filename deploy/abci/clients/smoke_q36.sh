@@ -238,7 +238,8 @@ for path in glob.glob(os.path.join(rollouts, "*", "events", "events_*.jsonl")):
             message = record.get("error_message") or ""
             errored += bool(message)
             mcp += "MCP Connection Failure" in message
-rate = round(100.0 * mcp / finished) if finished else 0
+# "none" (not 0) when nothing finished, so the < 10 % check cannot pass on an empty run.
+rate = round(100.0 * mcp / finished) if finished else "none"
 print(f"trajectories_finished={finished} trajectories_errored={errored} mcp_connection_failures={mcp}")
 print(f"mcp_failure_rate_pct={rate}")
 PY
