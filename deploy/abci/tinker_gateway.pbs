@@ -106,10 +106,13 @@ install -m 755 "$MILES_SRC/deploy/abci/kill-leftovers.sh" "$JOBDIR/kill-leftover
 # ---------------------------------------------------------------- node-local init on every node (also reports host -> IPoIB ip)
 cat > "$JOBDIR/node-init.sh" <<'EOF'
 #!/bin/bash
-# usage: node-init.sh <node_local>  (runs on each node via pbsdsh; prints init_ok <host> <ip> + init_info lines)
+# usage: node-init.sh <node_local> <report_file>  (runs on each node via pbsdsh; pbsdsh does NOT forward the task's
+# stdout to the caller, so every init_ok/init_info line is also written to <report_file>, which the launcher reads)
 set -u
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}   # pbsdsh's environment lacks /usr/sbin, where `ip` lives
 NODE_LOCAL=$1
+REPORT=${2:-/dev/null}
+exec > >(tee -a "$REPORT") 2>&1
 mkdir -p "$NODE_LOCAL/tmp" && chmod 1777 "$NODE_LOCAL/tmp" || { echo "init_failed $(hostname -s)"; exit 1; }
 ip=$(ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}')
 echo "init_ok $(hostname -s) $ip"
@@ -125,10 +128,12 @@ chmod +x "$JOBDIR/node-init.sh"
 declare -A HOST_IP=()
 for i in "${!HOSTS[@]}"; do
   if dry; then
-    show "pbsdsh[init ${HOSTS[$i]}]" pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL"
+    show "pbsdsh[init ${HOSTS[$i]}]" pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL" "$JOBDIR/init-${HOSTS[$i]}.txt"
     out="init_ok ${HOSTS[$i]} ${DRY_IPS[$i]:-10.0.0.$((i + 1))}"
   else
-    out=$(pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL")
+    report="$JOBDIR/init-${HOSTS[$i]}.txt"; : > "$report"
+    pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL" "$report" || true   # stdout is not forwarded
+    out=$(cat "$report")
   fi
   printf '%s\n' "$out"
   while read -r tag host ip _; do [[ $tag == init_ok && -n $ip ]] && HOST_IP[$host]=$ip; done <<< "$out"
@@ -267,7 +272,7 @@ if [[ $SERVICES == 1 ]]; then
   [[ -r $TOOLATHLON_ENV ]] || { echo "TOOLATHLON_ENV not readable: $TOOLATHLON_ENV" >&2; exit 2; }
   for i in "${!ENGINE_HOSTS[@]}"; do
     launch_bg "$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
-      pbsdsh -n "${ENGINE_VIDX[$i]}" -- "${PBSDSH_ENV[@]}" "PBS_JOBID=$PBS_JOBID" "PBS_LOCALDIR=$PBS_LOCALDIR" \
+      pbsdsh -n "${ENGINE_VIDX[$i]}" -- "${PBSDSH_ENV[@]}" "PBS_JOBID=$PBS_JOBID" "PBS_LOCALDIR=$PBS_LOCALDIR" "SERVICE_LOG=$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
         "PLATOON_ROOT=$PLATOON_ROOT" "TOOLATHLON_ENV=$TOOLATHLON_ENV" "MILES_SRC=$MILES_SRC" \
         OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only \
         /bin/bash "$MILES_SRC/deploy/abci/toolathlon_service.sh"

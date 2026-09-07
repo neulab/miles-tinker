@@ -11,6 +11,8 @@
 set -euo pipefail
 umask 077
 DRY_RUN=${DRY_RUN:-0}
+# pbsdsh does not forward stdout: log to the file the launcher names (services-<host>.log) instead
+[[ -n ${SERVICE_LOG:-} && ${DRY_RUN} != 1 ]] && exec >> "$SERVICE_LOG" 2>&1
 # The launcher never passes credentials (env -i); drop the ten accepted names anyway before anything else runs.
 for secret_name in WANDB_API_KEY OPENAI_API_KEY OPENAI_BASE_URL LITELLM_API_KEY LITELLM_BASE_URL RUBRIC_DEFAULT_LLM \
                    HF_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do unset "$secret_name"; done
