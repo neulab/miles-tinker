@@ -144,6 +144,23 @@ containing `smoke`. The yaml itself is never modified. The whole run is wrapped 
 `SMOKE_WANDB` (offline; `online` writes to the production W&B project), `SMOKE_EXPERIMENT`,
 `SMOKE_TRIAL`, `CONFIG`.
 
+Every run-size value above is a `${KNOB:-default}`, so the same block can be run at **production
+rollout concurrency** on the 5-node smoke: `PLATOON_WORKERS` x `PLATOON_GROUP_SIZE` is the number
+of concurrent root trajectories in the one asyncio client process (production is 3 x 8 = 24), plus
+`PLATOON_BATCH_SIZE`, `PLATOON_QUORUM`, `PLATOON_MIN_SUCCESS` (keep the last two in
+`[1, group_size]`), `PLATOON_TRAIN_STEPS`, `PLATOON_MAX_STEPS`, `PLATOON_ROLLOUT_TIMEOUT`,
+`PLATOON_STEP_TIMEOUT`, `PLATOON_STRAGGLER_TIMEOUT`, `PLATOON_WATCHDOG`.
+`submit_toolathlon.sh` forwards all of them (and `OPENREWARD_STREAM_ISOLATION`) through `qsub -v`.
+This matters because the client-side failure modes of the 15-node runs only appear once rollouts
+overlap: run `ta15-rec-q36-r3-v1` lost 968 of 1060 trajectories to `MCPError: MCP Connection
+Failure` at 24 concurrent while the 4-concurrent smoke lost 0 of 34 on the same code:
+
+```bash
+MILES_SRC=$PWD PLATOON_ROOT=/home/aci18912it/source/platoon-tinker PLATOON_STEP=1 PLATOON_TIMEOUT=4200 \
+  PLATOON_WORKERS=3 PLATOON_GROUP_SIZE=8 PLATOON_BATCH_SIZE=3 PLATOON_QUORUM=6 PLATOON_MIN_SUCCESS=4 \
+  bash deploy/abci/submit_toolathlon.sh smoke --walltime 2:00:00
+```
+
 Its named checks and the evidence each reads (`$RUN=$JOBDIR/platoon-smoke/<experiment>/<trial>`):
 
 | Check | Evidence |
@@ -156,6 +173,7 @@ Its named checks and the evidence each reads (`$RUN=$JOBDIR/platoon-smoke/<exper
 | episodes emitted tool calls | `"tool_name":` in the same events (OpenHands `ActionEvent`) |
 | Toolathlon executed a tool | `"type": "tool_result"` in `.../openreward/<task>/<id>/bridge/bridge_events.jsonl` |
 | the job's Toolathlon service served the run | that bridge's `session_started` carries the job's `OPENREWARD_SESSION_URLS_TOOLATHLON` URL |
+| MCP bridges connected (< 10% of trajectories lost at step 0) | `mcp_failure_rate_pct` over every `trajectory_finished` record under `$RUN/rollouts/train`: the share whose `error_message` contains `MCP Connection Failure`. `none` (no terminal record) also fails |
 | clean trainer exit, no watchdog kill, no unhandled exception | `Training completed successfully` and no `WATCHDOG: ... Forcing exit` in `$JOBDIR/platoon-smoke/platoon-step9.log`, no traceback in its last 40 lines |
 
 The service's own access lines (`services-<host>.log`) are printed as context, not as a verdict:
