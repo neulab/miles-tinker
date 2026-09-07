@@ -25,6 +25,24 @@ from miles.utils.flops_utils import (
 S64K = 65536
 QWEN36_LINEAR = dict(num_k_heads=16, num_v_heads=32, k_dim=128, v_dim=128, conv_kernel=4)
 QWEN36_LAYER_TYPES = [FULL_ATTENTION if (i + 1) % 4 == 0 else LINEAR_ATTENTION for i in range(40)]
+# megatron/training/arguments.py defaults, present on every trainer Namespace whether or not the model is MLA
+MEGATRON_MLA_DEFAULTS = dict(
+    multi_latent_attention=False,
+    q_lora_rank=None,
+    kv_lora_rank=32,
+    qk_head_dim=128,
+    qk_pos_emb_head_dim=64,
+    v_head_dim=128,
+)
+ZEROED_MLA_FIELDS = dict(q_lora_rank=None, kv_lora_rank=None, qk_head_dim=0, qk_pos_emb_head_dim=0, v_head_dim=0)
+DEEPSEEK_MLA = dict(
+    multi_latent_attention=True,
+    q_lora_rank=1536,
+    kv_lora_rank=512,
+    qk_head_dim=128,
+    qk_pos_emb_head_dim=64,
+    v_head_dim=128,
+)
 
 
 def dense_args(**overrides):
@@ -40,11 +58,7 @@ def dense_args(**overrides):
         moe_ffn_hidden_size=None,
         moe_router_topk=1,
         moe_shared_expert_intermediate_size=None,
-        q_lora_rank=None,
-        kv_lora_rank=None,
-        qk_head_dim=0,
-        qk_pos_emb_head_dim=0,
-        v_head_dim=0,
+        **MEGATRON_MLA_DEFAULTS,
     )
     return SimpleNamespace(**(base | overrides))
 
@@ -64,11 +78,7 @@ def qwen36_args(**overrides):
         moe_router_topk=8,
         moe_shared_expert_intermediate_size=512,
         moe_layer_freq=[1] * 40,
-        q_lora_rank=None,
-        kv_lora_rank=None,
-        qk_head_dim=0,
-        qk_pos_emb_head_dim=0,
-        v_head_dim=0,
+        **MEGATRON_MLA_DEFAULTS,
         attention_output_gate=True,
         flops_layer_types=None,
         flops_linear_attention=None,
@@ -181,6 +191,47 @@ def test_qwen36_64k_total_matches_the_hand_formula():
     )
     assert calculate_fwd_flops([S64K], args) == expected
     assert expected / S64K == pytest.approx(11.20e9, rel=1e-3)  # docs/fork/mfu.md
+
+
+def test_megatron_mla_defaults_do_not_leak_into_a_non_mla_model():
+    """The trainer passes its raw Megatron Namespace (kv_lora_rank=32, qk_pos_emb_head_dim=64,
+    v_head_dim=128 by default); only kv_channels=256 prices Qwen3.6's 10 full-attention layers."""
+    real = qwen36_args(flops_layer_types=QWEN36_LAYER_TYPES, flops_linear_attention=QWEN36_LINEAR)
+    zeroed = qwen36_args(
+        flops_layer_types=QWEN36_LAYER_TYPES, flops_linear_attention=QWEN36_LINEAR, **ZEROED_MLA_FIELDS
+    )
+    del zeroed.multi_latent_attention
+    assert real.kv_lora_rank == 32 and real.qk_pos_emb_head_dim == 64 and real.v_head_dim == 128
+    for s in (2048, 16384, S64K):
+        assert calculate_fwd_flops([s], real) == calculate_fwd_flops([s], zeroed)
+    assert calculate_fwd_flops([S64K], real) / S64K == pytest.approx(11.20e9, rel=1e-3)
+
+
+def test_mla_formulas_stay_live_for_deepseek_style_args():
+    plain = dense_args(attention_output_gate=False)
+    mla = dense_args(attention_output_gate=False, **DEEPSEEK_MLA)
+    s = 4096
+    h, heads, groups = 2048, 16, 4
+    q = 2 * s * 1536 * (h + heads * (128 + 64))
+    kv = 2 * s * (512 * (h + heads * (128 + 128)) + h * 64)
+    scores = 2 * heads * s * s * (128 + 64) / 2
+    av = heads * s * s * 128
+    plain_attention = (
+        2 * s * h * heads * 128 + 2 * 2 * s * h * groups * 128 + 2 * heads * s * s * 128 / 2 + heads * s * s * 128
+    )
+    assert calculate_fwd_flops([s], mla) - calculate_fwd_flops([s], plain) == 8 * (
+        q + kv + scores + av - plain_attention
+    )
+    # the switch alone decides: the same lora/head dims with multi_latent_attention=False price as GQA
+    assert calculate_fwd_flops(
+        [s], dense_args(attention_output_gate=False, **{**DEEPSEEK_MLA, "multi_latent_attention": False})
+    ) == calculate_fwd_flops([s], plain)
+    # namespaces without the switch (HF adapter output, hand-built args) fall back to kv_lora_rank being set
+    legacy = dense_args(
+        attention_output_gate=False, **{k: v for k, v in DEEPSEEK_MLA.items() if k != "multi_latent_attention"}
+    )
+    del legacy.multi_latent_attention
+    assert calculate_fwd_flops([s], legacy) == calculate_fwd_flops([s], mla)
 
 
 def test_qwen36_64k_old_over_new_ratio_is_in_band():
@@ -357,5 +408,17 @@ def test_hf_config_adapter_carries_the_pattern_and_the_gate():
     assert adapted.flops_layer_types == QWEN36_LAYER_TYPES
     assert adapted.flops_linear_attention == QWEN36_LINEAR
     assert adapted.attention_output_gate is True
+    assert adapted.multi_latent_attention is False
+    deepseek = flops_args_from_hf_config(
+        SimpleNamespace(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            vocab_size=8,
+            intermediate_size=16,
+            kv_lora_rank=512,
+        )
+    )
+    assert deepseek.multi_latent_attention is True
     megatron = qwen36_args(flops_layer_types=QWEN36_LAYER_TYPES, flops_linear_attention=QWEN36_LINEAR)
     assert calculate_fwd_flops([4096, S64K], adapted) == calculate_fwd_flops([4096, S64K], megatron)

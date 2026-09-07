@@ -104,6 +104,7 @@ class RoutingCache:
         self._evictions = 0
         self._releases = 0
         self._capture_rejected = 0
+        self._prefix_hits = 0  # find_prefix_parent() lookups that reused a cached parent (P > 0)
         # unique per process and across restarts (a stale handle never resolves to a fresh entry)
         self._next_id = (secrets.randbits(ROUTING_ID_BITS - 9) << 8) + 1
 
@@ -132,6 +133,7 @@ class RoutingCache:
                 if reuse <= 0:
                     return None
                 self.pin(parent)
+                self._prefix_hits += 1
                 return parent, reuse
         return None
 
@@ -228,6 +230,7 @@ class RoutingCache:
                 "releases": self._releases,
                 "pinned": sum(1 for e in self._entries.values() if e.pending_count > 0),
                 "capture_rejected": self._capture_rejected,
+                "prefix_hits": self._prefix_hits,
             }
 
     def get(self, routing_id: int) -> RoutingEntry | None:

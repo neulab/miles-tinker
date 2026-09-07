@@ -15,7 +15,11 @@ needed. Model args come from ``scripts/models/qwen3.6-35B-A3B.py``; the
 launcher overrides its ``--mtp-num-layers 1`` with ``0`` (argparse last wins)
 and never passes ``--enable-mtp-training``: the engines run without EAGLE, the
 fused lm head cannot serve the MTP block's logits, and one layer of activations
-is saved. The engines load the MTP weights from HF and never use them.
+is saved. The bridge itself derives ``mtp_num_layers=1`` from the HF config, so
+it is ``_apply_bridge_runtime_config`` (miles/backends/megatron_utils/
+model_provider.py) that carries the 0 onto the provider and skips the MTP block;
+the unused HF ``mtp.*`` tensors are never requested by the Megatron-param-driven
+bridge load. The engines load the MTP weights from HF and never use them.
 
 Numerics are matched across the two sides: the engines run with
 ``--sglang-enable-fp32-lm-head`` and the trainer scores the same fp32 logits
@@ -242,7 +246,8 @@ def serve(args: ScriptArgs):
         f"--moe-token-dispatcher-type {args.moe_token_dispatcher_type} "
     )
 
-    # last-wins over the model definition's --mtp-num-layers 1; no --enable-mtp-training
+    # last-wins over the model definition's --mtp-num-layers 1; no --enable-mtp-training.
+    # The bridge provider only sees it through _apply_bridge_runtime_config (model_provider.py).
     mtp_args = "--mtp-num-layers 0 "
 
     sglang_args = (

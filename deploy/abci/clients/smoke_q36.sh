@@ -2,12 +2,23 @@
 # CLIENT_SCRIPT for tinker_gateway.pbs: the 5-node Qwen3.6-35B-A3B smoke (design 10.2 steps 1-8) on the head node.
 # Launch with deploy/abci/submit_toolathlon.sh smoke (MODE=full, SERVICES=1, TRAIN_NODES=4, LAUNCHER_ARGS=--check-weight-update-equal).
 # Steps that need a different gateway configuration are RELAUNCHES of the same preset (they cannot be toggled per
-# request): step 3 (R3 equivalence) needs `LAUNCHER_ARGS="--check-weight-update-equal --tinker-r3-check"` with
-# R3_CHECK=1 (and MILES_TEST_R3_THRESHOLD=0.02 in EXTRA_ARGS if the launcher forwards it); the strict-policy half of
-# step 2 needs `EXTRA_ARGS="--tinker-routing-replay-policy strict"` with R3_POLICY=strict; the fused-head on/off
-# compare of step 4 needs a relaunch without --fused-lm-head-logprobs (FUSED_HEAD=0) - each relaunch re-runs this
-# script and the relevant checks pick up the mode from R3_CHECK / R3_POLICY / FUSED_HEAD.
+# request). LAUNCHER_ARGS are options of the typer launcher (examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve
+# --help), NOT serve_tinker.py flags: the launcher emits `--tinker-r3-check` itself from `--r3-check`, and a
+# `--tinker-*` token in LAUNCHER_ARGS is rejected by typer only after the whole Ray cluster is up.
+#   step 3 (R3 equivalence):
+#     LAUNCHER_ARGS="--check-weight-update-equal --r3-check --extra-env-vars MILES_TEST_R3_THRESHOLD=0.02" R3_CHECK=1
+#     (`--extra-env-vars` is the only path to the Ray trainer actors, where miles/utils/replay_base.py reads the
+#     env var; EXTRA_ARGS is serve argv only, the containers run --cleanenv; without it the gate is 1e-2)
+#   strict-policy half of step 2:
+#     EXTRA_ARGS="--tinker-routing-replay-policy strict" R3_POLICY=strict (or LAUNCHER_ARGS ... --routing-policy strict);
+#     only step 1 and the R3 probe run: every other client trains datums without a routing_handle, which strict
+#     fails typed by design
+#   fused-head on/off compare of step 4:
+#     LAUNCHER_ARGS="--check-weight-update-equal --no-fused-lm-head" FUSED_HEAD=0
+# Each relaunch re-runs this script and the relevant checks pick up the mode from R3_CHECK / R3_POLICY / FUSED_HEAD.
 # Knobs: MODEL_NAME, BENCH_DATUMS (32), BENCH_SEQ_LEN (65536), R3_POLICY (natural), R3_CHECK (0), FUSED_HEAD (1).
+# The SDK sends SESSION_END only from a fatal-exception path (never on a clean exit), so every client here frees
+# its model itself (unload_model at exit); a client that leaks one holds the single full-FT slot for the 600 s lease.
 set -uo pipefail
 MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}
 source "$MILES_SRC/deploy/clients/hostguard.sh"
@@ -38,25 +49,35 @@ expect_log "HostCache[routed_experts] allocated (node memory plan)" 'HostCache\[
 expect_log "warmup check_weights: 0 mismatches" 'check_weight|mismatch' "$HEAD_LOG"
 grep -E 'mismatch' "$HEAD_LOG" | head -5
 
-step 2 "SDK 0.27.1 smoke (proto) then the 0.16.1 R3 probe (policy=${R3_POLICY:-natural})"
+R3_POLICY=${R3_POLICY:-natural}
+step 2 "0.16.1 R3 probe (policy=$R3_POLICY) then the SDK 0.27.1 smoke (proto)"
+run "$PLATOON_PY" deploy/clients/tinker_r3_probe.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" --policy "$R3_POLICY"
+# the gateway logs the first prefix-parent hits (runtime.py _begin_capture) and counts them in the optim metrics
+expect_log "gateway saw a prefix-parent hit on an extended turn" 'prefix parent hit .*routed_experts_start_len=[1-9]' "$HEAD_LOG"
+expect_log "optim metrics count prefix-parent hits (routing_prefix_hits)" '"routing_prefix_hits": [1-9]' "$HEAD_LOG"
+if [[ $R3_POLICY == strict ]]; then
+  echo "SKIP (R3_POLICY=strict): the SDK smoke, the 64k bench, the numerics check and the resume gate train datums"
+  echo "  without a routing_handle, which strict fails typed by design; run them on the natural-policy launch"
+  echo; echo "smoke_q36 done (strict): $FAILED failed step(s)/check(s) ($(date))"
+  exit $(( FAILED > 0 ))
+fi
 run "$COOKBOOK_PY" deploy/clients/tinker_sdk_smoke.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" --lora-rank 8 --steps 2 --unload-before-resume --resume-without-optimizer
-run "$PLATOON_PY" deploy/clients/tinker_r3_probe.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" --policy "${R3_POLICY:-natural}"
-expect_log "gateway logged routed_experts_start_len on an extended turn" 'routed_experts_start_len' "$HEAD_LOG"
 
-step 3 "R3 equivalence (relaunch with --tinker-r3-check; R3_CHECK=${R3_CHECK:-0})"
+step 3 "R3 equivalence (relaunch with --r3-check; R3_CHECK=${R3_CHECK:-0})"
 if [[ ${R3_CHECK:-0} == 1 ]]; then
   expect_log "replay check lines present" 'Replay check' "$HEAD_LOG"
   grep -E 'Replay check' "$HEAD_LOG" | tail -5
   echo "(threshold: MILES_TEST_R3_THRESHOLD=0.02 -> >= 98% of covered rows must match the trainer's top-k)"
 else
-  echo "SKIP: relaunch the smoke preset with LAUNCHER_ARGS='--check-weight-update-equal --tinker-r3-check' and R3_CHECK=1"
+  echo "SKIP: relaunch the smoke preset with LAUNCHER_ARGS='--check-weight-update-equal --r3-check --extra-env-vars MILES_TEST_R3_THRESHOLD=0.02' and R3_CHECK=1"
 fi
 
 step 4 "memory at 64k: one 65536-token row per DP rank (fused head ${FUSED_HEAD:-1})"
 run "$COOKBOOK_PY" deploy/clients/tinker_mfu_bench.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" \
   --num-datums "${BENCH_DATUMS:-32}" --seq-len "${BENCH_SEQ_LEN:-65536}" --steps 2 --perf-jsonl "$CHECKPOINT_ROOT/perf.jsonl"
 grep -E 'max_memory_allocated|OutOfMemory|CUDA out of memory' "$HEAD_LOG" | tail -5
-echo "(budget: max_memory_allocated < 130 GB at TP1, else relaunch with --tp 2; fused on/off compare = relaunch with FUSED_HEAD=0)"
+echo "(budget: max_memory_allocated < 130 GB at TP1, else relaunch with --tp 2; fused on/off compare = relaunch with"
+echo " LAUNCHER_ARGS='--check-weight-update-equal --no-fused-lm-head' and FUSED_HEAD=0)"
 
 step 5 "sampler-vs-trainer numerics (fp32 head both sides)"
 run "$COOKBOOK_PY" deploy/clients/tinker_onpolicy_check.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" --train-steps 1 --learning-rate 1e-6

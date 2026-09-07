@@ -10,8 +10,11 @@ Exercises the C1/C2/C6 contracts end to end:
      ``loss_fn_inputs["routing_handle"]`` = int64 ``[1]`` holding that call's ``routing_id``; datum B =
      a synthetic prompt/target that was never sampled and carries no handle. Under the gateway's
      ``natural`` policy both train and ``optim_step`` metrics must report
-     ``routing_covered_datums == 1`` and ``routing_uncovered_datums == 1``; under ``strict`` datum B's
-     ``forward_backward`` must fail with a user error while datum A trains.
+     ``routing_covered_datums == 1`` and ``routing_uncovered_datums == 1``. Under ``strict`` datum A
+     is stepped alone first (covered 1 / uncovered 0), then datum B's ``forward_backward`` must fail
+     with a user error AND poison its gradient window: the following ``optim_step`` fails typed with
+     "gradients discarded" (miles/tinker/core/service.py ``_discard_dirty``).
+     The optim metrics must also carry ``routing_prefix_hits >= 2`` (turns 2-3 reused a cached parent).
 Prints one PASS/FAIL line per check, the optim metrics, and exits non-zero on any violation.
 
 Args:
@@ -62,6 +65,7 @@ ROUTING_METRIC_KEYS = (
     "routing_cache_bytes",
     "routing_cache_pinned",
     "routing_cache_evictions",
+    "routing_prefix_hits",
 )
 TURNS = [
     "List three prime numbers below twenty and explain briefly why each is prime.",
@@ -212,24 +216,53 @@ def train_datums(checks: Checks, client, records: list[dict], tokenizer, policy:
     fb_a = client.forward_backward([datum_a], loss_fn="cispo").result()
     checks.check("datum A forward_backward (handle)", len(fb_a.loss_fn_outputs) == 1, f"metrics {sorted(fb_a.metrics or {})}")
     b_error = None
+    if policy == "strict":
+        # a strict failure poisons the whole gradient window (service._discard_dirty), so datum A must be
+        # stepped on its own before datum B is submitted
+        metrics = _optim_step_metrics(client)
+        _check_window_metrics(checks, metrics, policy, expected_uncovered=0)
+        try:
+            client.forward_backward([datum_b], loss_fn="cispo").result()
+            checks.check("datum B forward_backward fails typed under strict", False, "it trained")
+        except Exception as exc:  # noqa: BLE001  (the SDK surfaces the gateway's user error as its own exception type)
+            b_error = exc
+            checks.check("datum B forward_backward fails typed under strict", "routing" in str(exc).lower(), f"error={type(exc).__name__}: {str(exc)[:200]}")
+        try:
+            client.optim_step(types.AdamParams(learning_rate=1e-6)).result()
+            checks.check("optim_step after the strict failure fails typed (window poisoned)", False, "it stepped")
+        except Exception as exc:  # noqa: BLE001
+            checks.check("optim_step after the strict failure fails typed (window poisoned)", "gradients discarded" in str(exc), f"error={type(exc).__name__}: {str(exc)[:200]}")
+        return {"metrics": metrics, "b_error": b_error}
     try:
         fb_b = client.forward_backward([datum_b], loss_fn="cispo").result()
-        checks.check("datum B forward_backward (no handle)", policy == "natural" and len(fb_b.loss_fn_outputs) == 1, f"policy={policy} metrics {sorted(fb_b.metrics or {})}")
-    except Exception as exc:  # noqa: BLE001  (the SDK surfaces the gateway's user error as its own exception type)
+        checks.check("datum B forward_backward (no handle)", len(fb_b.loss_fn_outputs) == 1, f"policy={policy} metrics {sorted(fb_b.metrics or {})}")
+    except Exception as exc:  # noqa: BLE001
         b_error = exc
-        checks.check("datum B forward_backward fails typed under strict", policy == "strict" and "routing" in str(exc).lower(), f"policy={policy} error={type(exc).__name__}: {str(exc)[:200]}")
+        checks.check("datum B forward_backward (no handle)", False, f"policy={policy} error={type(exc).__name__}: {str(exc)[:200]}")
+    metrics = _optim_step_metrics(client)
+    _check_window_metrics(checks, metrics, policy, expected_uncovered=1)
+    return {"metrics": metrics, "b_error": b_error}
+
+
+def _optim_step_metrics(client) -> dict:
     optim = client.optim_step(types.AdamParams(learning_rate=1e-6)).result()
     metrics = dict(optim.metrics or {})
     print("optim metrics:", {k: metrics[k] for k in sorted(metrics)}, flush=True)
+    return metrics
+
+
+def _check_window_metrics(checks: Checks, metrics: dict, policy: str, expected_uncovered: int) -> None:
     missing = [k for k in ROUTING_METRIC_KEYS if k not in metrics]
     checks.check("optim metrics carry the C6 routing keys", not missing, f"missing {missing}" if missing else "all present")
     covered, uncovered = metrics.get("routing_covered_datums"), metrics.get("routing_uncovered_datums")
-    expected_uncovered = 1 if policy == "natural" else 0
     checks.check("routing_covered_datums == 1", covered == 1, f"routing_covered_datums={covered}")
     checks.check(f"routing_uncovered_datums == {expected_uncovered} ({policy})", uncovered == expected_uncovered, f"routing_uncovered_datums={uncovered}")
     checks.check("routing_capture_rejected == 0", metrics.get("routing_capture_rejected", 0) == 0, f"{metrics.get('routing_capture_rejected')}")
+    # turns 2 and 3 extend the previous turn's sequence: each must have reused a cached parent (P > 0);
+    # the counter is process-wide, so earlier clients only add to it
+    hits = metrics.get("routing_prefix_hits")
+    checks.check("routing_prefix_hits >= 2 (turns 2-3 reused a cached parent)", isinstance(hits, (int, float)) and hits >= 2, f"routing_prefix_hits={hits}")
     checks.check("grad_norm finite", np.isfinite(metrics.get("grad_norm", float("nan"))), f"grad_norm={metrics.get('grad_norm')}")
-    return {"metrics": metrics, "b_error": b_error}
 
 
 def main() -> int:

@@ -17,6 +17,11 @@ Args:
   --resume-without-optimizer: resume with ``create_training_client_from_state`` (weights only, Adam
     reset) instead of ``..._with_optimizer``; the optimizer-state load allocates a second copy of the
     Adam moments on the trainer, which does not fit for large unsharded-expert MoE models.
+  --keep-model: leave the model(s) loaded at exit. By default every model this script created and did
+    not already unload is freed in a ``finally`` (POST /api/v1/unload_model) whatever the outcome: the
+    SDK sends SESSION_END only from a fatal-exception path, never on a clean exit, so on a single-slot
+    full fine-tuning gateway a leaked model would hold the slot for the whole lease (600 s) and every
+    later client would get "serves one model at a time".
 
 Example:
   /home/aci18912it/miles-tinker/cookbook-venv/bin/python deploy/clients/tinker_sdk_smoke.py \\
@@ -159,6 +164,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--unload-before-resume", action="store_true", help="free the first model before resuming (full fine-tuning gateways serve one model at a time)")
     parser.add_argument("--resume-without-optimizer", action="store_true", help="resume weights only (create_training_client_from_state) instead of with optimizer state")
+    parser.add_argument("--keep-model", action="store_true", help="leave the model(s) loaded at exit (default: unload whatever is still resident)")
     args = parser.parse_args()
     base_url = resolve_base_url(args)
     checks = Checks()
@@ -168,6 +174,33 @@ def main() -> int:
     client = service.create_lora_training_client(base_model=args.base_model, rank=args.lora_rank)
     info = client.get_info()
     checks.check("create_lora_training_client", bool(info.model_id), f"model_id={info.model_id} is_lora={info.is_lora} rank={info.lora_rank}")
+    loaded = [info.model_id]  # models still resident on the gateway; freed at exit unless --keep-model
+    try:
+        _run_checks(args, checks, service, client, info, loaded, base_url)
+    finally:
+        unload_at_exit(checks, base_url, loaded, keep=args.keep_model)
+
+    print(f"{'FAIL' if checks.failed else 'PASS'}: {checks.failed} failed check(s)")
+    return 1 if checks.failed else 0
+
+
+def unload_at_exit(checks: Checks, base_url: str, loaded: list, keep: bool, unload=None) -> None:
+    """Free every model in ``loaded`` (in place) so a clean exit does not hold a full-FT slot
+    until the lease expires; a failed unload is a WARN, not a FAIL (the lease sweep still frees it)."""
+    unload = unload or unload_model
+    if keep:
+        print(f"keeping {loaded} loaded (--keep-model)", flush=True)
+        return
+    for model_id in list(loaded):
+        try:
+            unload(base_url, model_id)
+            loaded.remove(model_id)
+            checks.check("unload_model at exit", True, model_id)
+        except Exception as exc:  # noqa: BLE001
+            checks.warn("unload_model at exit", f"{model_id}: {type(exc).__name__}: {exc}")
+
+
+def _run_checks(args, checks: Checks, service, client, info, loaded: list, base_url: str) -> None:
     tokenizer = client.get_tokenizer()
     datums = make_datums(tokenizer)
 
@@ -187,6 +220,7 @@ def main() -> int:
     if args.unload_before_resume:
         # single-tenant (full fine-tuning) gateways serve one model at a time; the SDK has no unload call
         unload_model(base_url, info.model_id)
+        loaded.remove(info.model_id)
         checks.check("unload_model before resume", True, info.model_id)
     weights_info = service.create_rest_client().get_weights_info_by_tinker_path(state_path).result()
     checks.check(
@@ -199,15 +233,14 @@ def main() -> int:
     else:
         resume = "create_training_client_from_state_with_optimizer"
         resumed = service.create_training_client_from_state_with_optimizer(state_path)
-    checks.check(resume, resumed.get_info().model_id != info.model_id)
+    resumed_id = resumed.get_info().model_id
+    loaded.append(resumed_id)
+    checks.check(resume, resumed_id != info.model_id)
     train_rounds(checks, resumed, datums, 1, "resumed")
 
     sampler = resumed.save_weights_and_get_sampling_client()
     check_stop_ids(checks, tokenizer, sampler)
     check_stop_strings(checks, tokenizer, sampler)
-
-    print(f"{'FAIL' if checks.failed else 'PASS'}: {checks.failed} failed check(s)")
-    return 1 if checks.failed else 0
 
 
 if __name__ == "__main__":

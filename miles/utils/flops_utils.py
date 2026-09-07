@@ -7,7 +7,9 @@ lm head; ``docs/fork/mfu.md`` spells out the formulas. The optional attributes
 ``flops_layer_types`` / ``flops_linear_attention`` (filled from the HF config by
 ``ensure_hf_layer_pattern``), ``attention_output_gate`` and
 ``enable_mtp_training`` / ``mtp_num_layers`` refine the model; without them the
-dense / MoE formulas are unchanged.
+dense / MoE formulas are unchanged. The MLA (q/kv-lora, qk_pos_emb / v_head_dim)
+formulas apply only when ``multi_latent_attention`` is set (``_is_mla``): Megatron
+defaults those fields to non-zero values for every model.
 """
 
 import logging
@@ -35,8 +37,19 @@ def calculate_lm_head_flops(seqlen, hidden_size, vocab_size):
     return 2 * seqlen * hidden_size * vocab_size
 
 
+def _is_mla(args) -> bool:
+    """Multi-latent attention (DeepSeek-style) is what the q/kv-lora and
+    qk_pos_emb/v_head_dim formulas describe. Megatron's argparse defaults
+    ``kv_lora_rank=32, qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128`` for
+    EVERY model, so those fields are only meaningful when ``multi_latent_attention``
+    is set; namespaces without the flag (``flops_args_from_hf_config`` output,
+    hand-built test args) fall back to ``kv_lora_rank`` being set."""
+    return bool(getattr(args, "multi_latent_attention", getattr(args, "kv_lora_rank", None) is not None))
+
+
 def calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_heads, num_query_groups):
-    if args.q_lora_rank is None:
+    mla = _is_mla(args)
+    if not mla or args.q_lora_rank is None:
         q_flops = 2 * seqlen * hidden_size * num_attention_heads * args.kv_channels
         if getattr(args, "attention_output_gate", False):
             # Qwen3.5/3.6 ``attn_output_gate``: the q projection also emits a
@@ -49,7 +62,7 @@ def calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_head
             * args.q_lora_rank
             * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
         )
-    if args.kv_lora_rank is None:
+    if not mla:
         kv_flops = 2 * 2 * seqlen * hidden_size * num_query_groups * args.kv_channels
     else:
         kv_flops = (
@@ -66,13 +79,14 @@ def calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_head
 
 
 def calculate_attention_flops(args, seqlen, num_attention_heads):
+    mla = _is_mla(args)
     # QK^T with causal
-    if args.qk_pos_emb_head_dim:
+    if mla:
         flops = 2 * num_attention_heads * seqlen * seqlen * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
     else:
         flops = 2 * num_attention_heads * seqlen * seqlen * args.kv_channels / 2
     # A*V
-    if args.v_head_dim:
+    if mla:
         flops += num_attention_heads * seqlen * seqlen * args.v_head_dim
     else:
         flops += num_attention_heads * seqlen * seqlen * args.kv_channels
@@ -312,6 +326,7 @@ def flops_args_from_hf_config(config):
         moe_router_topk=_first(config, "num_experts_per_tok", "moe_topk", default=1),
         moe_shared_expert_intermediate_size=shared_ffn,
         moe_layer_freq=moe_layer_freq,
+        multi_latent_attention=getattr(config, "kv_lora_rank", None) is not None,
         q_lora_rank=getattr(config, "q_lora_rank", None),
         kv_lora_rank=getattr(config, "kv_lora_rank", None),
         qk_head_dim=getattr(config, "qk_nope_head_dim", None) or 0,

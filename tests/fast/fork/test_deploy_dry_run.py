@@ -263,6 +263,21 @@ def test_submit_presets_dry_run(tmp_path):
         assert "(dry run: not submitted)" in proc.stdout and "reservation" in proc.stdout
     proc = subprocess.run(["bash", str(submit), "bogus", "--dry-run"], env=env, capture_output=True, text=True)
     assert proc.returncode == 2
+    # a serve_tinker.py flag in LAUNCHER_ARGS would only be rejected by typer after the Ray cluster is up
+    proc = subprocess.run(
+        ["bash", str(submit), "smoke", "--dry-run"],
+        env={**env, "LAUNCHER_ARGS": "--check-weight-update-equal --tinker-r3-check"}, capture_output=True, text=True,
+    )
+    assert proc.returncode == 2 and "--tinker-r3-check is a serve_tinker.py flag" in proc.stderr and "--r3-check" in proc.stderr
+    proc = subprocess.run(
+        ["bash", str(submit), "smoke", "--dry-run"],
+        env={**env, "LAUNCHER_ARGS": "--check-weight-update-equal --r3-check --extra-env-vars MILES_TEST_R3_THRESHOLD=0.02",
+             "EXTRA_ARGS": "--tinker-routing-replay-policy strict"},
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    qsub = next(line for line in proc.stdout.splitlines() if line.startswith("qsub:"))
+    assert "MILES_TEST_R3_THRESHOLD=0.02" in qsub and "EXTRA_ARGS=--tinker-routing-replay-policy" in qsub.replace("\\ ", " ")
 
 
 def test_node_init_helper_finds_ip_without_usr_sbin_in_path(tmp_path):

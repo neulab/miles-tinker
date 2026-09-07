@@ -450,3 +450,82 @@ async def test_a_session_end_event_frees_the_slots_at_once(client):
     assert len(client.service.free_slots) == free_before + 1
     # telemetry without a session end (or malformed) still just accepts
     assert (await client.post("/api/v1/telemetry", content=b"not json")).json() == {"status": "accepted"}
+
+
+async def test_a_silent_session_holds_the_full_ft_slot_until_the_lease_expires():
+    """Neither SDK sends SESSION_END on a clean exit (only from a fatal-exception path), so a
+    client that exits with its model loaded holds the single full fine-tuning slot for the whole
+    lease: the next create_model is a 400 the SDK does not retry. Clients must unload_model at
+    exit (deploy/clients/*); the sweep frees the slot only after lease_timeout_s."""
+    service = make_service(retrieve_poll_timeout_s=0.2, n_slots=1, train_mode="full", lease_timeout_s=0.5)
+    assert not service.config.is_lora
+    run_task = asyncio.create_task(service.run())
+    transport = httpx.ASGITransport(app=build_app(service))
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            s1 = (
+                await client.post("/api/v1/create_session", json={"sdk_version": "0.27.1"}, headers=_headers())
+            ).json()
+            created = (
+                await client.post(
+                    "/api/v1/create_model",
+                    json={"base_model": "base", "session_id": s1["session_id"], "model_seq_id": 0},
+                    headers=_headers(),
+                )
+            ).json()
+            assert (await _poll(client, created["request_id"]))["type"] == "create_model"
+            assert not service.free_slots
+            # S1 exits cleanly: no SESSION_END, no more heartbeats. A second client (same tenant) is refused.
+            s2 = (
+                await client.post("/api/v1/create_session", json={"sdk_version": "0.16.1"}, headers=_headers())
+            ).json()
+            refused = await client.post(
+                "/api/v1/create_model",
+                json={
+                    "base_model": "base",
+                    "session_id": s2["session_id"],
+                    "model_seq_id": 0,
+                    "lora_config": {"rank": 8},
+                },
+                headers=_headers(),
+            )
+            assert refused.status_code == 400 and "one model at a time" in refused.text
+            # the second client's own SESSION_END does not free S1's model either
+            await client.post(
+                "/api/v1/telemetry",
+                json={
+                    "session_id": s2["session_id"],
+                    "events": [{"event": "SESSION_END", "session_id": s2["session_id"]}],
+                },
+                headers=_headers(),
+            )
+            still = await client.post(
+                "/api/v1/create_model",
+                json={"base_model": "base", "session_id": s2["session_id"], "model_seq_id": 1},
+                headers=_headers(),
+            )
+            assert still.status_code == 400
+            # an explicit unload frees it at once (what the deploy clients do in their finally)
+            unload = await client.post(
+                "/api/v1/unload_model", json={"model_id": created["model_id"]}, headers=_headers()
+            )
+            assert unload.status_code == 200, unload.text
+            await _poll(client, unload.json()["request_id"])
+            assert len(service.free_slots) == 1
+            # and without the unload only the lease sweep would have done it
+            created2 = (
+                await client.post(
+                    "/api/v1/create_model",
+                    json={"base_model": "base", "session_id": s2["session_id"], "model_seq_id": 2},
+                    headers=_headers(),
+                )
+            ).json()
+            await _poll(client, created2["request_id"])
+            assert not service.free_slots
+            await asyncio.sleep(0.6)
+            await service._sweep_once()
+            assert len(service.free_slots) == 1, "stale session (no heartbeat for lease_timeout_s) freed by the sweep"
+    finally:
+        for task in (run_task, getattr(service, "_sweep_task", None)):
+            if task is not None:
+                task.cancel()

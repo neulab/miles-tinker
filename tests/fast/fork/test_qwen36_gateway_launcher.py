@@ -187,3 +187,70 @@ def test_rejects_invalid_configs(launcher):
         launcher.ScriptArgs(rollout_num_gpus=12)
     with pytest.raises(AssertionError):
         launcher.ScriptArgs(max_tokens_per_gpu=4096)
+
+
+# --- LAUNCHER_ARGS strings quoted in the deploy docs/scripts must be options of `serve` -----------
+# (a serve_tinker.py flag such as --tinker-r3-check is rejected by typer only after the whole Ray
+# cluster is up: deploy/abci/tinker_gateway.pbs execs the launcher after the ray-status wait)
+
+_DOCUMENTED_LAUNCHER_ARGS_FILES = [
+    REPO_ROOT / "deploy" / "abci" / "clients" / "smoke_q36.sh",
+    REPO_ROOT / "deploy" / "abci" / "README.md",
+    REPO_ROOT / "deploy" / "abci" / "submit_toolathlon.sh",
+]
+
+
+def _documented_launcher_args() -> list[str]:
+    import re
+
+    found = []
+    for path in _DOCUMENTED_LAUNCHER_ARGS_FILES:
+        for match in re.finditer(
+            r"""LAUNCHER_ARGS=(?:\$\{LAUNCHER_ARGS:-)?(["']?)(--[^"'\n,]*?)\1(?=[\s,)}`]|$)""", path.read_text()
+        ):
+            found.append(match.group(2).strip())
+    assert found, "no LAUNCHER_ARGS strings found in the deploy docs"
+    return sorted(set(found))
+
+
+def _invoke_serve(launcher, monkeypatch, argv: list[str]):
+    from typer.testing import CliRunner
+
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    result = CliRunner().invoke(
+        launcher.app, ["serve", "--hf-checkpoint", "/x/hf", "--checkpoint-root", "/x/ckpt", *argv]
+    )
+    return result, captured
+
+
+@pytest.mark.parametrize("launcher_args", _documented_launcher_args())
+def test_documented_launcher_args_are_accepted_by_the_typer_cli(launcher, monkeypatch, launcher_args):
+    argv = shlex.split(launcher_args)
+    if any(flag in launcher_args for flag in ("--n-adapters", "--max-tokens-per-gpu")):
+        pytest.skip("README example for the generic LoRA launcher, not this typer script")
+    assert not any(token.startswith("--tinker-") for token in argv), launcher_args
+    result, captured = _invoke_serve(launcher, monkeypatch, argv)
+    assert result.exit_code == 0, f"{launcher_args!r}: {result.output}"
+    assert captured["train_script"] == "serve_tinker.py"
+
+
+def test_r3_check_relaunch_reaches_the_trainer_actors(launcher, monkeypatch):
+    """smoke_q36.sh step 3: --r3-check emits --tinker-r3-check and --extra-env-vars carries the
+    threshold to the Ray actors (replay_base.py reads MILES_TEST_R3_THRESHOLD from os.environ)."""
+    result, captured = _invoke_serve(
+        launcher,
+        monkeypatch,
+        shlex.split("--check-weight-update-equal --r3-check --extra-env-vars MILES_TEST_R3_THRESHOLD=0.02"),
+    )
+    assert result.exit_code == 0, result.output
+    argv = shlex.split(captured["train_args"])
+    assert "--tinker-r3-check" in argv and "--check-weight-update-equal" in argv
+    assert captured["config"].extra_env_vars == "MILES_TEST_R3_THRESHOLD=0.02"
+    assert U.resolve_extra_env_vars({}, captured["config"]) == {"MILES_TEST_R3_THRESHOLD": "0.02"}
+
+
+def test_serve_side_flags_are_rejected_by_the_typer_cli(launcher, monkeypatch):
+    result, captured = _invoke_serve(launcher, monkeypatch, ["--check-weight-update-equal", "--tinker-r3-check"])
+    assert result.exit_code == 2 and "No such option: --tinker-r3-check" in result.output
+    assert not captured, "execute_train must not run"

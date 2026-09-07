@@ -111,12 +111,34 @@ async def test_the_generate_body_asks_for_routing_and_the_prefix_delta_on_the_se
     (seq2,) = result2["sequences"]
     assert state["bodies"][1]["routed_experts_start_len"] == len(prompt1) + 3 - 1, "P = parent.num_rows"
     assert seq2["routing_id"] != seq1["routing_id"]
+    assert backend.routing.stats()["prefix_hits"] == 1 and backend._routing_metrics()["routing_prefix_hits"] == 1
 
     full2 = prompt2 + [50, 51, 52]
     rows = backend.routing.materialize("t", seq2["routing_id"], full2)
     assert rows.dtype == np.int32 and rows.shape == (len(full2) - 1, L, K)
     np.testing.assert_array_equal(rows, _routing_for(full2, 0)), "parent rows ++ delta rows = the full routing"
     assert backend.routing.stats()["pinned"] == 0
+
+
+async def test_prefix_parent_hits_are_logged_a_few_times_then_only_counted(router, backend, caplog):
+    """The smoke greps head.log for the INFO line; the 15-node job must not get one line per sample."""
+    import logging
+
+    from miles.tinker import runtime as runtime_module
+
+    backend._prefix_hit_logs_left = 2
+    prompt = list(range(10))
+    with caplog.at_level(logging.INFO, logger="miles.tinker.runtime"):
+        (seq,) = (await backend.sample(_payload(prompt), lora_name=None))["sequences"]
+        assert "prefix parent hit" not in caplog.text, "the first turn has no parent"
+        for turn in range(3):
+            prompt = prompt + [50, 51, 52] + [60 + turn]
+            await backend.sample(_payload(prompt), lora_name=None)
+    lines = [r.getMessage() for r in caplog.records if "prefix parent hit" in r.getMessage()]
+    assert len(lines) == 2, lines
+    assert f"routing_id={seq['routing_id']} routed_experts_start_len={len(range(10)) + 3 - 1}" in lines[0]
+    assert backend.routing.stats()["prefix_hits"] == 3
+    assert runtime_module.PREFIX_HIT_LOG_LIMIT >= 1
 
 
 async def test_a_stop_edge_row_is_trimmed(router, backend):
@@ -139,6 +161,7 @@ async def test_a_response_without_routing_fails_the_sample_as_a_server_error(rou
         "releases": 0,
         "pinned": 0,
         "capture_rejected": 1,
+        "prefix_hits": 0,
     }
 
 
@@ -251,6 +274,7 @@ class TestMaterialization:
             "routing_cache_bytes",
             "routing_cache_pinned",
             "routing_cache_evictions",
+            "routing_prefix_hits",
             "fused_lm_head",
         }
         assert set(metrics) == expected_keys

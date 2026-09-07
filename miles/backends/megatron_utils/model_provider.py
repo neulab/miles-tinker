@@ -81,6 +81,19 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # MoE token dispatcher (same-name, always present)
     provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
 
+    # MTP depth. megatron.bridge derives mtp_num_layers from the HF config
+    # (CONFIG_MAPPING mtp_num_hidden_layers -> 1 for Qwen3.5/3.6), so without this
+    # line ``--mtp-num-layers 0`` never reached the provider: provide() built the MTP
+    # block, which the fused lm head rejects at install and which otherwise trains
+    # the MTP objective (mtp_loss_scaling_factor) on a second [T, V] logits tensor.
+    # None (not 0) is what build_mtp_spec checks; same rule as the raw path below
+    # and miles_plugins/megatron_bridge/nemotron_h.py. mtp_loss_scaling_factor is
+    # left alone (inert without an MTP block).
+    provider.mtp_num_layers = getattr(args, "mtp_num_layers", None) or None
+    if getattr(args, "enable_mtp_training", False):
+        # mirror the raw path: keep RL MTP gradients out of the shared embedding / lm head
+        provider.mtp_detach_heads = True
+
     # arg name != provider field; arg default None, so propagate only when the user set it
     if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
         provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
@@ -95,6 +108,31 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
 
     if hasattr(provider, "dsa_attention_backend"):
         provider.dsa_attention_backend = getattr(args, "dsa_attention_backend", "megatron")
+
+
+def _check_bridge_mtp_depth(provider, args: argparse.Namespace) -> None:
+    """Fail at provider construction (before the HF weight load) when the bridge
+    provider's MTP depth disagrees with ``--mtp-num-layers``."""
+    wanted = getattr(args, "mtp_num_layers", None) or None
+    got = getattr(provider, "mtp_num_layers", None) or None
+    if bool(got) != bool(wanted) or (wanted and got != wanted):
+        raise ValueError(
+            f"bridge provider mtp_num_layers={got!r} disagrees with --mtp-num-layers {wanted!r}; "
+            "the bridge derives the depth from the HF config, so the runtime-config copy must override it"
+        )
+
+
+def _check_model_mtp(model, args: argparse.Namespace) -> None:
+    """A built model must not carry an MTP block when ``--mtp-num-layers`` is 0/None
+    (VL wrappers keep the GPTModel under ``language_model``). The other direction
+    is pipeline-stage dependent and is covered by ``_check_bridge_mtp_depth``."""
+    inner = getattr(model, "language_model", model)
+    if getattr(inner, "mtp_process", False) and not getattr(args, "mtp_num_layers", None):
+        raise ValueError(
+            f"{type(inner).__name__}.mtp_process is True but --mtp-num-layers is "
+            f"{getattr(args, 'mtp_num_layers', None)!r}: the MTP block would be trained "
+            "(and rejected by the fused lm head)"
+        )
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -170,6 +208,7 @@ def get_model_provider_func(
         if role == "critic":
             provider.share_embeddings_and_output_weights = False
         provider.finalize()
+        _check_bridge_mtp_depth(provider, args)
 
         def wrapped_bridge_provider(
             pre_process: bool = True,
@@ -185,6 +224,7 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            _check_model_mtp(model, args)
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config

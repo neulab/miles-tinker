@@ -177,6 +177,7 @@ def test_a_consumed_leaf_is_released_and_a_consumed_parent_follows_its_last_chil
         "releases": 2,
         "pinned": 0,
         "capture_rejected": 0,
+        "prefix_hits": 1,
     }
 
 

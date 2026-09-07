@@ -45,6 +45,12 @@ TRAIN_NODES=${TRAIN_NODES:-4}
 for v in "$MILES_SRC" "$PLATOON_ROOT" "$HF_SNAPSHOT" "${LAUNCHER_ARGS}" "${EXTRA_ARGS:-}" "$RUN_NAME"; do
   [[ $v != *,* ]] || { echo "qsub -v splits on commas; value not allowed: $v" >&2; exit 2; }
 done
+# LAUNCHER_ARGS are typer options of $LAUNCHER (`serve --help`); a serve_tinker.py flag there (e.g. --tinker-r3-check,
+# the launcher spells it --r3-check) is rejected by typer only after the whole Ray cluster is up. Serve flags go in
+# EXTRA_ARGS (appended verbatim, last wins).
+for tok in ${LAUNCHER_ARGS}; do
+  [[ $tok != --tinker-* ]] || { echo "LAUNCHER_ARGS token $tok is a serve_tinker.py flag: use the launcher option (see '$LAUNCHER serve --help', e.g. --r3-check) or put it in EXTRA_ARGS" >&2; exit 2; }
+done
 VARS="RTYPE=rt_HF,MODE=full,RUN_NAME=$RUN_NAME,SERVICES=1,TRAIN_NODES=$TRAIN_NODES,GATEWAY_LAUNCHER=$LAUNCHER,HF_SNAPSHOT=$HF_SNAPSHOT"
 VARS+=",MILES_SRC=$MILES_SRC,PLATOON_ROOT=$PLATOON_ROOT,CLIENT_SCRIPT=$CLIENT_SCRIPT,WORKERS=${WORKERS:-3},WANDB_MODE=${WANDB_MODE:-online}"
 [[ -n $CONFIG ]] && VARS+=",CONFIG=$CONFIG"

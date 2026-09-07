@@ -60,6 +60,7 @@ GENERATE_RETRY_PAUSE_S = 1.0
 # R3 (rollout routing replay) policy when a datum has no cached routing
 ROUTING_POLICY_NATURAL = "natural"  # rows of -1: the trainer routes through the live router, metrics count it
 ROUTING_POLICY_STRICT = "strict"  # the unit fails typed (category user)
+PREFIX_HIT_LOG_LIMIT = 8  # INFO lines for the first prefix-parent hits of a process (the smoke greps one)
 ROUTING_WINDOW_KEYS = ("routing_covered_datums", "routing_uncovered_datums", "routing_uncovered_rows")
 
 
@@ -81,6 +82,7 @@ class MilesBackend(ExecutorBackend):
         self.routing: RoutingCache | None = _make_routing_cache(args)
         self.routing_replay = self.routing is not None
         self.routing_policy = getattr(args, "tinker_routing_replay_policy", ROUTING_POLICY_NATURAL)
+        self._prefix_hit_logs_left = PREFIX_HIT_LOG_LIMIT
         # JSON parse / base64 decode of /generate bodies, materialization and object_store.put run off the loop
         self._routing_executor = (
             ThreadPoolExecutor(max_workers=4, thread_name_prefix="r3") if self.routing is not None else None
@@ -225,6 +227,7 @@ class MilesBackend(ExecutorBackend):
             "routing_cache_bytes": stats["bytes"],
             "routing_cache_pinned": stats["pinned"],
             "routing_cache_evictions": stats["evictions"],
+            "routing_prefix_hits": stats["prefix_hits"],
             "fused_lm_head": int(bool(getattr(self.args, "fused_lm_head_logprobs", False))),
         }
 
@@ -323,6 +326,12 @@ class MilesBackend(ExecutorBackend):
                 self.routing.pin(capture.parent)
                 capture.pins += 1
             request["routed_experts_start_len"] = capture.start_len
+            if self._prefix_hit_logs_left > 0:  # the first few hits at INFO; the count lives in routing_prefix_hits
+                self._prefix_hit_logs_left -= 1
+                logger.info(
+                    f"tinker R3: prefix parent hit routing_id={capture.parent.routing_id} "
+                    f"routed_experts_start_len={capture.start_len} prompt_len={len(prompt_tokens)}"
+                )
         return capture
 
     async def _capture_sequences(self, capture: "_RoutingCapture", bodies: list) -> tuple[list[dict], list[dict]]:
