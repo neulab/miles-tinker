@@ -58,8 +58,13 @@ VARS+=",MILES_SRC=$MILES_SRC,PLATOON_ROOT=$PLATOON_ROOT,CLIENT_SCRIPT=$CLIENT_SC
 [[ -n ${EXTRA_ARGS:-} ]] && VARS+=",EXTRA_ARGS=$EXTRA_ARGS"
 [[ -n ${KEEP_GATEWAY:-} ]] && VARS+=",KEEP_GATEWAY=$KEEP_GATEWAY"
 # Smoke-mode knobs read by clients/smoke_q36.sh; forwarded only when set (they must reach the client through -v,
-# because the CLIENT_SCRIPT inherits the job environment, not this shell's).
-for knob in R3_CHECK R3_POLICY FUSED_HEAD PLATOON_STEP SMOKE_WANDB PLATOON_TIMEOUT BENCH_DATUMS BENCH_SEQ_LEN; do
+# because the CLIENT_SCRIPT inherits the job environment, not this shell's).  The PLATOON_* run-size knobs let
+# the 5-node smoke reproduce production rollout concurrency (WORKERS x GROUP_SIZE concurrent trajectories in the
+# one client process); OPENREWARD_STREAM_ISOLATION=0 turns off platoon's stdout/stderr isolation (debug only).
+for knob in R3_CHECK R3_POLICY FUSED_HEAD PLATOON_STEP SMOKE_WANDB PLATOON_TIMEOUT BENCH_DATUMS BENCH_SEQ_LEN \
+           PLATOON_WORKERS PLATOON_GROUP_SIZE PLATOON_BATCH_SIZE PLATOON_QUORUM PLATOON_MIN_SUCCESS \
+           PLATOON_TRAIN_STEPS PLATOON_MAX_STEPS PLATOON_ROLLOUT_TIMEOUT PLATOON_STEP_TIMEOUT \
+           PLATOON_STRAGGLER_TIMEOUT PLATOON_WATCHDOG OPENREWARD_STREAM_ISOLATION; do
   [[ -n ${!knob:-} ]] || continue
   [[ ${!knob} != *,* ]] || { echo "qsub -v splits on commas; $knob value not allowed: ${!knob}" >&2; exit 2; }
   VARS+=",$knob=${!knob}"

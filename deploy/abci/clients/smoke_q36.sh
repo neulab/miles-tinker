@@ -24,6 +24,11 @@
 #   PLATOON_STEP (1; 0 skips step 9), PLATOON_TIMEOUT (2400 s), SMOKE_WANDB (offline; `online` writes to the
 #   production W&B project), SMOKE_EXPERIMENT (toolathlon-smoke), SMOKE_TRIAL ($RUN_NAME-platoon-smoke),
 #   CONFIG (the recursive yaml, plugin-relative), PLATOON_ROOT.
+# Step-9 run size (defaults = the tiny run; raise them to reproduce production concurrency on 5 nodes):
+#   PLATOON_WORKERS (2), PLATOON_GROUP_SIZE (2), PLATOON_BATCH_SIZE (2), PLATOON_QUORUM (2), PLATOON_MIN_SUCCESS (1),
+#   PLATOON_TRAIN_STEPS (2), PLATOON_MAX_STEPS (12), PLATOON_ROLLOUT_TIMEOUT (600), PLATOON_STEP_TIMEOUT (240),
+#   PLATOON_STRAGGLER_TIMEOUT (180), PLATOON_WATCHDOG (1200).  Production is WORKERS=3 GROUP_SIZE=8 (24 concurrent
+#   root trajectories in one asyncio process), which is what step 9's mcp_failure_rate_pct check is calibrated for.
 # The SDK sends SESSION_END only from a fatal-exception path (never on a clean exit), so every client here frees
 # its model itself (unload_model at exit); a client that leaks one holds the single full-FT slot for the 600 s lease.
 # Step 9's trainer does not (production does not either): it is the last step, and the lease frees the slot.
@@ -148,23 +153,28 @@ else
   # every use (`steps % recovery_every`, `1 <= min_successful_group_size <= group_size`).
   # checkpoint.every 1000 = no periodic permanent save; recovery_every 1 = one ~490 GB recovery save per step (plus
   # one at launch). The trainer still writes a permanent `final` on a clean finish (rl.py, unconditional).
+  # Every run-size value is a knob so the smoke can also be run at PRODUCTION concurrency (the client-side
+  # failure modes of the 15-node runs only appear once rollouts overlap): PLATOON_WORKERS x PLATOON_GROUP_SIZE is
+  # the number of concurrent root trajectories in the one asyncio client process (production: 3 x 8 = 24).
+  # Keep PLATOON_QUORUM and PLATOON_MIN_SUCCESS in [1, PLATOON_GROUP_SIZE] (WorkflowConfig.__post_init__), and
+  # PLATOON_BATCH_SIZE >= PLATOON_WORKERS so every worker has a group to run.
   PLATOON_ARGV=(
     "$PLATOON_PY" -m platoon.train.tinker.restart_wrapper --max-restarts 0 --restart-delay 10 --
     "$PLATOON_PY" -m platoon.openreward.train_scripts.tinker.train_tinker --config "$PLATOON_CONFIG"
     --tinker_base_url "$TINKER_BASE_URL" --log_path "$SMOKE_LOG_PATH"
     --stats.experiment_name "$SMOKE_EXPERIMENT" --stats.trial_name "$SMOKE_TRIAL"
     --stats.wandb.mode "$SMOKE_WANDB_MODE"
-    --train.max_training_steps 2 --train.batch_size 2
-    --train.num_concurrent_rollout_workflow_workers 2
-    --train.workflow_config.group_size 2
-    --train.workflow_config.straggler_quorum 2
-    --train.workflow_config.min_successful_group_size 1
-    --train.workflow_config.straggler_timeout_seconds 180
-    --train.workflow_config.rollout_config.max_steps 12
-    --train.workflow_config.rollout_config.timeout 600
-    --train.workflow_config.rollout_config.step_timeout 240
+    --train.max_training_steps "${PLATOON_TRAIN_STEPS:-2}" --train.batch_size "${PLATOON_BATCH_SIZE:-2}"
+    --train.num_concurrent_rollout_workflow_workers "${PLATOON_WORKERS:-2}"
+    --train.workflow_config.group_size "${PLATOON_GROUP_SIZE:-2}"
+    --train.workflow_config.straggler_quorum "${PLATOON_QUORUM:-2}"
+    --train.workflow_config.min_successful_group_size "${PLATOON_MIN_SUCCESS:-1}"
+    --train.workflow_config.straggler_timeout_seconds "${PLATOON_STRAGGLER_TIMEOUT:-180}"
+    --train.workflow_config.rollout_config.max_steps "${PLATOON_MAX_STEPS:-12}"
+    --train.workflow_config.rollout_config.timeout "${PLATOON_ROLLOUT_TIMEOUT:-600}"
+    --train.workflow_config.rollout_config.step_timeout "${PLATOON_STEP_TIMEOUT:-240}"
     --checkpoint.every 1000 --checkpoint.recovery_every 1
-    --watchdog.timeout_seconds 1200
+    --watchdog.timeout_seconds "${PLATOON_WATCHDOG:-1200}"
   )
   run_platoon() {
     (
@@ -182,9 +192,9 @@ else
   # single full-FT slot until the 600 s lease expires. Reap it (a no-op after a clean exit).
   pkill -u "$(id -u)" -f 'platoon\.openreward\.train_scripts\.tinker\.train_tinker' 2>/dev/null &&
     echo "(reaped a step-9 trainer that outlived the timeout)" || true
-  python3 - "$PERF_JSONL" "$PERF_BEFORE" "$SMOKE_RUNDIR/checkpoints.jsonl" > "$FACTS" <<'PY'
-import json, sys
-perf, before, ckpt = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+  python3 - "$PERF_JSONL" "$PERF_BEFORE" "$SMOKE_RUNDIR/checkpoints.jsonl" "$ROLLOUTS" > "$FACTS" <<'PY'
+import glob, json, os, sys
+perf, before, ckpt, rollouts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 def rows(path):
     try:
         return [json.loads(line) for line in open(path) if line.strip()]
@@ -209,9 +219,33 @@ recovery = [r for r in checkpoints if str(r.get("name", "")).startswith("recover
 print(f"recovery_checkpoint_with_state_path={recovery[-1]['name'] if recovery else 'none'}"
       f" ({len(recovery)} of {len(checkpoints)} records in {ckpt})")
 print(f"permanent_checkpoints={[r.get('name') for r in checkpoints if not str(r.get('name', '')).startswith('recovery-')]}")
+# Every trajectory that reached a terminal record, and how many died before their first agent step because the
+# MCP bridge would not spawn.  This is the 15-node regression (run ta15-rec-q36-r3-v1 lost 968 of 1060
+# trajectories to it): OpenHands' programmatic tool calling swapped the process-global sys.stderr for an
+# io.StringIO while a sibling rollout was spawning its bridge, so Popen could not get a stderr fd.  It only
+# appears once rollouts overlap, hence the production-concurrency knobs above.
+finished = errored = mcp = 0
+for path in glob.glob(os.path.join(rollouts, "*", "events", "events_*.jsonl")):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") != "trajectory_finished":
+                continue
+            finished += 1
+            message = record.get("error_message") or ""
+            errored += bool(message)
+            mcp += "MCP Connection Failure" in message
+rate = round(100.0 * mcp / finished) if finished else 0
+print(f"trajectories_finished={finished} trajectories_errored={errored} mcp_connection_failures={mcp}")
+print(f"mcp_failure_rate_pct={rate}")
 PY
   cat "$FACTS"
   expect_log "trainer completed >= 2 optim steps with datums" 'optim_windows_with_datums=([2-9]|[0-9]{2,})' "$FACTS"
+  # < 10 %: at production concurrency the pre-fix client lost 91 % of trajectories here (see the fact block).
+  expect_log "MCP bridges connected (< 10% of trajectories lost at step 0)" 'mcp_failure_rate_pct=[0-9]$' "$FACTS"
   expect_log "R3 covered the run's datums (routing_covered_datums > 0)" 'routing_covered_datums=[1-9]' "$FACTS"
   expect_log "R3 left no datum uncovered (routing_uncovered_datums == 0)" 'routing_uncovered_datums=0$' "$FACTS"
   expect_log "gateway extended a turn-1 prefix (routing_prefix_hits grew)" 'routing_prefix_hits_delta=[1-9]' "$FACTS"

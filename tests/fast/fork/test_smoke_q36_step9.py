@@ -75,6 +75,27 @@ def _platoon_argv() -> list[str]:
     return shlex.split(body, comments=True)
 
 
+# Every run-size value of the step-9 argv is `${KNOB:-default}` so the same block can be run at production
+# rollout concurrency on the 5-node smoke.  The tests below check the *defaults* (the tiny run) and, separately,
+# that the knob exists, is documented and is forwarded by submit_toolathlon.sh.
+_KNOB = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*):-(.*)\}$")
+
+
+def _default(token: str) -> str:
+    """`${PLATOON_WORKERS:-2}` -> `2`; anything else unchanged."""
+    match = _KNOB.match(token)
+    return match.group(2) if match else token
+
+
+def _knob_of(token: str) -> str | None:
+    match = _KNOB.match(token)
+    return match.group(1) if match else None
+
+
+def _platoon_argv_defaults() -> list[str]:
+    return [_default(tok) for tok in _platoon_argv()]
+
+
 def _override_keys() -> list[str]:
     """The train_tinker overrides of the step-9 argv (everything after the bare `--`, minus `--config`)."""
     argv = _platoon_argv()
@@ -138,7 +159,7 @@ def test_step9_runs_last_and_is_bounded_and_skippable():
 
 
 def test_step9_argv_is_the_production_entry_point_with_a_tiny_run_size():
-    argv = _platoon_argv()
+    argv = _platoon_argv_defaults()
     assert argv[:5] == ["$PLATOON_PY", "-m", "platoon.train.tinker.restart_wrapper", "--max-restarts", "0"]
     assert argv[argv.index("--") + 1:argv.index("--") + 3] == ["$PLATOON_PY", "-m"]
     assert argv[argv.index("--") + 3] == "platoon.openreward.train_scripts.tinker.train_tinker"
@@ -153,6 +174,49 @@ def test_step9_argv_is_the_production_entry_point_with_a_tiny_run_size():
     assert int(pairs["--train.workflow_config.rollout_config.max_steps"]) <= 16
     assert int(pairs["--train.workflow_config.rollout_config.timeout"]) <= 900
     assert int(pairs["--train.workflow_config.rollout_config.step_timeout"]) <= 300
+
+
+RUN_SIZE_KNOBS = {
+    "--train.max_training_steps": "PLATOON_TRAIN_STEPS",
+    "--train.batch_size": "PLATOON_BATCH_SIZE",
+    "--train.num_concurrent_rollout_workflow_workers": "PLATOON_WORKERS",
+    "--train.workflow_config.group_size": "PLATOON_GROUP_SIZE",
+    "--train.workflow_config.straggler_quorum": "PLATOON_QUORUM",
+    "--train.workflow_config.min_successful_group_size": "PLATOON_MIN_SUCCESS",
+    "--train.workflow_config.straggler_timeout_seconds": "PLATOON_STRAGGLER_TIMEOUT",
+    "--train.workflow_config.rollout_config.max_steps": "PLATOON_MAX_STEPS",
+    "--train.workflow_config.rollout_config.timeout": "PLATOON_ROLLOUT_TIMEOUT",
+    "--train.workflow_config.rollout_config.step_timeout": "PLATOON_STEP_TIMEOUT",
+    "--watchdog.timeout_seconds": "PLATOON_WATCHDOG",
+}
+
+
+def test_every_run_size_value_is_an_env_knob():
+    """The 15-node client bugs only appear once rollouts overlap, so the smoke must be able to reach
+    production concurrency (WORKERS x GROUP_SIZE = 24 trajectories) without editing this script."""
+    argv = _platoon_argv()
+    pairs = dict(zip(argv, argv[1:]))
+    for flag, knob in RUN_SIZE_KNOBS.items():
+        assert _knob_of(pairs[flag]) == knob, (flag, pairs[flag])
+
+
+def test_the_run_size_knobs_are_documented_and_forwarded_by_the_submitter():
+    header = SMOKE_TEXT.split("\nset -uo pipefail")[0]
+    submitter = (REPO / "deploy" / "abci" / "submit_toolathlon.sh").read_text()
+    forwarded = re.search(r"^for knob in (.*?); do$", submitter, re.S | re.M).group(1).split()
+    for knob in RUN_SIZE_KNOBS.values():
+        assert knob in header, knob
+        assert knob in forwarded, knob
+
+
+def test_step9_checks_the_mcp_bridge_connect_failure_rate():
+    """Run ta15-rec-q36-r3-v1 lost 968 of 1060 trajectories to `MCPError: MCP Connection Failure` at step 0.
+    The smoke has to fail on a recurrence, so it counts them from the rollout event records."""
+    body = _step9()
+    assert '"$SMOKE_RUNDIR/checkpoints.jsonl" "$ROLLOUTS"' in body
+    assert 'record.get("type") != "trajectory_finished"' in body
+    assert '"MCP Connection Failure" in message' in body
+    assert re.search(r"expect_log \"MCP bridges connected.*'mcp_failure_rate_pct=\[0-9\]\$'", body)
 
 
 @pytest.fixture(scope="module")
@@ -198,7 +262,7 @@ def platoon_config_probe(tmp_path_factory):
         "$SMOKE_TRIAL": "run-platoon-smoke",
         "$SMOKE_WANDB_MODE": "offline",
     }
-    train_argv = [substitutions.get(tok, tok) for tok in tail[3:]]
+    train_argv = [substitutions.get(_default(tok), _default(tok)) for tok in tail[3:]]
     proc = subprocess.run(
         [str(PLATOON_PY), str(probe), json.dumps(_override_keys() + ["train.definitely_not_a_field"]),
          json.dumps(train_argv)],
