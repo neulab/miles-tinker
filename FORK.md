@@ -90,8 +90,8 @@ the rationale column of this table, so keep one row per file or directory
 | `tools/fork/` | `upstream_sync.py` + `upstream_state.json`: base selection, merge/rebase, conflict report, fast tests, state record | no |
 | `tests/fast/fork/` | tests for the sync tool | no |
 | `.claude/skills/upstream-sync/` | Claude Code skill wrapping the sync tool and the conflict policy | no |
-| `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node), `pull_image.pbs`, `smoke_container.pbs`, README runbook | no |
-| `deploy/clients/` | login-node client launchers: cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
+| `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node, `CLIENT_SCRIPT` runs the client on the head node), `clients/*.sh` ready-made client scripts, `pull_image.pbs`, `smoke_container.pbs`, README runbook | no |
+| `deploy/clients/` | client launchers (refuse login nodes via `hostguard`; run them through `CLIENT_SCRIPT`): cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | `execute_train`-shaped launcher for the gateway (lora/full) on 8 + 8 GPUs | maybe (as `examples/tinker/`) once FFT lands upstream |
 | `docs/fork/` | fork overview, full fine-tuning semantics, acceptance procedure | no |
 

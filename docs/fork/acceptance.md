@@ -3,7 +3,8 @@
 Two unmodified clients must train against the gateway, in both `lora` and
 `full` mode, on Qwen3-4B-Instruct-2507 with two 8xH200 ABCI nodes (8 train
 GPUs + 8 SGLang engines), and the training MFU reported by the gateway must
-exceed 12%. Everything below runs from the login node in the fork checkout;
+exceed 12%. Clients run on the gateway job's head node through `CLIENT_SCRIPT` (see
+`deploy/abci/README.md` section 4; the launchers refuse login nodes); commands are typed in the fork checkout;
 `P=/groups/gai51740/aci18912it/miles-tinker`.
 
 ## 0. Bring up a gateway and smoke it

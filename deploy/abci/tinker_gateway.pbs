@@ -12,7 +12,8 @@
 # Two-node Tinker gateway on ABCI (singularity + PBS + Ray).
 #   node 0: ray head + miles driver (serve_tinker.py) + gateway HTTP  (one container)
 #   node 1: ray worker                                                (one container via pbsdsh)
-# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...`.
+# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...,CLIENT_SCRIPT=...,KEEP_GATEWAY=1`.
+# Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
 set -euo pipefail
 umask 077
 source /etc/profile.d/modules.sh 2>/dev/null || true
@@ -145,4 +146,27 @@ for t in $(seq 1 360); do
   kill -0 "$HEAD_PID" 2>/dev/null || { echo "head container exited early" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
   sleep 10
 done
+
+# ---------------------------------------------------------------- client on the head node (never on a login node)
+# CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway is healthy, with the
+# endpoint exported (TINKER_BASE_URL, ENDPOINT_FILE, JOBDIR, RUN_NAME, HF_HOME, no_proxy); its output goes to
+# $JOBDIR/client.log and $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1.
+if [[ -n ${CLIENT_SCRIPT:-} ]]; then
+  [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
+  echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"
+  (
+    export TINKER_BASE_URL="http://$HEAD_HOST:$TINKER_PORT" ENDPOINT_FILE="$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint" \
+           JOBDIR="$JOBDIR" RUN_NAME="$RUN_NAME" HF_HOME="$HF_HOME" \
+           no_proxy="$HEAD_HOST,$HEAD_IP,${no_proxy:-}" TINKER_API_KEY="${TINKER_API_KEY:-tml-local}"
+    cd "$MILES_SRC"
+    bash "$CLIENT_SCRIPT"
+  ) > "$JOBDIR/client.log" 2>&1
+  CLIENT_STATUS=$?
+  echo "$CLIENT_STATUS" > "$JOBDIR/client.status"
+  echo "client exited status=$CLIENT_STATUS ($(date))"
+  if [[ ${KEEP_GATEWAY:-0} != 1 ]]; then
+    echo "stopping the gateway (KEEP_GATEWAY=1 keeps it serving)"
+    exit "$CLIENT_STATUS"
+  fi
+fi
 wait "$HEAD_PID"; st=$?; echo "head exited status=$st $(date)"; exit "$st"

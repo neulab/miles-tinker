@@ -14,9 +14,9 @@ login node. Cluster facts used throughout:
 | Extra site | `extra-site/` = `pip --target` dir with `tinker` 0.27.1 (the gateway's proto codec needs it); prepended to `PYTHONPATH` |
 | HF cache | `HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface` (has `Qwen/Qwen3-4B-Instruct-2507`), `HF_HUB_OFFLINE=1` in jobs |
 | Logs | `/home/aci18912it/miles-tinker/logs/<job>.OU` (PBS), `$PROJECT_ROOT/jobs/<run>/` (launcher, head, worker) |
-| Clients | login node, `module load python/3.12/3.12.9`; cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1), platoon venv `/home/aci18912it/source/platoon/plugins/textcraft/.venv` (tinker 0.16.1) |
+| Clients | the gateway job's head node via `CLIENT_SCRIPT` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1), platoon venvs under `/home/aci18912it/source/platoon/plugins/*/.venv` (tinker 0.16.1) |
 
-Everything below is run from the login node in the fork checkout unless stated.
+Commands below are typed on a login node (qsub, tail, git) but every client and probe runs inside the job on the head compute node: the launchers in `deploy/clients/` refuse to start on a `login*` host (`MILES_ALLOW_LOGIN_NODE=1` only for a seconds-long smoke).
 
 ## 1. Pull the image (once per image tag)
 
@@ -107,31 +107,31 @@ The file is removed when the job ends. Only the gateway port is used by
 clients; the SGLang router and engines bind the compute nodes' IPoIB
 addresses and are reached by the driver only.
 
-## 4. Run clients on the login node
+## 4. Run clients inside the job (head node)
 
-All clients speak HTTP only (no Ray, no `/dev/shm`), so the login node is the
-right place for interactive runs; keep them light (the rollout/env code of
-guess_number and textcraft is small). Long unattended runs can instead be
-started on node 0 from a plain host process (see `notes` in
-`docs/fork/acceptance.md`).
+ABCI login nodes are shared and monitored; a Tinker client (rollouts, rendering, per-token logprobs) pins a
+core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`; the
+launcher starts it once the gateway is healthy with `TINKER_BASE_URL`, `ENDPOINT_FILE`, `JOBDIR`, `RUN_NAME`,
+`HF_HOME` and `no_proxy` exported, logs it to `$JOBDIR/client.log` (exit code in `client.status`), and ends the
+job when the client finishes (`KEEP_GATEWAY=1` keeps serving). Ready-made scripts:
 
 ```bash
-E=$PROJECT_ROOT/name-resolve/gw-lora.endpoint
-# raw SDK smoke (0.27.1): train/save/sample/resume/stop tokens, PASS/FAIL per check
-/home/aci18912it/miles-tinker/cookbook-venv/bin/python deploy/clients/tinker_sdk_smoke.py --endpoint-file $E --lora-rank 16
-# cookbook math_rl arithmetic (single-turn, async, 20 steps)
-deploy/clients/cookbook_math_arithmetic_smoke.sh $E /groups/gai51740/aci18912it/miles-tinker/runs/math-smoke
-# cookbook guess_number, multi-turn, AsyncConfig(max_steps_off_policy=1), 25 steps (acceptance run A)
-/home/aci18912it/miles-tinker/cookbook-venv/bin/python deploy/clients/cookbook_guess_number_async.py \
-    endpoint_file=$E log_path=/groups/gai51740/aci18912it/miles-tinker/runs/gn-async
-# platoon textcraft synth (SDK 0.16.1, cispo), small overrides (acceptance run B)
-deploy/clients/run_platoon_textcraft.sh $E /groups/gai51740/aci18912it/miles-tinker/runs/textcraft
+# SDK smoke + sampler/trainer probe + short MFU benchmark (LoRA or full)
+qsub -v RTYPE=rt_HF,MODE=lora,RUN_NAME=smoke-lora,CLIENT_SCRIPT=$PWD/deploy/abci/clients/smoke.sh deploy/abci/tinker_gateway.pbs
+# tinker-cookbook guess_number, async RL, 25 steps (GN_ARGS="learning_rate=1e-5" etc.)
+qsub -v RTYPE=rt_HF,MODE=lora,RUN_NAME=gn-lora,CLIENT_SCRIPT=$PWD/deploy/abci/clients/cookbook_guess_number.sh,GN_ARGS="learning_rate=1e-5" deploy/abci/tinker_gateway.pbs
+# platoon number-search, 100 steps, W&B online (run `wandb login` once beforehand; the key lives in ~/.netrc)
+qsub -v RTYPE=rt_HF,MODE=full,RUN_NAME=ns-full,CLIENT_SCRIPT=$PWD/deploy/abci/clients/platoon_number_search.sh,STEPS=100 -l walltime=06:00:00 deploy/abci/tinker_gateway.pbs
 ```
 
-Against a `MODE=full` gateway the same commands work unchanged: the gateway
-accepts and ignores `lora_config` (`lora_rank` on the client is a no-op) and
-`weights_info` still reports `is_lora: true` so both SDKs' resume path works
-(`docs/fork/full-finetuning.md`). Run one client at a time on a full gateway.
+Your own client is any bash script that reads `$ENDPOINT_FILE` or `$TINKER_BASE_URL`; keep venvs on `/home` or
+`/groups` (compute nodes see them, have internet access for W&B/HF, and `module load python/3.12/3.12.9`).
+Watch progress from a login node with `tail -f $P/jobs/<RUN_NAME>/client.log`. Two clients against one LoRA
+gateway: launch the gateway with `KEEP_GATEWAY=1` and one `CLIENT_SCRIPT`, then run the second client from a
+separate 1-node job that reads the endpoint file (or chain both in one script).
+
+A quick interactive check from a login node (`MILES_ALLOW_LOGIN_NODE=1 ... tinker_sdk_smoke.py --steps 1`) is
+acceptable because it finishes in about a minute; anything that samples rollouts is not.
 
 ## 5. Where things land
 

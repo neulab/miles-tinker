@@ -7,6 +7,7 @@
 # Env: PLATOON_ROOT, PLATOON_PYTHON (plugin venv with the tinker extra), TINKER_API_KEY (must start with tml-),
 #      HF_HOME (Qwen3-4B-Instruct-2507 tokenizer), WANDB_MODE (offline|disabled).
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/hostguard.sh"
 ENDPOINT=${1:?endpoint file or http://host:port}; LOG_PATH=${2:?log_path}; shift 2
 [[ -f $ENDPOINT ]] && ENDPOINT=$(tr -d '[:space:]' < "$ENDPOINT")
 PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon}

@@ -17,6 +17,12 @@ Example:
     deploy/clients/cookbook_guess_number_async.py endpoint_file=$P/name-resolve/gw-lora.endpoint log_path=$P/runs/gn-async
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
+
 import asyncio
 import os
 from pathlib import Path

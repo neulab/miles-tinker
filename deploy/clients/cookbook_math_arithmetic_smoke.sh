@@ -6,6 +6,7 @@
 # Env: COOKBOOK_PYTHON (default: the login-node cookbook venv), TINKER_API_KEY (default tml-local),
 #      HF_HOME (default: the shared cache holding the Qwen3-4B-Instruct-2507 tokenizer).
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/hostguard.sh"
 ENDPOINT=${1:?endpoint file or http://host:port}; LOG_PATH=${2:?log_path}; shift 2
 [[ -f $ENDPOINT ]] && ENDPOINT=$(tr -d '[:space:]' < "$ENDPOINT")
 COOKBOOK_PYTHON=${COOKBOOK_PYTHON:-/home/aci18912it/miles-tinker/cookbook-venv/bin/python}

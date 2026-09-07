@@ -20,6 +20,12 @@ Example:
     --endpoint-file $P/name-resolve/gw.endpoint
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
+
 import argparse
 import os
 import random
