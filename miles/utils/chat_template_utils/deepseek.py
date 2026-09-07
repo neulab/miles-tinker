@@ -16,7 +16,6 @@ import json
 import os
 from typing import Any
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
 from sglang.srt.entrypoints.openai.protocol import Tool
 
 from miles.utils.chat_template_utils.templates import encoding_dsv32
@@ -125,7 +124,12 @@ class DeepSeekV32Family(DeepSeekFamily):
 
 
 class DeepSeekV4Family(DeepSeekFamily):
-    template = encoding_dsv4
+    @functools.cached_property
+    def template(self):
+        # Older AMD SGLang images can serve Qwen without the V4 encoder.
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        return encoding_dsv4
 
     def _generation_prompt_suffix(self, tail_role: str | None, thinking_token: str) -> str | None:
         if tail_role in {"user", "developer", "tool"}:

@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import logging
+import os
 
 import httpx
 
@@ -386,11 +387,19 @@ class SGLangApiClient:
     async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
         adapter-only session (no quant unpack; base tensors rejected)."""
+        if os.environ.get("MILES_SGLANG_LEGACY_WEIGHT_UPDATE") == "1":
+            if selector != "all" or not sync_base:
+                raise NotImplementedError("Legacy SGLang weight updates only support full base-weight transfers")
+            return await self._make_request("post_process_weights", {"restore_weights_before_load": True})
         return await self._make_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
 
     async def end_weight_update(self, expected_lora_checksums=None):
         """Close the weight-update session: re-finalize base weights (sync_base
         sessions) and apply the streamed LoRA stash."""
+        if os.environ.get("MILES_SGLANG_LEGACY_WEIGHT_UPDATE") == "1":
+            if expected_lora_checksums is not None:
+                raise NotImplementedError("Legacy SGLang cannot verify streamed LoRA adapters")
+            return await self._make_request("post_process_weights", {"post_process_quantization": True})
         return await self._make_request("end_weight_update", {"expected_lora_checksums": expected_lora_checksums})
 
     async def update_weight_version(self, weight_version: str, abort_all_requests: bool = False):

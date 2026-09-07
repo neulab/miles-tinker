@@ -7,11 +7,31 @@ encode as ForwardBackwardOutput / SampleResponse protos when the client asks
 JSON floats. The schema ships with the tinker pip package.
 """
 
+import importlib.metadata
+import importlib.util
+import sys
+
 import numpy as np
 
 from miles.tinker.core.types import UserInputError
 from miles.tinker.server.encoding import build_row, forward_backward_metrics
-from tinker.proto import tinker_public_pb2 as public_pb
+
+
+def _load_public_proto():
+    # AMD images use Python 3.10. The generated schema supports it, whereas
+    # importing the SDK package executes client code requiring Python 3.11.
+    if sys.version_info >= (3, 11):
+        from tinker.proto import tinker_public_pb2
+
+        return tinker_public_pb2
+    path = importlib.metadata.distribution("tinker").locate_file("tinker/proto/tinker_public_pb2.py")
+    spec = importlib.util.spec_from_file_location("tinker_public_pb2", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+public_pb = _load_public_proto()
 
 PROTO_CONTENT_TYPE = "application/x-protobuf"
 

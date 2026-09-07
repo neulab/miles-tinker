@@ -24,6 +24,9 @@ versions of SGLang, Megatron-LM, and a few CUDA kernels.
   </Tab>
   <Tab title="AMD MI300X / MI350X">
 
+    For the experimental Tinker backend on MI350X without Docker, see the
+    [Apptainer setup and reproduction guide](../platforms/amd-tinker-apptainer.md).
+
     ```bash
     docker pull rlsys/miles:MI350-355-latest    # or MI300-latest
 

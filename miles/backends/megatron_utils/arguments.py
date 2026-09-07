@@ -1,7 +1,11 @@
 import logging
 import os
 
-from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
+try:
+    from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
+except ModuleNotFoundError:
+    # Megatron 0.16 in the AMD image predates the tokenizer module move.
+    from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from megatron.training.arguments import parse_args, validate_args
 
 from miles_plugins.models.deepseek_v4.arguments import is_dsv4_model, normalize_dsv4_args
@@ -12,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 def set_default_megatron_args(args):
+    if not hasattr(args, "use_gloo_process_groups"):
+        args.use_gloo_process_groups = args.enable_gloo_process_groups
     if getattr(args, "true_on_policy_mode", False):
         raise NotImplementedError(
             "--true-on-policy-mode is not supported on the megatron backend with this Megatron "

@@ -20,6 +20,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _install_bridge_process_group_filter() -> None:
+    """Keep process groups out of the old bridge's copied QKV configuration."""
+    import torch.distributed as dist
+    from megatron.bridge.models.conversion import param_mapping, utils
+
+    original = getattr(utils, "remove_non_pickleables", None)
+    if original is None or getattr(original, "_miles_process_group_filter", False):
+        return
+
+    def remove_non_pickleables(obj, max_depth=3, current_depth=0):
+        if isinstance(obj, dist.ProcessGroup):
+            return None
+        return original(obj, max_depth, current_depth)
+
+    remove_non_pickleables._miles_process_group_filter = True
+    utils.remove_non_pickleables = remove_non_pickleables
+    param_mapping.remove_non_pickleables = remove_non_pickleables
+
+
 def _install_bridge_pp_group_unwrap() -> None:
     """Let ``MegatronParamMapping.broadcast_obj_from_pp_rank`` work with
     miles' :class:`~miles.utils.reloadable_process_group.ReloadableProcessGroup`.
@@ -55,6 +74,7 @@ def _install_bridge_pp_group_unwrap() -> None:
 
 
 try:
+    _install_bridge_process_group_filter()
     _install_bridge_pp_group_unwrap()
 except Exception as _e:  # best-effort
     logger.warning("miles bridge shim _install_bridge_pp_group_unwrap not applied: %s", _e)

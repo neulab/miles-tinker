@@ -185,7 +185,7 @@ def build_app(service: TinkerService) -> FastAPI:
             # elapses; 408 is the SDK's quiet "poll again" (try_again logs a warning)
             try:
                 await asyncio.wait_for(promise.settled.wait(), service.config.retrieve_poll_timeout_s)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return JSONResponse(
                     status_code=408, content={"type": "try_again", "request_id": request_id, "queue_state": "active"}
                 )

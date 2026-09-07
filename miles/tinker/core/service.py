@@ -501,7 +501,7 @@ class TinkerService:
     async def _wait_wake(self, timeout: float | None) -> None:
         try:
             await asyncio.wait_for(self._wake.wait(), timeout)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             pass
         self._wake.clear()
 

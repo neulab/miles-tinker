@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.server_args import ServerArgs
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, probe_server_healthy
 from miles.backends.sglang_utils.sglang_engine import build_server_url
@@ -155,7 +156,10 @@ class ServerCell:
             )
 
         addr_info = await self._compute_addr_info()
-        await activate_launch_gate(gate_url=addr_info.gate_url)
+        if "gated_launch_port" in ServerArgs.__dataclass_fields__:
+            await activate_launch_gate(gate_url=addr_info.gate_url)
+        else:
+            logger.info("SGLang starts immediately in this version; waiting for its health check")
         self._change_state(
             "init", StateUninitialized, StateInitializing(addr_info=addr_info, start_time=time.monotonic())
         )
