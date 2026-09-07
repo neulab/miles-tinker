@@ -4,6 +4,7 @@ from collections.abc import Callable
 from copy import deepcopy
 
 from miles.utils.device_flops import local_peak_bf16_tflops
+from miles.utils.flops_utils import ensure_hf_layer_pattern
 from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.timer import Timer
 from miles.utils.tracking_utils import tracking
@@ -30,6 +31,8 @@ def log_perf_data_raw(
         log_dict.update(extra_metrics)
 
     if ("perf/actor_train_time" in log_dict) and (compute_total_fwd_flops is not None):
+        # Once per process: linear-attention layer pattern from the HF config (never raises).
+        ensure_hf_layer_pattern(args)
         total_fwd_flops = compute_total_fwd_flops(seq_lens=timer_instance.seq_lens)
 
         if "perf/log_probs_time" in log_dict:

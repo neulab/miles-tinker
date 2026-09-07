@@ -54,3 +54,18 @@ def test_optim_window_drains_units_and_timer(monkeypatch):
 def test_unmeasured_window_reports_counts_only():
     metrics = tinker_perf.pop_optim_window_metrics(Namespace(mfu_peak_tflops=600.0))
     assert metrics == {"num_tokens": 0, "num_datums": 0, "num_units": 0}
+
+
+def test_optim_window_resolves_the_hf_layer_pattern_before_the_flops_model(monkeypatch):
+    order = []
+    monkeypatch.setattr(tinker_perf, "ensure_hf_layer_pattern", lambda args: order.append("pattern"))
+    monkeypatch.setattr(
+        tinker_perf, "fwd_tflops_per_gpu", lambda seq_lens, args, world_size: order.append("flops") or 10.0
+    )
+    tinker_perf.note_unit([4])
+    Timer().add(tinker_perf.ACTOR_TRAIN_TIMER, 1.0)
+
+    metrics = tinker_perf.pop_optim_window_metrics(Namespace(mfu_peak_tflops=600.0))
+
+    assert order == ["pattern", "flops"]
+    assert metrics["actor_train_tflops"] == pytest.approx(30.0)

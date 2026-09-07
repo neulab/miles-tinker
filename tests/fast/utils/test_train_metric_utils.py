@@ -90,3 +90,18 @@ def test_non_primary_rank_logs_nothing(timer, logged):
     timer.timers = {"actor_train": 2.0}
     log_perf_data_raw(rollout_id=0, args=make_args(), is_primary_rank=False, compute_total_fwd_flops=lambda **_: 1.0)
     assert logged == []
+
+
+def test_native_perf_site_resolves_the_hf_layer_pattern_first(timer, logged, monkeypatch):
+    order = []
+    monkeypatch.setattr(train_metric_utils, "ensure_hf_layer_pattern", lambda args: order.append("pattern"))
+    timer.timers = {"actor_train": 2.0}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(train_metric_utils, "local_peak_bf16_tflops", lambda: 989.0)
+        log_perf_data_raw(
+            rollout_id=0,
+            args=make_args(),
+            is_primary_rank=True,
+            compute_total_fwd_flops=lambda seq_lens: order.append("flops") or FWD_TFLOPS,
+        )
+    assert order == ["pattern", "flops"]

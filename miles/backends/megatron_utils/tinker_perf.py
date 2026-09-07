@@ -14,7 +14,7 @@ from collections.abc import Iterable
 import torch.distributed as dist
 
 from miles.utils.device_flops import local_peak_bf16_tflops
-from miles.utils.flops_utils import fwd_tflops_per_gpu
+from miles.utils.flops_utils import ensure_hf_layer_pattern, fwd_tflops_per_gpu
 from miles.utils.timer import Timer
 
 ACTOR_TRAIN_TIMER = "actor_train"
@@ -63,6 +63,8 @@ def pop_optim_window_metrics(args: Namespace) -> dict[str, float]:
     timer_instance.reset(ACTOR_TRAIN_TIMER)
     seq_lens, num_units = pop_window()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    # Once per process: linear-attention layer pattern from the HF config (never raises).
+    ensure_hf_layer_pattern(args)
     total_fwd_tflops = fwd_tflops_per_gpu(seq_lens, args, world_size) if seq_lens else 0.0
     peak_tflops = getattr(args, "mfu_peak_tflops", None) or local_peak_bf16_tflops()
     metrics = perf_metrics(
