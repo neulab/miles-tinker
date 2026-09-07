@@ -80,13 +80,24 @@ have to agree on, and when they disagreed the run died with an
 `IndexError: pop_forward out of range` inside Megatron's `compute_topk` with
 no way to tell which step was wrong. Each step now states its numbers:
 
-- Registration. `setup_model_and_optimizer` calls `reset_registrations()` on
-  every manager before the build (a second build in one process used to append
-  its routers after the first build's, leaving the live routers at stream
-  indices the fill never reaches) and logs one line per build:
-  `R3 registration (actor): routing replay manager enabled=True, 40 routers
-  registered by this model build`. `register_to_module` is also idempotent per
-  module instance.
+- Registration. A router registers itself in its own `__init__`
+  (Megatron-LM `megatron/core/transformer/moe/router.py:284`), so a wrapper
+  that builds a decoder and throws it away registers twice as many replays as
+  the model has live routers -- and the live ones land in the second half,
+  past the streams the fill reaches. megatron-bridge's `Qwen3VLGPTModel` does
+  exactly that: `text_model.py:82` calls `GPTModel.__init__`, which builds
+  `self.decoder = TransformerBlock(...)` (`gpt_model.py:232`), and
+  `text_model.py:118` ("# rebuild the transformer block") replaces it with a
+  `Qwen3VLTransformerBlock` from the same spec. That is what killed job
+  2245536: 80 replays, the fill wrote 0..39, the 40 routers that ran read
+  40..79.
+  `setup_model_and_optimizer` therefore calls `reset_registrations()` before
+  the build and `prune_to_model(model)` after it -- keeping only the replays a
+  module of the built model still holds, in module order -- and logs one line
+  per build:
+  `R3 registration (actor): routing replay manager enabled=True, 80 routers
+  registered by this model build, 40 live in the model, 40 dropped`.
+  `register_to_module` is also idempotent per module instance.
 - Fill. `fill_replay_data` logs
   `R3 fill rollout_routed_experts: microbatches=1 replays=40 streams=40
   rows_recorded=40 rows_per_replay=[1]` and raises `ReplayError` when there is

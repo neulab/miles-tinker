@@ -29,6 +29,7 @@ from miles.backends.megatron_utils.arguments import set_default_megatron_args
 from miles.backends.megatron_utils.checkpoint import load_checkpoint
 from miles.backends.megatron_utils.initialize import init
 from miles.backends.megatron_utils.model_provider import get_model_provider_func
+from miles.utils.replay_base import all_replay_managers
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.debug_utils.run_megatron.worker.batch import loss_func, prepare_batch
 from miles.utils.debug_utils.run_megatron.worker.output import compute_and_save_output_info
@@ -144,6 +145,12 @@ def _build_and_load_model(args: argparse.Namespace, script: WorkerScriptArgs) ->
     # Forward-only runs skip DDP wrapping so the distributed-optimizer grad buffer
     # (tens-to-hundreds of GB for large MoE models) is never allocated -> avoids OOM.
     model: list[Any] = get_model(model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=script.run_backward)
+    # Same rule as setup_model_and_optimizer: keep only the routers the built model runs
+    # (a wrapper that rebuilds its decoder registers each router twice).
+    for manager in all_replay_managers:
+        if manager.enabled:
+            kept, dropped = manager.prune_to_model(model)
+            print(f"[worker] R3 {manager.name}: {kept} live routers, {dropped} dropped", flush=True)
 
     if args.load is not None:
         load_checkpoint(

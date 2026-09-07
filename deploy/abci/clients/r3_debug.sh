@@ -8,7 +8,9 @@
 #   qsub -v RTYPE=rt_HF,MODE=full,RUN_NAME=r3dbg-1,SERVICES=0,TRAIN_NODES=1,\
 #     GATEWAY_LAUNCHER=examples/tinker/run_qwen3_6_35b_a3b_gateway.py,HF_SNAPSHOT=...,\
 #     MILES_SRC=...,LAUNCHER_ARGS="--context-len 8191 --max-tokens-per-gpu 8192",\
-#     CLIENT_SCRIPT=deploy/abci/clients/r3_debug.sh -l walltime=01:30:00 deploy/abci/tinker_gateway.pbs
+#     CLIENT_SCRIPT=$MILES_SRC/deploy/abci/clients/r3_debug.sh -l walltime=01:30:00 deploy/abci/tinker_gateway.pbs
+# CLIENT_SCRIPT must be absolute: tinker_gateway.pbs checks it from the batch shell's cwd ($HOME),
+# not from MILES_SRC (job 2245772 came up healthy and then refused the relative path).
 # The launcher asserts --max-tokens-per-gpu >= --context-len + 1, so both must shrink together.
 # Knobs: MODEL_NAME, R3_POLICY (natural), R3_MAX_TOKENS (16 generated tokens per turn), SECOND_PROBE (1).
 set -uo pipefail
