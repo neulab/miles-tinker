@@ -106,6 +106,15 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     if getattr(args, "moe_aux_loss_coeff", None) is not None:
         provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
 
+    # Vision tower of a VL checkpoint (Qwen3.5/3.6 VL providers default to training it). A text-only
+    # gateway never feeds it, so without freezing its params occupy the DDP grad buffers and the
+    # optimizer (~2.9 GiB/rank for Qwen3.6-35B) and decoupled weight decay drifts them every step.
+    if getattr(args, "freeze_vision_model", False):
+        frozen = [f for f in ("freeze_vision_model", "freeze_vision_projection") if hasattr(provider, f)]
+        for field in frozen:
+            setattr(provider, field, True)
+        logger.info(f"bridge: freezing the vision stack ({', '.join(frozen) or 'no vision fields on this provider'})")
+
     if hasattr(provider, "dsa_attention_backend"):
         provider.dsa_attention_backend = getattr(args, "dsa_attention_backend", "megatron")
 

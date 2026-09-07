@@ -182,3 +182,20 @@ def test_a_model_with_an_unwanted_mtp_block_is_rejected_at_provide(provider_modu
     provide = provider_module.get_model_provider_func(_args(mtp_num_layers=0))
     with pytest.raises(ValueError, match="mtp_process is True but --mtp-num-layers is 0"):
         provide()
+
+
+def test_bridge_freezes_the_vision_stack_only_when_asked(provider_module):
+    """--freeze-vision-model keeps a VL checkpoint's tower out of the grad buffers and the optimizer."""
+    frozen = _Provider()
+    frozen.freeze_vision_model = frozen.freeze_vision_projection = False
+    provider_module._apply_bridge_runtime_config(frozen, _args(mtp_num_layers=0, freeze_vision_model=True))
+    assert (frozen.freeze_vision_model, frozen.freeze_vision_projection) == (True, True)
+
+    trained = _Provider()
+    trained.freeze_vision_model = trained.freeze_vision_projection = False
+    provider_module._apply_bridge_runtime_config(trained, _args(mtp_num_layers=0, freeze_vision_model=False))
+    assert (trained.freeze_vision_model, trained.freeze_vision_projection) == (False, False)
+
+    text_only = _Provider()  # no vision fields: the flag must not invent them or raise
+    provider_module._apply_bridge_runtime_config(text_only, _args(mtp_num_layers=0, freeze_vision_model=True))
+    assert not hasattr(text_only, "freeze_vision_model")

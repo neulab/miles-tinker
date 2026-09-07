@@ -146,6 +146,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     pause_generation_mode: str = "retract"
     update_weight_buffer_size: int = 2 * 1024**3
     check_weight_update_equal: bool = False
+    freeze_vision_model: bool = True  # text-only RL: never train (or weight-decay) the VL tower
 
     # Sampling engines.
     sglang_ep_size: int = 8
@@ -204,6 +205,8 @@ def serve(args: ScriptArgs):
     )
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
+    if args.freeze_vision_model:
+        ckpt_args += "--freeze-vision-model "
 
     mode_args = "--tinker-train-mode full "
 

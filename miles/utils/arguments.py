@@ -409,6 +409,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The method to convert megatron weights to hugging face weights for SGLang.",
             )
             parser.add_argument(
+                "--freeze-vision-model",
+                action="store_true",
+                help=(
+                    "Under --megatron-to-hf-mode bridge, freeze the vision tower and its projection of a "
+                    "vision-language checkpoint (megatron-bridge providers default to training them). A "
+                    "text-only RL run never feeds the tower, so its parameters would otherwise sit in the "
+                    "DDP grad buffers and the optimizer, and decoupled weight decay would drift them on "
+                    "every step. Ignored for text-only providers."
+                ),
+            )
+            parser.add_argument(
                 "--dsa-attention-backend",
                 choices=["megatron", "tilelang"],
                 default="tilelang",

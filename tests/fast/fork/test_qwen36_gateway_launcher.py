@@ -70,7 +70,7 @@ def _sglang_field(flag: str) -> str:
 
 
 _EXPECTED_DEFAULT_ARGV = (
-    "--hf-checkpoint /x/hf --megatron-to-hf-mode bridge "
+    "--hf-checkpoint /x/hf --megatron-to-hf-mode bridge --freeze-vision-model "
     "--tinker-train-mode full "
     "--tinker-server-port 10613 --tinker-checkpoint-root /x/ckpt "
     "--tinker-base-model apurvaga/Qwen3.6-35B-A3B-preserve-thinking "
@@ -95,6 +95,12 @@ _EXPECTED_DEFAULT_ARGV = (
     "--num-gpus-per-node 8 --actor-num-nodes 4 --actor-num-gpus-per-node 8 --rollout-num-gpus 88 "
     "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend flash"
 )
+
+
+def test_vision_tower_is_frozen_by_default_and_can_be_trained_on_request(launcher, monkeypatch):
+    """A text-only RL run must not train (or weight-decay) the VL checkpoint's vision tower."""
+    assert "--freeze-vision-model" in _serve_argv(launcher, monkeypatch)
+    assert "--freeze-vision-model" not in _serve_argv(launcher, monkeypatch, freeze_vision_model=False)
 
 
 def test_default_serve_argv_is_the_designed_flag_multiset(launcher, monkeypatch):
