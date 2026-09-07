@@ -1,0 +1,61 @@
+#!/bin/bash
+# CLIENT_SCRIPT for tinker_gateway.pbs: the platoon Toolathlon RL client (SDK 0.16.1, cispo) on the job's head node.
+# The launcher exports TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME HF_HOME no_proxy MILES_SRC
+# PLATOON_ROOT SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS (C10).
+# Secrets (W&B, OpenAI/LiteLLM judges, HF) are sourced HERE ONLY, from /home/aci18912it/rasp/config/abci.env (which
+# chains secrets.env, mode 0600) - never in the batch shell, the service helper or any container.
+# Knobs: CONFIG (plugin-relative yaml), WORKERS (3), MAX_RESTARTS (20), RESTART_DELAY (700 s >= lease 600 + sweep 30
+# + margin), KEEP_CKPTS (2), WANDB_MODE (online), WANDB_TRIAL (RUN_NAME), EXTRA (verbatim platoon --a.b.c overrides).
+# Restart/resume: platoon.train.tinker.restart_wrapper restarts the trainer on the watchdog exit code (2); the
+# gateway frees the single full-FT slot on SESSION_END (TINKER_TELEMETRY=1) or lease expiry (600 s), so the next
+# attempt re-acquires it after RESTART_DELAY and rl.py resumes from <log_path>/<experiment>/<trial>/checkpoints.jsonl.
+set -euo pipefail
+MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}
+source "$MILES_SRC/deploy/clients/hostguard.sh"
+source /etc/profile.d/modules.sh 2>/dev/null || true; module load python/3.12/3.12.9 2>/dev/null || true
+PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon-tinker}
+PLUGIN=$PLATOON_ROOT/plugins/openreward
+PY=$PLUGIN/.venv/bin/python
+CONFIG=${CONFIG:-platoon/openreward/configs/tinker/abci_toolathlon_15node_recursive_qwen36_miles_tinker_r3_v1.yaml}
+[[ -x $PY ]] || { echo "platoon venv python missing: $PY" >&2; exit 2; }
+[[ -r $PLUGIN/$CONFIG ]] || { echo "config missing: $PLUGIN/$CONFIG" >&2; exit 2; }
+[[ -n ${TINKER_BASE_URL:-} ]] || { echo "TINKER_BASE_URL is not set (run through tinker_gateway.pbs CLIENT_SCRIPT)" >&2; exit 2; }
+[[ -n ${OPENREWARD_SESSION_URLS_TOOLATHLON:-} ]] || { echo "OPENREWARD_SESSION_URLS_TOOLATHLON is empty: launch with SERVICES=1" >&2; exit 2; }
+[[ $(stat -c %a /home/aci18912it/rasp/config/secrets.env) == 600 ]] || { echo "secrets.env must be mode 0600" >&2; exit 2; }
+set +x
+# shellcheck disable=SC1091
+source /home/aci18912it/rasp/config/abci.env   # secrets only here; exports PLATOON_MODEL_SNAPSHOT, HF_HOME, chains secrets.env + .netrc
+[[ -z ${HF_TOKEN:-} && -r ~/.cache/huggingface/token ]] && export HF_TOKEN=$(<~/.cache/huggingface/token)
+export TINKER_BASE_URL TINKER_API_KEY=${TINKER_API_KEY:-tml-local} TINKER_TELEMETRY=1
+export HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS=$OPENREWARD_SESSION_URLS_TOOLATHLON
+export OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only OPENREWARD_DISABLE_UPDATE_CHECK=1
+export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
+export WANDB_MODE=${WANDB_MODE:-online}
+CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client
+mkdir -p "$CLIENT_LOCAL"/{home,tmp,xdg}
+export TMPDIR=$CLIENT_LOCAL/tmp XDG_CACHE_HOME=$CLIENT_LOCAL/xdg
+LOG_PATH=/groups/gai51740/aci18912it/miles-tinker/runs/$RUN_NAME/logs
+CKPT_ROOT=/groups/gai51740/aci18912it/miles-tinker/checkpoints/$RUN_NAME
+mkdir -p "$LOG_PATH"
+echo "platoon toolathlon -> $TINKER_BASE_URL config=$CONFIG workers=${WORKERS:-3} services=$OPENREWARD_SESSION_URLS_TOOLATHLON ($(date))"
+echo "platoon: $(git -C "$PLATOON_ROOT" rev-parse --short HEAD 2>/dev/null) $(git -C "$PLATOON_ROOT" branch --show-current 2>/dev/null); log_path=$LOG_PATH ckpt_root=$CKPT_ROOT"
+# checkpoint pruner: every 10 min keep the newest KEEP_CKPTS records of checkpoints.jsonl (never the last record's
+# state_path, never a directory written in the last 30 min); each full save is ~490 GB
+( while sleep 600; do
+    python3 "$MILES_SRC/deploy/abci/clients/prune_tinker_checkpoints.py" --log-path "$LOG_PATH" --checkpoint-root "$CKPT_ROOT" --keep "${KEEP_CKPTS:-2}" || true
+  done ) & PRUNE_PID=$!
+trap 'kill $PRUNE_PID 2>/dev/null || true' EXIT
+cd "$PLUGIN"
+# shellcheck disable=SC2086
+status=0
+"$PY" -m platoon.train.tinker.restart_wrapper --max-restarts "${MAX_RESTARTS:-20}" --restart-delay "${RESTART_DELAY:-700}" -- \
+  "$PY" -m platoon.openreward.train_scripts.tinker.train_tinker --config "$CONFIG" \
+    --tinker_base_url "$TINKER_BASE_URL" --log_path "$LOG_PATH" \
+    --stats.trial_name "${WANDB_TRIAL:-$RUN_NAME}" --stats.wandb.mode "$WANDB_MODE" \
+    --train.num_concurrent_rollout_workflow_workers "${WORKERS:-3}" ${EXTRA:-} || status=$?
+kill "$PRUNE_PID" 2>/dev/null || true
+cd "$MILES_SRC"
+python3 deploy/clients/perf_report.py --perf-jsonl "$CKPT_ROOT/perf.jsonl" --every 10 || true
+echo "platoon toolathlon exited status=$status ($(date))"
+exit "$status"

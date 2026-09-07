@@ -9,14 +9,28 @@
 #PBS -j oe
 #PBS -o /home/aci18912it/miles-tinker/logs/
 #
-# Two-node Tinker gateway on ABCI (singularity + PBS + Ray).
-#   node 0: ray head + miles driver (serve_tinker.py) + gateway HTTP  (one container)
-#   node 1: ray worker                                                (one container via pbsdsh)
-# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...,CLIENT_SCRIPT=...,KEEP_GATEWAY=1`,
-# plus GATEWAY_LAUNCHER (repo-relative launcher, default the Qwen3-4B one) and HF_SNAPSHOT (its --hf-checkpoint).
+# N-node Tinker gateway on ABCI (singularity + PBS + Ray), N = unique hosts in PBS_NODEFILE (>= 2).
+#   PBS node 0 (this batch shell): ray head + miles driver (serve_tinker.py) + gateway HTTP (one container)
+#   every other node:              ray worker (one container each, held by pbsdsh)
+#   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs (miles/ray/placement_group.py sorts bundles by IP)
+#   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one Toolathlon
+#                                  service per engine node (deploy/abci/toolathlon_service.sh), started before Ray
+# Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for presets):
+#   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
+#   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
+#   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
+#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
 # Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
+# DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
+# and every pbsdsh / singularity command line without executing anything.
 set -euo pipefail
 umask 077
+DRY_RUN=${DRY_RUN:-0}
+# Credentials never enter this batch shell: the client subshell sources abci.env/secrets.env itself and every
+# pbsdsh line runs under `env -i`, every container under `--cleanenv`. Drop the ten names up front regardless.
+SECRET_NAMES=(WANDB_API_KEY OPENAI_API_KEY OPENAI_BASE_URL LITELLM_API_KEY LITELLM_BASE_URL RUBRIC_DEFAULT_LLM
+              HF_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN)
+unset "${SECRET_NAMES[@]}"
 source /etc/profile.d/modules.sh 2>/dev/null || true
 module load singularity-ce/4.4.1 2>/dev/null || true
 
@@ -30,31 +44,117 @@ EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}     # pip --target dir with t
 HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
 HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
 MODE=${MODE:-lora}
-GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}  # run from /root/miles inside the container
+GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-${LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}}  # run from /root/miles inside the container
+PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon-tinker}
+TOOLATHLON_ENV=${TOOLATHLON_ENV:-$MILES_SRC/deploy/abci/toolathlon.env}
+SERVICES=${SERVICES:-0}
+WORKERS=${WORKERS:-3}
+LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 JOB=${PBS_JOBID%%.*}
 RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
 JOBDIR=$PROJECT_ROOT/jobs/$RUN_NAME
 NODE_LOCAL=${PBS_LOCALDIR:?}/miles
-TINKER_PORT=${TINKER_PORT:-$((20000 + 10#$JOB % 20000))}
 RAY_PORT=6379; DASH_PORT=8265
+CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints/$RUN_NAME
+ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint
 mkdir -p "$JOBDIR" "$PROJECT_ROOT/checkpoints" "$PROJECT_ROOT/name-resolve"
+# Gateway port: outside miles' dynamic 20000+ range and Toolathlon's 8082 / 28100-28107; bumped while bound.
+TINKER_PORT=${TINKER_PORT:-$((30000 + 10#$JOB % 9000))}
+while ss -ltn 2>/dev/null | grep -q ":$TINKER_PORT "; do echo "port $TINKER_PORT is bound, trying the next"; TINKER_PORT=$((TINKER_PORT + 1)); done
+
+# ---------------------------------------------------------------- helpers (DRY_RUN prints instead of executing)
+dry() { [[ $DRY_RUN == 1 ]]; }
+show() { local label=$1; shift; printf 'DRY_RUN %s:' "$label"; printf ' %q' "$@"; echo; }
+LAST_PID=
+launch_bg() {  # launch_bg <logfile> <argv...>: background the command with its output in <logfile>; pid in LAST_PID
+  local log=$1; shift
+  if dry; then show "bg[$(basename "$log")]" "$@"; LAST_PID=; return 0; fi
+  "$@" > "$log" 2>&1 &
+  LAST_PID=$!
+}
+wait_gone() {  # wait_gone <seconds> <pids...>: poll until none of the pids is alive (or the budget is spent)
+  local budget=$1 t; shift; local pids=("$@")
+  (( ${#pids[@]} )) || return 0
+  for t in $(seq 1 "$budget"); do kill -0 "${pids[@]}" 2>/dev/null || return 0; sleep 1; done
+  return 1
+}
+PBSDSH_ENV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "HOME=$HOME" "USER=${USER:-$(id -un)}" "LOGNAME=${USER:-$(id -un)}")
 
 # ---------------------------------------------------------------- node map
 awk '!seen[$1]++ { printf "%s\t%d\n", $1, NR-1 }' "$PBS_NODEFILE" > "$JOBDIR/nodes.tsv"
 mapfile -t HOSTS < <(cut -f1 "$JOBDIR/nodes.tsv"); mapfile -t VIDX < <(cut -f2 "$JOBDIR/nodes.tsv")
-(( ${#HOSTS[@]} == 2 )) || { echo "expected 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
-[[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
+NODES=${#HOSTS[@]}
+(( NODES >= 2 )) || { echo "expected >= 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
+TRAIN_NODES=${TRAIN_NODES:-$(( NODES == 2 ? 1 : 4 ))}
+(( TRAIN_NODES >= 1 && TRAIN_NODES < NODES )) || { echo "TRAIN_NODES=$TRAIN_NODES must be in [1, $NODES)" >&2; exit 2; }
+ROLLOUT_GPUS=$(( 8 * (NODES - TRAIN_NODES) ))
+NUM_GPUS=$(( 8 * NODES ))
+dry || [[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
 # The node's own hostname resolves to an IPv6 link-local address on the node itself, so pick the
 # IPoIB hostname network (10.0.x.y) from the interface list instead of getent.
 node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}'; }
 node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
 HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
+if dry; then IFS=, read -r -a DRY_IPS <<< "${DRY_RUN_IPS:-}"; HEAD_IP=${DRY_IPS[0]:-10.0.0.1}; IFNAME=${IFNAME:-ib0}; fi
 [[ -n $HEAD_IP && -n $IFNAME ]] || { echo "could not determine the head IPoIB address" >&2; ip -o -4 addr show >&2; exit 2; }
 exec > >(tee -a "$JOBDIR/launcher.log") 2>&1
-echo "job=$JOB run=$RUN_NAME mode=$MODE launcher=$GATEWAY_LAUNCHER snapshot=$HF_SNAPSHOT head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF $(date)"
-echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD) $(git -C "$MILES_SRC" branch --show-current)"
+echo "job=$JOB run=$RUN_NAME mode=$MODE nodes=$NODES train_nodes=$TRAIN_NODES rollout_gpus=$ROLLOUT_GPUS services=$SERVICES launcher=$GATEWAY_LAUNCHER snapshot=$HF_SNAPSHOT head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME port=$TINKER_PORT sif=$SIF dry_run=$DRY_RUN $(date)"
+echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD 2>/dev/null) $(git -C "$MILES_SRC" branch --show-current 2>/dev/null)"
+install -m 755 "$MILES_SRC/deploy/abci/kill-leftovers.sh" "$JOBDIR/kill-leftovers.sh"
 
-# ---------------------------------------------------------------- container command (same on both nodes)
+# ---------------------------------------------------------------- node-local init on every node (also reports host -> IPoIB ip)
+cat > "$JOBDIR/node-init.sh" <<'EOF'
+#!/bin/bash
+# usage: node-init.sh <node_local>  (runs on each node via pbsdsh; prints init_ok <host> <ip> + init_info lines)
+set -u
+NODE_LOCAL=$1
+mkdir -p "$NODE_LOCAL/tmp" && chmod 1777 "$NODE_LOCAL/tmp" || { echo "init_failed $(hostname -s)"; exit 1; }
+ip=$(ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}')
+echo "init_ok $(hostname -s) $ip"
+d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -1)
+while [[ $d == /sys/fs/cgroup/* ]]; do
+  [[ -r $d/memory.max ]] && echo "init_info $(hostname -s) cgroup=$d memory.max=$(cat "$d/memory.max") memory.current=$(cat "$d/memory.current" 2>/dev/null)"
+  d=$(dirname "$d")
+done
+echo "init_info $(hostname -s) PBS_LOCALDIR=${PBS_LOCALDIR:-unset} nproc=$(nproc) $(grep MemTotal /proc/meminfo | tr -s ' ')"
+echo "init_info $(hostname -s) df: $(df -h --output=size,used,avail,target "${PBS_LOCALDIR:-/local}" 2>/dev/null | tail -1 | tr -s ' ')"
+EOF
+chmod +x "$JOBDIR/node-init.sh"
+declare -A HOST_IP=()
+for i in "${!HOSTS[@]}"; do
+  if dry; then
+    show "pbsdsh[init ${HOSTS[$i]}]" pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL"
+    out="init_ok ${HOSTS[$i]} ${DRY_IPS[$i]:-10.0.0.$((i + 1))}"
+  else
+    out=$(pbsdsh -n "${VIDX[$i]}" -- /bin/bash "$JOBDIR/node-init.sh" "$NODE_LOCAL")
+  fi
+  printf '%s\n' "$out"
+  while read -r tag host ip _; do [[ $tag == init_ok && -n $ip ]] && HOST_IP[$host]=$ip; done <<< "$out"
+  [[ -n ${HOST_IP[${HOSTS[$i]}]:-} ]] || { echo "node init failed on ${HOSTS[$i]} (vnode ${VIDX[$i]})" >&2; exit 2; }
+done
+[[ ${HOST_IP[$HEAD_HOST]} == "$HEAD_IP" ]] || { echo "head ip mismatch: $HEAD_IP vs ${HOST_IP[$HEAD_HOST]}" >&2; exit 2; }
+
+# ---------------------------------------------------------------- roles: trainers = TRAIN_NODES lowest IPs (numeric per octet, as placement_group.sort_key)
+TRAIN_HOSTS=(); ENGINE_HOSTS=(); ENGINE_IPS=(); ENGINE_VIDX=()
+: > "$JOBDIR/roles.tsv"
+n=0
+while IFS=$'\t' read -r ip host vidx; do
+  if (( n < TRAIN_NODES )); then role=train; TRAIN_HOSTS+=("$host")
+  else role=engine; ENGINE_HOSTS+=("$host"); ENGINE_IPS+=("$ip"); ENGINE_VIDX+=("$vidx"); fi
+  printf '%s\t%s\t%s\t%s\n' "$host" "$vidx" "$ip" "$role" >> "$JOBDIR/roles.tsv"
+  n=$((n + 1))
+done < <(for i in "${!HOSTS[@]}"; do printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i]}]}" "${HOSTS[$i]}" "${VIDX[$i]}"; done \
+         | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+echo "roles (host vidx ip role):"; cat "$JOBDIR/roles.tsv"
+SERVICE_NODES=; SERVICE_URLS=; ENGINE_IP_LIST=
+if [[ $SERVICES == 1 ]]; then  # one Toolathlon service per engine node; URLs by IPoIB ip in IP order (C10)
+  SERVICE_NODES=$(IFS=,; echo "${ENGINE_HOSTS[*]}")
+  SERVICE_URLS=$(printf 'http://%s:8082,' "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
+  ENGINE_IP_LIST=$(IFS=,; echo "${ENGINE_IPS[*]}")
+fi
+
+# ---------------------------------------------------------------- container command (same on every node)
 export NVIDIA_VISIBLE_DEVICES=all     # nvidia-container-cli + --contain: required or no GPUs are visible
 CONTAINER_ARGS=(
   --nv --cleanenv --containall --no-mount cwd
@@ -72,15 +172,11 @@ CONTAINER_ARGS=(
   --env DG_JIT_CACHE_DIR=/tmp/deepgemm --env RAY_TMPDIR=/tmp/ray --env RAY_memory_monitor_refresh_ms=0
   --env "NCCL_SOCKET_IFNAME=$IFNAME" --env "GLOO_SOCKET_IFNAME=$IFNAME" --env "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
   --env TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --env "MASTER_ADDR=$HEAD_IP" --env MILES_SCRIPT_EXTERNAL_RAY=1
   --env "WANDB_MODE=${WANDB_MODE:-offline}" --env "WANDB_DIR=$JOBDIR/wandb"
 )
 printf '%q ' "${CONTAINER_ARGS[@]}" > "$JOBDIR/container_args.txt"
-
-# ---------------------------------------------------------------- node-local init on both nodes
-for i in 0 1; do
-  pbsdsh -n "${VIDX[$i]}" -- /bin/bash -c "mkdir -p '$NODE_LOCAL/tmp' && chmod 1777 '$NODE_LOCAL/tmp' && echo init_ok \$(hostname -s)"
-done
 
 # ---------------------------------------------------------------- inner scripts (run inside the container; no nested quoting)
 cat > "$JOBDIR/worker-inner.sh" <<'EOF'
@@ -96,17 +192,18 @@ cat > "$JOBDIR/head-inner.sh" <<'EOF'
 set -euo pipefail
 ray start --head --node-ip-address="$HEAD_IP" --port="$RAY_PORT" --dashboard-host=127.0.0.1 --dashboard-port="$DASH_PORT" \
           --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats
-for t in $(seq 1 90); do ray status 2>/dev/null | grep -q "/16.0 GPU" && break; echo "waiting for 16 GPUs ($t/90)"; sleep 10; done
-ray status | grep -q "/16.0 GPU" || { echo "worker never joined" >&2; ray status; exit 1; }
+for t in $(seq 1 180); do ray status 2>/dev/null | grep -q "/${NUM_GPUS}.0 GPU" && break; echo "waiting for $NUM_GPUS GPUs ($t/180)"; sleep 10; done
+ray status | grep -q "/${NUM_GPUS}.0 GPU" || { echo "workers never joined ($NUM_GPUS GPUs expected)" >&2; ray status; exit 1; }
 printf "http://%s:%s\n" "$(hostname -s)" "$TINKER_PORT" > "$ENDPOINT_FILE.tmp" && mv "$ENDPOINT_FILE.tmp" "$ENDPOINT_FILE"
 echo "endpoint $(cat "$ENDPOINT_FILE") (ray cluster ready $(date))"
 # shellcheck disable=SC2086
 exec python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
-  --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
+  --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" \
+  --actor-num-nodes "$TRAIN_NODES" --rollout-num-gpus "$ROLLOUT_GPUS" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
 EOF
 chmod +x "$JOBDIR/worker-inner.sh" "$JOBDIR/head-inner.sh"
 
-# ---------------------------------------------------------------- worker (node 1): host-side wrapper started via pbsdsh
+# ---------------------------------------------------------------- worker wrapper (host side, one per non-head node, started via pbsdsh)
 cat > "$JOBDIR/worker.sh" <<EOF
 exec >> "$JOBDIR/worker-\$(hostname -s).log" 2>&1
 set -x
@@ -118,82 +215,164 @@ exec /usr/bin/singularity exec $(cat "$JOBDIR/container_args.txt") \\
   --env HEAD_IP=$HEAD_IP --env RAY_PORT=$RAY_PORT --env WORKER_IP=\$WORKER_IP \\
   "$SIF" /bin/bash "$JOBDIR/worker-inner.sh"
 EOF
-pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=$HOME /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker.log" 2>&1 &
-WORKER_PID=$!
 
 # ---------------------------------------------------------------- teardown
 # PBS ends the job only when this batch shell exits, so teardown must (1) never block and (2) leave no
-# process behind: killing singularity's starter orphans everything it spawned (ray daemons, actors,
-# SGLang engines holding the GPUs), so each node runs kill-leftovers.sh before the shell exits.
-cat > "$JOBDIR/kill-leftovers.sh" <<'EOF'
-#!/bin/bash
-# usage: kill-leftovers.sh [logdir]  (with logdir, appends to <logdir>/teardown-<host>.log)
-[[ $(hostname -s) == login* ]] && { echo "refusing to run on $(hostname -s)" >&2; exit 1; }
-[[ -n ${1:-} ]] && exec >> "$1/teardown-$(hostname -s).log" 2>&1
-me=$(id -un)
-NAMES='python|python3|raylet|gcs_server|starter|starter-suid|sinit'
-CMDS='^(ray::|sglang::|/usr/bin/singularity)'
-left=$( { pgrep -u "$me" -a -x "$NAMES"; pgrep -u "$me" -a -f "$CMDS"; } 2>/dev/null | sort -u)
-n=$(printf '%s' "$left" | grep -c .)
-echo "$(hostname -s): $n leftover process(es) $(date +%T)"; printf '%s\n' "$left" | head -12 | cut -c1-160
-if (( n > 0 )); then
-  pkill -KILL -u "$me" -x "$NAMES" 2>/dev/null; pkill -KILL -u "$me" -f "$CMDS" 2>/dev/null
-  sleep 2; echo "$(hostname -s): $(pgrep -u "$me" -x "$NAMES" | wc -l) left after kill"
-fi
-exit 0
-EOF
-chmod +x "$JOBDIR/kill-leftovers.sh"
-
+# process behind. Order: service helpers (their own bounded cleanup is 90 s container + 10 s guard), then the
+# miles containers (TERM to singularity's starter kills the whole --containall PID namespace), KILL what is
+# left, wait on the explicit pid list (a bare `wait` blocks forever on the tee behind launcher.log), then the
+# leftover sweep on every node (Toolathlon containers have no PID namespace: nginx/postgres/uvicorn survive
+# their starter).
+HEAD_PID=; WORKER_PIDS=(); SERVICE_PIDS=(); CLIENT_PID=; MONITOR_PID=
+alive() { local p; for p in "$@"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && printf '%s ' "$p"; done; }
 cleanup() { local st=$?; trap - EXIT TERM INT; echo "cleanup status=$st $(date)"
-  rm -f "$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint"
-  local pids=(${HEAD_PID:-} "$WORKER_PID")
-  kill -TERM "${pids[@]}" 2>/dev/null || true
-  for t in $(seq 1 30); do kill -0 "${pids[@]}" 2>/dev/null || break; sleep 1; done
-  kill -KILL "${pids[@]}" 2>/dev/null || true
+  rm -f "$ENDPOINT_FILE"
+  [[ -n $MONITOR_PID ]] && { kill "$MONITOR_PID" 2>/dev/null || true; }
+  if [[ -n $CLIENT_PID ]] && kill -0 "$CLIENT_PID" 2>/dev/null; then
+    echo "client still running: TERM to its process group"; kill -TERM -- "-$CLIENT_PID" 2>/dev/null || kill -TERM "$CLIENT_PID" 2>/dev/null || true
+    wait_gone 30 "$CLIENT_PID" || kill -KILL -- "-$CLIENT_PID" 2>/dev/null || true
+  fi
+  local svc; read -r -a svc <<< "$(alive "${SERVICE_PIDS[@]}")"
+  if (( ${#svc[@]} )); then
+    echo "(1) TERM ${#svc[@]} service helper(s), up to 120 s"; kill -TERM "${svc[@]}" 2>/dev/null || true
+    wait_gone 120 "${svc[@]}" || echo "service helper(s) still alive after 120 s: $(alive "${svc[@]}")"
+  fi
+  local miles; read -r -a miles <<< "$(alive "$HEAD_PID" "${WORKER_PIDS[@]}")"
+  if (( ${#miles[@]} )); then
+    echo "(2) TERM ${#miles[@]} miles container(s), up to 30 s"; kill -TERM "${miles[@]}" 2>/dev/null || true
+    wait_gone 30 "${miles[@]}" || echo "miles container(s) still alive after 30 s: $(alive "${miles[@]}")"
+  fi
+  local all=("$HEAD_PID" "${WORKER_PIDS[@]}" "${SERVICE_PIDS[@]}" "$CLIENT_PID" "$MONITOR_PID") left
+  read -r -a left <<< "$(alive "${all[@]}")"
+  (( ${#left[@]} )) && { echo "(3) KILL ${left[*]}"; kill -KILL "${left[@]}" 2>/dev/null || true; }
   # wait on these pids only: a bare `wait` blocks forever on the tee process substitution behind launcher.log
-  wait "${pids[@]}" 2>/dev/null || true
-  bash "$JOBDIR/kill-leftovers.sh" || true
-  pbsdsh -n "${VIDX[1]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash "$JOBDIR/kill-leftovers.sh" "$JOBDIR" || true
+  local p; for p in "${all[@]}"; do [[ -n $p ]] && { wait "$p" 2>/dev/null || true; }; done
+  echo "(4) leftover sweep on every node"
+  if dry; then show "kill-leftovers[$HEAD_HOST]" bash "$JOBDIR/kill-leftovers.sh"; else bash "$JOBDIR/kill-leftovers.sh" || true; fi
+  local sweep=() i
+  for i in "${!HOSTS[@]}"; do (( i == 0 )) && continue
+    if dry; then show "pbsdsh[kill-leftovers ${HOSTS[$i]}]" pbsdsh -n "${VIDX[$i]}" -- "${PBSDSH_ENV[@]}" /bin/bash "$JOBDIR/kill-leftovers.sh" "$JOBDIR"
+    else pbsdsh -n "${VIDX[$i]}" -- "${PBSDSH_ENV[@]}" /bin/bash "$JOBDIR/kill-leftovers.sh" "$JOBDIR" & sweep+=($!); fi
+  done
+  if (( ${#sweep[@]} )); then
+    wait_gone 90 "${sweep[@]}" || { echo "leftover sweep still running after 90 s on some node(s); abandoning it"; kill -KILL "${sweep[@]}" 2>/dev/null || true; }
+    for p in "${sweep[@]}"; do wait "$p" 2>/dev/null || true; done
+  fi
   echo "teardown done $(date)"; exit "$st"; }
 trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
 
-# ---------------------------------------------------------------- head + driver + gateway (node 0)
-ulimit -n "$(ulimit -Hn)" 2>/dev/null || true; ulimit -s unlimited 2>/dev/null || true
-LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
-EXTRA_ARGS=${EXTRA_ARGS:-}
-/usr/bin/singularity exec "${CONTAINER_ARGS[@]}" \
-  --env "HEAD_IP=$HEAD_IP" --env "RAY_PORT=$RAY_PORT" --env "DASH_PORT=$DASH_PORT" \
-  --env "TINKER_PORT=$TINKER_PORT" --env "RUN_NAME=$RUN_NAME" --env "MODE=$MODE" --env "HF_SNAPSHOT=$HF_SNAPSHOT" \
-  --env "GATEWAY_LAUNCHER=$GATEWAY_LAUNCHER" \
-  --env "CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints/$RUN_NAME" --env "ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint" \
-  --env "LAUNCHER_ARGS=$LAUNCHER_ARGS" --env "EXTRA_ARGS=$EXTRA_ARGS" \
-  "$SIF" /bin/bash "$JOBDIR/head-inner.sh" > "$JOBDIR/head.log" 2>&1 &
-HEAD_PID=$!
+# ---------------------------------------------------------------- Toolathlon services (before Ray: miles' dynamic ports start at 20000 and skip bound ones)
+if [[ $SERVICES == 1 ]]; then
+  [[ -r $TOOLATHLON_ENV ]] || { echo "TOOLATHLON_ENV not readable: $TOOLATHLON_ENV" >&2; exit 2; }
+  for i in "${!ENGINE_HOSTS[@]}"; do
+    launch_bg "$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
+      pbsdsh -n "${ENGINE_VIDX[$i]}" -- "${PBSDSH_ENV[@]}" "PBS_JOBID=$PBS_JOBID" "PBS_LOCALDIR=$PBS_LOCALDIR" \
+        "PLATOON_ROOT=$PLATOON_ROOT" "TOOLATHLON_ENV=$TOOLATHLON_ENV" "MILES_SRC=$MILES_SRC" \
+        OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only \
+        /bin/bash "$MILES_SRC/deploy/abci/toolathlon_service.sh"
+    SERVICE_PIDS+=("$LAST_PID")
+  done
+  echo "services: ${#ENGINE_HOSTS[@]} helper(s) started on $SERVICE_NODES ($(date))"
+fi
 
-# ---------------------------------------------------------------- health + supervise
-for t in $(seq 1 360); do
-  if curl -sf --noproxy '*' --connect-timeout 3 --max-time 10 "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" >/dev/null; then
-    echo "gateway healthy at http://$HEAD_HOST:$TINKER_PORT ($(date))"; break
-  fi
-  kill -0 "$HEAD_PID" 2>/dev/null || { echo "head container exited early" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
-  sleep 10
+# ---------------------------------------------------------------- ray workers (every non-head node)
+for i in "${!HOSTS[@]}"; do (( i == 0 )) && continue
+  launch_bg "$JOBDIR/ray-worker-${HOSTS[$i]}.log" pbsdsh -n "${VIDX[$i]}" -- "${PBSDSH_ENV[@]}" /bin/bash "$JOBDIR/worker.sh"
+  WORKER_PIDS+=("$LAST_PID")
 done
 
+# ---------------------------------------------------------------- head + driver + gateway (node 0)
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true; ulimit -s unlimited 2>/dev/null || true
+launch_bg "$JOBDIR/head.log" /usr/bin/singularity exec "${CONTAINER_ARGS[@]}" \
+  --env "HEAD_IP=$HEAD_IP" --env "RAY_PORT=$RAY_PORT" --env "DASH_PORT=$DASH_PORT" --env "NUM_GPUS=$NUM_GPUS" \
+  --env "TINKER_PORT=$TINKER_PORT" --env "RUN_NAME=$RUN_NAME" --env "MODE=$MODE" --env "HF_SNAPSHOT=$HF_SNAPSHOT" \
+  --env "GATEWAY_LAUNCHER=$GATEWAY_LAUNCHER" --env "TRAIN_NODES=$TRAIN_NODES" --env "ROLLOUT_GPUS=$ROLLOUT_GPUS" \
+  --env "CHECKPOINT_ROOT=$CHECKPOINT_ROOT" --env "ENDPOINT_FILE=$ENDPOINT_FILE" \
+  --env "LAUNCHER_ARGS=$LAUNCHER_ARGS" --env "EXTRA_ARGS=$EXTRA_ARGS" \
+  "$SIF" /bin/bash "$JOBDIR/head-inner.sh"
+HEAD_PID=$LAST_PID
+# shellcheck disable=SC2086
+dry && show "serve (inside the head container)" python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
+  --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" --actor-num-nodes "$TRAIN_NODES" --rollout-num-gpus "$ROLLOUT_GPUS" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
+
+# ---------------------------------------------------------------- service health (release quorum: >= 1/4 on :8082 with X-Session-ID, >= 5/8 workers)
+probe() { [[ $(curl --silent --output /dev/null --connect-timeout 3 --max-time 15 --noproxy '*' --write-out '%{http_code}' "$@" 2>/dev/null) == 200 ]]; }
+SWEEP_REPORT=
+sweep_services() {  # 0 when every service host meets the quorum and its helper is alive; SWEEP_REPORT lists the rest
+  local pids=() kinds=() hosts=() i w host ip; local -A pub=() wrk=()
+  for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}; ip=${ENGINE_IPS[$i]}
+    for w in 0 1 2 3; do probe -H "X-Session-ID: gw-health-$JOB-$host-$w" "http://$ip:8082/health" & pids+=($!); kinds+=(pub); hosts+=("$host"); done
+    for w in 0 1 2 3 4 5 6 7; do probe "http://$ip:$((28100 + w))/health" & pids+=($!); kinds+=(wrk); hosts+=("$host"); done
+  done
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then host=${hosts[$i]}
+      if [[ ${kinds[$i]} == pub ]]; then pub[$host]=$(( ${pub[$host]:-0} + 1 )); else wrk[$host]=$(( ${wrk[$host]:-0} + 1 )); fi
+    fi
+  done
+  SWEEP_REPORT=
+  for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}
+    kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null || SWEEP_REPORT+=" $host(helper dead)"
+    (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
+  done
+  [[ -z $SWEEP_REPORT ]]
+}
+if [[ $SERVICES == 1 ]] && ! dry; then
+  for t in $(seq 1 120); do
+    sweep_services && { echo "services healthy on $SERVICE_NODES ($(date))"; break; }
+    (( t % 6 == 0 )) && echo "waiting for services ($t/120):$SWEEP_REPORT"
+    for i in "${!SERVICE_PIDS[@]}"; do kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null || { echo "service helper on ${ENGINE_HOSTS[$i]} exited early" >&2; tail -40 "$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" >&2; exit 1; }; done
+    (( t == 120 )) && { echo "services not healthy after 1200 s:$SWEEP_REPORT" >&2; exit 1; }
+    sleep 10
+  done
+fi
+
+# ---------------------------------------------------------------- gateway health
+if ! dry; then
+  for t in $(seq 1 360); do
+    if curl -sf --noproxy '*' --connect-timeout 3 --max-time 10 "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" >/dev/null; then
+      echo "gateway healthy at http://$HEAD_HOST:$TINKER_PORT ($(date))"; break
+    fi
+    kill -0 "$HEAD_PID" 2>/dev/null || { echo "head container exited early" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
+    (( t == 360 )) && { echo "gateway not healthy after 3600 s" >&2; exit 1; }
+    sleep 10
+  done
+fi
+
+# ---------------------------------------------------------------- monitor: head container alive, services quorum (10 consecutive failures = fatal)
+monitor_loop() {
+  local fails=0
+  while sleep 30; do
+    kill -0 "$HEAD_PID" 2>/dev/null || { echo "monitor: head container died ($(date)); ending the job" >&2; kill -TERM $$; return; }
+    [[ $SERVICES == 1 ]] || continue
+    if sweep_services; then fails=0; continue; fi
+    fails=$((fails + 1)); echo "monitor: unhealthy services ($fails/10):$SWEEP_REPORT ($(date))" >&2
+    (( fails >= 10 )) && { echo "monitor: services unhealthy for 10 consecutive sweeps; ending the job" >&2; kill -TERM $$; return; }
+  done
+}
+if ! dry; then monitor_loop & MONITOR_PID=$!; fi
+
 # ---------------------------------------------------------------- client on the head node (never on a login node)
-# CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway is healthy, with the
-# endpoint exported (TINKER_BASE_URL, ENDPOINT_FILE, JOBDIR, RUN_NAME, HF_HOME, no_proxy); its output goes to
-# $JOBDIR/client.log and $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1.
+# CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway (and the services) are healthy,
+# in its own process group with the C10 exports below; its output goes to $JOBDIR/client.log and its exit code to
+# $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1.
+CLIENT_ENV=(
+  "TINKER_BASE_URL=http://$HEAD_HOST:$TINKER_PORT" "TINKER_API_KEY=${TINKER_API_KEY:-tml-local}" "ENDPOINT_FILE=$ENDPOINT_FILE"
+  "JOBDIR=$JOBDIR" "RUN_NAME=$RUN_NAME" "HF_HOME=$HF_HOME"
+  "no_proxy=$HEAD_HOST,$HEAD_IP${SERVICE_NODES:+,$SERVICE_NODES,$ENGINE_IP_LIST}${no_proxy:+,$no_proxy}"
+  "MILES_SRC=$MILES_SRC" "PLATOON_ROOT=$PLATOON_ROOT" "SERVICE_NODES=$SERVICE_NODES"
+  "OPENREWARD_SESSION_URLS_TOOLATHLON=$SERVICE_URLS" "OPENREWARD_SESSION_URLS=$SERVICE_URLS"
+  "PBS_LOCALDIR=$PBS_LOCALDIR" "WORKERS=$WORKERS"
+)
 if [[ -n ${CLIENT_SCRIPT:-} ]]; then
   [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
-  echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"
-  (
-    export TINKER_BASE_URL="http://$HEAD_HOST:$TINKER_PORT" ENDPOINT_FILE="$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint" \
-           JOBDIR="$JOBDIR" RUN_NAME="$RUN_NAME" HF_HOME="$HF_HOME" \
-           no_proxy="$HEAD_HOST,$HEAD_IP,${no_proxy:-}" TINKER_API_KEY="${TINKER_API_KEY:-tml-local}"
-    cd "$MILES_SRC"
-    bash "$CLIENT_SCRIPT"
-  ) > "$JOBDIR/client.log" 2>&1
-  CLIENT_STATUS=$?
+  echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"; printf '  export %s\n' "${CLIENT_ENV[@]}"
+  if dry; then show "client" env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT"; CLIENT_STATUS=0
+  else
+    ( cd "$MILES_SRC" && exec setsid env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT" ) > "$JOBDIR/client.log" 2>&1 &
+    CLIENT_PID=$!
+    CLIENT_STATUS=0; wait "$CLIENT_PID" || CLIENT_STATUS=$?
+    CLIENT_PID=
+  fi
   echo "$CLIENT_STATUS" > "$JOBDIR/client.status"
   echo "client exited status=$CLIENT_STATUS ($(date))"
   if [[ ${KEEP_GATEWAY:-0} != 1 ]]; then
@@ -201,4 +380,5 @@ if [[ -n ${CLIENT_SCRIPT:-} ]]; then
     exit "$CLIENT_STATUS"
   fi
 fi
+dry && { echo "dry run complete"; exit 0; }
 wait "$HEAD_PID"; st=$?; echo "head exited status=$st $(date)"; exit "$st"
