@@ -46,7 +46,7 @@ class Replay:
         manager = self.manager
         context = ""
         if manager is not None:
-            lengths = [len(r.top_indices_list) for r in manager.replays]
+            lengths = manager.queue_lengths()
             context = (
                 f"; manager {manager.name}: enabled={manager.enabled} stage={manager.stage} "
                 f"replays={len(manager.replays)} non_empty={sum(1 for n in lengths if n)} "
@@ -143,6 +143,7 @@ class BaseReplayManager:
         return len(live), dropped
 
     def queue_lengths(self) -> list[int]:
+        """Rows currently queued per registered replay (diagnostics)."""
         return [len(replay.top_indices_list) for replay in self.replays]
 
     def set_current(self, replay: Replay):
