@@ -108,6 +108,7 @@ cat > "$JOBDIR/node-init.sh" <<'EOF'
 #!/bin/bash
 # usage: node-init.sh <node_local>  (runs on each node via pbsdsh; prints init_ok <host> <ip> + init_info lines)
 set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}   # pbsdsh's environment lacks /usr/sbin, where `ip` lives
 NODE_LOCAL=$1
 mkdir -p "$NODE_LOCAL/tmp" && chmod 1777 "$NODE_LOCAL/tmp" || { echo "init_failed $(hostname -s)"; exit 1; }
 ip=$(ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}')

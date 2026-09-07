@@ -263,3 +263,28 @@ def test_submit_presets_dry_run(tmp_path):
         assert "(dry run: not submitted)" in proc.stdout and "reservation" in proc.stdout
     proc = subprocess.run(["bash", str(submit), "bogus", "--dry-run"], env=env, capture_output=True, text=True)
     assert proc.returncode == 2
+
+
+def test_node_init_helper_finds_ip_without_usr_sbin_in_path(tmp_path):
+    """pbsdsh runs helpers with a PATH that lacks /usr/sbin; node-init.sh must still find `ip` (job 2245383)."""
+    import re
+    import subprocess
+
+    pbs = (Path(__file__).resolve().parents[3] / "deploy/abci/tinker_gateway.pbs").read_text()
+    m = re.search(r'cat > "\$JOBDIR/node-init.sh" <<\'EOF\'\n(.*?)\nEOF\n', pbs, re.S)
+    assert m, "node-init.sh heredoc not found"
+    helper = tmp_path / "node-init.sh"
+    helper.write_text(m.group(1) + "\n")
+    probe = subprocess.run(
+        ["/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "bash", "-c", "ip -o -4 addr show | grep -c ' 10\\.0\\.'"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() == "0":
+        pytest.skip("no 10.0.x.y IPoIB interface on this host")
+    out = subprocess.run(
+        ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "bash", str(helper), str(tmp_path / "local")],
+        capture_output=True, text=True, check=False,
+    )
+    ok = [line for line in out.stdout.splitlines() if line.startswith("init_ok ")]
+    assert ok, out.stdout + out.stderr
+    assert len(ok[0].split()) == 3 and ok[0].split()[2].startswith("10.0."), ok[0]
