@@ -464,11 +464,17 @@ class TinkerService:
         for sampling_session_id, session in list(self.sampling_sessions.items()):
             if _path_model_id(session["model_path"]) == record.model_id:
                 del self.sampling_sessions[sampling_session_id]
-        async with self._backend_lock:
-            for version in sorted(record.loaded_versions):
-                await self._unload_version(record, version)
-            await self.backend.unload_slot(record.slot)
-        self.free_slots.add(record.slot)
+        try:
+            async with self._backend_lock:
+                for version in sorted(record.loaded_versions):
+                    await self._unload_version(record, version)
+                await self.backend.unload_slot(record.slot)
+        finally:
+            # The record is already forgotten, so the slot must come back even when the
+            # trainer is unreachable (a dead actor group after a failed unit): leaking it
+            # would leave a single-tenant gateway answering "serves one model at a time"
+            # to every later client for the rest of the run.
+            self.free_slots.add(record.slot)
 
     def _forget_model(self, record: ModelRecord) -> None:
         self.models.pop(record.model_id, None)

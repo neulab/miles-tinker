@@ -19,9 +19,12 @@ Storage model
   for rows [P, S-1) (``routed_experts_start_len``) and the entry stores that
   delta with ``parent_id``/``parent_rows``. Materialization walks the chain.
 - Parents are found through a prefix-hash index: every entry records the
-  blake2b digest of ``tokens[:c]`` at ``c in {stride, 2*stride, ...} | {S}``;
-  a prompt is hashed at the same cut points and the longest cut with live
-  candidates is refined with an exact longest-common-prefix compare.
+  blake2b digest of ``tokens[:c]`` at the cut ladder of ``_cut_lengths``
+  (``MIN_CUT, 2*MIN_CUT, ...`` up to the stride, then ``stride, 2*stride, ...``,
+  always ending at ``S``); a prompt is hashed at the same cut points and the
+  longest cut with live candidates is refined with an exact longest-common-prefix
+  compare. The sub-stride rungs are what let two sequences shorter than one
+  stride meet at all.
 - Lifetime: a parent found for an in-flight request is pinned
   (``pending_count``) until ``record``/``unpin``; entries with children stay
   until the children are gone; a materialized (trained) leaf is released
@@ -41,6 +44,10 @@ import numpy as np
 DEFAULT_MAX_BYTES = 137_438_953_472  # 128 GiB
 DEFAULT_TTL_S = 21_600.0
 DEFAULT_PREFIX_STRIDE = 256
+# Shortest prefix the index keys on. Below the stride the cut ladder doubles from
+# here, so a parent and its extension share a cut whenever they share this many
+# tokens (chat turns are far shorter than one stride).
+MIN_CUT = 8
 PREFIX_CANDIDATES = 8
 ROUTING_ID_BITS = 53  # a JSON-safe integer for the SDK's JS-compatible clients
 UNCOVERED = -1  # trainer: rows entirely -1 route through the live router
@@ -371,20 +378,41 @@ def _as_tokens(tokens) -> np.ndarray:
     return np.ascontiguousarray(array.reshape(-1))
 
 
+def _cut_lengths(size: int, stride: int) -> list[int]:
+    """Ascending cut lengths a sequence is indexed and probed at.
+
+    A parent and the request that extends it can only meet at a cut length both
+    carry, so the ladder must be dense enough below the shorter of the two. A
+    ladder of stride multiples alone is not: a 72-token turn is indexed only at
+    72 and its 93-token continuation probes only at 93, which is why a
+    ``--tinker-routing-prefix-stride 256`` gateway found no parent for any chat
+    turn shorter than one stride. Below the stride the ladder therefore doubles
+    from ``MIN_CUT``, so two sequences sharing at least ``MIN_CUT`` tokens of
+    prefix always share a cut; above it the stride keeps the index small.
+    The last entry is always ``size`` (``_resolve`` uses it as the exact key).
+    """
+    cut_lens = []
+    cut = MIN_CUT
+    while cut < stride and cut <= size:
+        cut_lens.append(cut)
+        cut *= 2
+    cut_lens.extend(range(stride, size + 1, stride))
+    if not cut_lens or cut_lens[-1] != size:
+        cut_lens.append(size)
+    return cut_lens
+
+
 def _prefix_digests(tokens: np.ndarray, stride: int) -> list[tuple[int, bytes]]:
-    """(cut_len, digest) for cut lengths stride, 2*stride, ... and S, ascending,
+    """(cut_len, digest) for the cut lengths of ``_cut_lengths``, ascending,
     from one incremental blake2b pass over the int32 bytes."""
     size = int(tokens.size)
     if size == 0:
         return []
     raw = tokens.astype("<i4", copy=False).tobytes()
-    cut_lens = list(range(stride, size + 1, stride))
-    if not cut_lens or cut_lens[-1] != size:
-        cut_lens.append(size)
     hasher = hashlib.blake2b(digest_size=16)
     digests = []
     fed = 0
-    for cut_len in cut_lens:
+    for cut_len in _cut_lengths(size, stride):
         hasher.update(raw[fed * 4 : cut_len * 4])
         fed = cut_len
         digests.append((cut_len, hasher.copy().digest()))

@@ -5,7 +5,7 @@ lifetime rules (pins, consumed leaves, TTL, byte cap) keep the cache bounded."""
 import numpy as np
 import pytest
 
-from miles.tinker.routing_cache import RoutingCache, RoutingCaptureError, _lcp, _prefix_digests
+from miles.tinker.routing_cache import RoutingCache, RoutingCaptureError, _cut_lengths, _lcp, _prefix_digests
 
 L, K, E = 3, 2, 16
 
@@ -257,3 +257,31 @@ def test_routing_ids_are_unique_and_json_safe():
     cache, _ = _cache()
     ids = {_record(cache, [1, 2, i], [4], seed=i)[0] for i in range(50)}
     assert len(ids) == 50 and all(0 < i < 2**53 for i in ids)
+
+
+def test_a_short_turn_finds_its_parent_under_the_production_stride():
+    """The 09080157 smoke never logged a prefix-parent hit: with
+    --tinker-routing-prefix-stride 256 a 72-token turn was indexed only at cut 72 and its
+    93-token continuation probed only at cut 93, so the two never met. The sub-stride
+    rungs of the cut ladder make every extension of a >= MIN_CUT-token turn findable."""
+    cache, _ = _cache(prefix_stride=256)
+    turn1_prompt, turn1_generated = list(range(24)), list(range(1000, 1048))  # S = 72
+    rid, _, _ = _record(cache, turn1_prompt, turn1_generated, seed=1)
+
+    turn2_prompt = turn1_prompt + turn1_generated + list(range(2000, 2021))  # 93 tokens
+    found = cache.find_prefix_parent("t", turn2_prompt)
+
+    assert found is not None, "a 72-token parent must be found for its 93-token extension"
+    parent, reuse = found
+    assert parent.routing_id == rid
+    assert reuse == 71, "every row of the parent (S - 1) is causally valid for the extension"
+    assert cache.stats()["prefix_hits"] == 1
+
+
+def test_the_cut_ladder_doubles_below_the_stride_and_strides_above_it():
+    assert _cut_lengths(72, 256) == [8, 16, 32, 64, 72]
+    assert _cut_lengths(93, 256) == [8, 16, 32, 64, 93]
+    assert _cut_lengths(600, 256) == [8, 16, 32, 64, 128, 256, 512, 600]
+    assert _cut_lengths(512, 256) == [8, 16, 32, 64, 128, 256, 512]
+    assert _cut_lengths(10, 4) == [4, 8, 10], "a stride under MIN_CUT keeps the plain stride ladder"
+    assert _cut_lengths(5, 256) == [5], "shorter than MIN_CUT: only the exact cut"
