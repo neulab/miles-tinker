@@ -13,6 +13,10 @@ Args:
   --base-model: model name the gateway advertises (default Qwen/Qwen3-4B-Instruct-2507).
   --lora-rank: adapter rank to request.
   --steps: forward_backward/optim_step rounds before the first save.
+  --unload-before-resume: free the first model before resuming (single-tenant full fine-tuning gateways).
+  --resume-without-optimizer: resume with ``create_training_client_from_state`` (weights only, Adam
+    reset) instead of ``..._with_optimizer``; the optimizer-state load allocates a second copy of the
+    Adam moments on the trainer, which does not fit for large unsharded-expert MoE models.
 
 Example:
   /home/aci18912it/miles-tinker/cookbook-venv/bin/python deploy/clients/tinker_sdk_smoke.py \\
@@ -154,6 +158,7 @@ def main() -> int:
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--unload-before-resume", action="store_true", help="free the first model before resuming (full fine-tuning gateways serve one model at a time)")
+    parser.add_argument("--resume-without-optimizer", action="store_true", help="resume weights only (create_training_client_from_state) instead of with optimizer state")
     args = parser.parse_args()
     base_url = resolve_base_url(args)
     checks = Checks()
@@ -189,8 +194,12 @@ def main() -> int:
         weights_info.base_model == args.base_model and weights_info.is_lora is True,
         f"base_model={weights_info.base_model} is_lora={weights_info.is_lora} lora_rank={weights_info.lora_rank}",
     )
-    resumed = service.create_training_client_from_state_with_optimizer(state_path)
-    checks.check("create_training_client_from_state_with_optimizer", resumed.get_info().model_id != info.model_id)
+    if args.resume_without_optimizer:
+        resume, resumed = "create_training_client_from_state", service.create_training_client_from_state(state_path)
+    else:
+        resume = "create_training_client_from_state_with_optimizer"
+        resumed = service.create_training_client_from_state_with_optimizer(state_path)
+    checks.check(resume, resumed.get_info().model_id != info.model_id)
     train_rounds(checks, resumed, datums, 1, "resumed")
 
     sampler = resumed.save_weights_and_get_sampling_client()

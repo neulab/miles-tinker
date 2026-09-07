@@ -12,7 +12,8 @@
 # Two-node Tinker gateway on ABCI (singularity + PBS + Ray).
 #   node 0: ray head + miles driver (serve_tinker.py) + gateway HTTP  (one container)
 #   node 1: ray worker                                                (one container via pbsdsh)
-# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...,CLIENT_SCRIPT=...,KEEP_GATEWAY=1`.
+# Tunables via `qsub -v MODE=lora|full,RUN_NAME=...,EXTRA_ARGS=...,LAUNCHER_ARGS=...,CLIENT_SCRIPT=...,KEEP_GATEWAY=1`,
+# plus GATEWAY_LAUNCHER (repo-relative launcher, default the Qwen3-4B one) and HF_SNAPSHOT (its --hf-checkpoint).
 # Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
 set -euo pipefail
 umask 077
@@ -29,6 +30,7 @@ EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}     # pip --target dir with t
 HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
 HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
 MODE=${MODE:-lora}
+GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}  # run from /root/miles inside the container
 JOB=${PBS_JOBID%%.*}
 RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
 JOBDIR=$PROJECT_ROOT/jobs/$RUN_NAME
@@ -49,7 +51,7 @@ node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
 HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
 [[ -n $HEAD_IP && -n $IFNAME ]] || { echo "could not determine the head IPoIB address" >&2; ip -o -4 addr show >&2; exit 2; }
 exec > >(tee -a "$JOBDIR/launcher.log") 2>&1
-echo "job=$JOB run=$RUN_NAME mode=$MODE head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF $(date)"
+echo "job=$JOB run=$RUN_NAME mode=$MODE launcher=$GATEWAY_LAUNCHER snapshot=$HF_SNAPSHOT head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME worker=${HOSTS[1]} port=$TINKER_PORT sif=$SIF $(date)"
 echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD) $(git -C "$MILES_SRC" branch --show-current)"
 
 # ---------------------------------------------------------------- container command (same on both nodes)
@@ -99,7 +101,7 @@ ray status | grep -q "/16.0 GPU" || { echo "worker never joined" >&2; ray status
 printf "http://%s:%s\n" "$(hostname -s)" "$TINKER_PORT" > "$ENDPOINT_FILE.tmp" && mv "$ENDPOINT_FILE.tmp" "$ENDPOINT_FILE"
 echo "endpoint $(cat "$ENDPOINT_FILE") (ray cluster ready $(date))"
 # shellcheck disable=SC2086
-exec python examples/tinker/run_qwen3_4b_gateway.py serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
+exec python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
   --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
 EOF
 chmod +x "$JOBDIR/worker-inner.sh" "$JOBDIR/head-inner.sh"
@@ -162,6 +164,7 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 /usr/bin/singularity exec "${CONTAINER_ARGS[@]}" \
   --env "HEAD_IP=$HEAD_IP" --env "RAY_PORT=$RAY_PORT" --env "DASH_PORT=$DASH_PORT" \
   --env "TINKER_PORT=$TINKER_PORT" --env "RUN_NAME=$RUN_NAME" --env "MODE=$MODE" --env "HF_SNAPSHOT=$HF_SNAPSHOT" \
+  --env "GATEWAY_LAUNCHER=$GATEWAY_LAUNCHER" \
   --env "CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints/$RUN_NAME" --env "ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint" \
   --env "LAUNCHER_ARGS=$LAUNCHER_ARGS" --env "EXTRA_ARGS=$EXTRA_ARGS" \
   "$SIF" /bin/bash "$JOBDIR/head-inner.sh" > "$JOBDIR/head.log" 2>&1 &

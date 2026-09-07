@@ -1,0 +1,13 @@
+# --sglang-config for tinker_gateway.pbs (EXTRA_ARGS="--sglang-config /root/miles/deploy/abci/sglang-return-routed-experts-1x8.yaml"):
+# the default one-model / one-group layout of --rollout-num-gpus 8, plus an engine-only ServerArgs override
+# that makes /generate return `meta_info.routed_experts` when a request asks for it (return_routed_experts).
+# The override is applied to the SGLang engine kwargs only (miles/backends/sglang_utils/sglang_engine.py);
+# the trainer never sees it, unlike --use-rollout-routing-replay, which also switches the training pass to
+# routing replay (not wired for the Tinker executors). num_gpus must equal --rollout-num-gpus.
+sglang:
+  - name: default
+    server_groups:
+      - worker_type: regular
+        num_gpus: 8
+        overrides:
+          enable_return_routed_experts: true
