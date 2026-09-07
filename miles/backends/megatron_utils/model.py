@@ -152,6 +152,12 @@ def setup_model_and_optimizer(
     # must start from an empty registration list (otherwise the live routers sit at
     # stream indices the fill never reaches).
     for manager in all_replay_managers:
+        if manager.replays:
+            logger.warning(
+                f"R3 registration ({role}): dropping {len(manager.replays)} {manager.name} replays left by an "
+                "earlier model build in this process (the live routers would otherwise sit past the streams "
+                "the fill reaches)"
+            )
         manager.reset_registrations()
 
     # Multi-LoRA and single-LoRA (actor, bridge) both build via the bridge helper,

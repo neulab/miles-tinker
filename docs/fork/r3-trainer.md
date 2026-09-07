@@ -38,8 +38,11 @@ rollout_data, *, stage)` wraps exactly one pass:
 - Enter: `fill_replay_data(...)` per active manager (this consumes and deletes
   `rollout_data[m.data_key]`), then `m.stage = stage`.
 - `forward_backward` uses `stage="replay_backward"`: `forward_step`
-  (`model.py`) forces `replay_forward` during the forward and restores
-  `replay_backward` for the recompute, so the router pops the same rows twice.
+  (`model.py`) switches a manager that is already in a replay stage to
+  `replay_forward` during the forward and restores `replay_backward` for the
+  recompute, so the router pops the same rows twice. A manager left at
+  `fallthrough` (enabled but never filled) is *not* switched: forcing it would
+  make every router pop from an empty queue.
   The fill runs outside the `actor_train` timer (MFU unaffected).
 - `forward_only_logprobs` uses `stage="replay_forward"` (entered on the
   method's existing `ExitStack`).
@@ -69,3 +72,33 @@ Megatron forces `sequence_parallel=False` at TP1, so the SP slice inside
 `fill_replay_data` is a no-op for the TP1 deployment and is live only in the
 TP2 fallback; `tests/fast/utils/test_replay_data_sp.py` pins the TP2 layout
 (each rank registers its half of the padded microbatch).
+
+## Diagnostics and the typed failure (job 2245536)
+
+The replay managers are process-wide singletons that three independent steps
+have to agree on, and when they disagreed the run died with an
+`IndexError: pop_forward out of range` inside Megatron's `compute_topk` with
+no way to tell which step was wrong. Each step now states its numbers:
+
+- Registration. `setup_model_and_optimizer` calls `reset_registrations()` on
+  every manager before the build (a second build in one process used to append
+  its routers after the first build's, leaving the live routers at stream
+  indices the fill never reaches) and logs one line per build:
+  `R3 registration (actor): routing replay manager enabled=True, 40 routers
+  registered by this model build`. `register_to_module` is also idempotent per
+  module instance.
+- Fill. `fill_replay_data` logs
+  `R3 fill rollout_routed_experts: microbatches=1 replays=40 streams=40
+  rows_recorded=40 rows_per_replay=[1]` and raises `ReplayError` when there is
+  nothing to fill (no microbatches -- `forward_backward_no_pipelining` runs the
+  last microbatch even at `num_microbatches=0` -- or no registered replays), or
+  when the register function left a registered router without its rows.
+- Mapping. `register_replay_list_moe` raises `ReplayError` when the registered
+  routers and the local MoE layers differ in number, or when a local layer id
+  is past the streams the rollout tensor carries.
+- Pop. An exhausted queue raises `ReplayError` naming the manager, the replay's
+  stream index and the manager's `enabled`/`stage`/`replays`/`non_empty`/
+  `rows_per_replay`, instead of a bare `IndexError`.
+
+`ReplayError` is always a bug in the wiring, never a data condition: an
+uncovered datum is expressed as all -1 rows (C5), not as a missing queue.

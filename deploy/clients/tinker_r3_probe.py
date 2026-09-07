@@ -112,8 +112,12 @@ def resolve_base_url(args: argparse.Namespace) -> str:
     return url
 
 
-def unload_model(base_url: str, model_id: str) -> None:
-    """POST /api/v1/unload_model with this client's API key (a gateway route without an SDK method)."""
+def unload_model(base_url: str, model_id: str) -> str:
+    """POST /api/v1/unload_model with this client's API key (a gateway route without an SDK method).
+
+    A 400 naming an unknown model means the gateway already released it (the lease sweep
+    races this call when a failed unit kills the trainer), which is the outcome we want.
+    """
     import httpx
 
     response = httpx.post(
@@ -122,7 +126,10 @@ def unload_model(base_url: str, model_id: str) -> None:
         headers={"X-API-Key": os.environ["TINKER_API_KEY"]},
         timeout=120,
     )
+    if response.status_code == 400 and "unknown model" in response.text:
+        return "already released by the gateway"
     response.raise_for_status()
+    return "unloaded"
 
 
 def render_turn(tokenizer, history: list[dict], user_text: str) -> list[int]:
@@ -300,12 +307,16 @@ def main() -> int:
         else:
             checks.check("training skipped: no routing_id on a turn", False)
     finally:
+        # the single full-FT slot is this client's to give back: a leaked model holds it
+        # for the whole lease and every later client gets "serves one model at a time"
         if not args.keep_model:
-            try:
-                unload_model(base_url, model_id)
-                print(f"unloaded {model_id}", flush=True)
-            except Exception as exc:  # noqa: BLE001
-                print(f"WARN unload_model failed: {exc}", flush=True)
+            for attempt in range(3):
+                try:
+                    print(f"{model_id}: {unload_model(base_url, model_id)}", flush=True)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"WARN unload_model attempt {attempt + 1} failed: {exc}", flush=True)
+                    time.sleep(2)
     print(f"{'PASS' if checks.failed == 0 else 'FAIL'} r3 probe: {checks.failed} failed check(s)", flush=True)
     return 1 if checks.failed else 0
 

@@ -7,9 +7,10 @@
 # "pop_forward out of range" and its missing prefix-parent hits.
 #   qsub -v RTYPE=rt_HF,MODE=full,RUN_NAME=r3dbg-1,SERVICES=0,TRAIN_NODES=1,\
 #     GATEWAY_LAUNCHER=examples/tinker/run_qwen3_6_35b_a3b_gateway.py,HF_SNAPSHOT=...,\
-#     MILES_SRC=...,LAUNCHER_ARGS="--actor-num-nodes 1 --rollout-num-gpus 8 --max-tokens-per-gpu 4096",\
+#     MILES_SRC=...,LAUNCHER_ARGS="--context-len 8191 --max-tokens-per-gpu 8192",\
 #     CLIENT_SCRIPT=deploy/abci/clients/r3_debug.sh -l walltime=01:30:00 deploy/abci/tinker_gateway.pbs
-# Knobs: MODEL_NAME, R3_POLICY (natural), R3_MAX_TOKENS (16 generated tokens per turn).
+# The launcher asserts --max-tokens-per-gpu >= --context-len + 1, so both must shrink together.
+# Knobs: MODEL_NAME, R3_POLICY (natural), R3_MAX_TOKENS (16 generated tokens per turn), SECOND_PROBE (1).
 set -uo pipefail
 MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}
 source "$MILES_SRC/deploy/clients/hostguard.sh"
@@ -45,6 +46,13 @@ step 5 "no replay error, no opaque router IndexError"
 if grep -qE 'ReplayError|pop_forward out of range' "$HEAD_LOG"; then
   echo "FAIL replay error in head.log:"; grep -E 'ReplayError|pop_forward out of range' "$HEAD_LOG" | head -5; FAILED=$((FAILED + 1))
 else echo "PASS no replay error"; fi
+
+if [[ ${SECOND_PROBE:-1} == 1 ]]; then
+  step 6 "a second client: the first probe gave the single full-FT slot back (service._release_model)"
+  run "$PLATOON_PY" deploy/clients/tinker_r3_probe.py --endpoint-file "$ENDPOINT_FILE" \
+    --base-model "$MODEL_NAME" --policy "${R3_POLICY:-natural}" --max-tokens "${R3_MAX_TOKENS:-16}"
+  grep -E 'R3 fill' "$HEAD_LOG" | tail -4
+fi
 
 echo; echo "r3_debug done: $FAILED failed check(s) ($(date))"
 exit $(( FAILED > 0 ))
