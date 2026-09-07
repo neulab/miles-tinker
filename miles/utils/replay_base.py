@@ -115,6 +115,33 @@ class BaseReplayManager:
         self.replays = []
         self.current = None
 
+    def prune_to_model(self, models) -> tuple[int, int]:
+        """Keep only the replays a module of ``models`` still holds, in module order.
+
+        A router registers itself in its own ``__init__``, so a wrapper that builds a
+        decoder and then throws it away registers twice as many replays as the model
+        has live routers -- and the live ones end up in the second half, past the
+        streams ``register_replay_list_*`` fills. megatron-bridge's ``Qwen3VLGPTModel``
+        does exactly that: ``GPTModel.__init__`` builds ``self.decoder =
+        TransformerBlock(...)`` and the subclass then replaces it with a
+        ``Qwen3VLTransformerBlock`` built from the same spec. Called once per model
+        build; returns ``(kept, dropped)``.
+        """
+        live: list[Replay] = []
+        seen: set[int] = set()
+        for model in models:
+            for module in model.modules():
+                for value in vars(module).values():
+                    if isinstance(value, Replay) and value.manager is self and id(value) not in seen:
+                        seen.add(id(value))
+                        live.append(value)
+        dropped = len(self.replays) - len(live)
+        self.replays = live
+        for index, replay in enumerate(live):
+            replay.index = index
+        self.current = None
+        return len(live), dropped
+
     def queue_lengths(self) -> list[int]:
         return [len(replay.top_indices_list) for replay in self.replays]
 

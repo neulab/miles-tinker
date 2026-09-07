@@ -150,3 +150,46 @@ def test_an_exhausted_replay_raises_a_typed_error_naming_the_manager_and_its_que
     message = str(excinfo.value)
     assert "pop_forward out of range" in message
     assert "replays=3" in message and "non_empty=1" in message and "rows_per_replay=[0, 1]" in message
+
+
+class _Block(torch.nn.Module):
+    """A decoder block whose layers register a replay each, as Megatron's TopKRouter does."""
+
+    def __init__(self, manager, num_layers: int):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(_Router() for _ in range(num_layers))
+        for layer in self.layers:
+            manager.register_to_module(layer, "routing_replay")
+
+
+class _RebuildingModel(torch.nn.Module):
+    """megatron-bridge's Qwen3VLGPTModel: GPTModel.__init__ builds self.decoder, then the
+    subclass replaces it with its own block built from the same spec (text_model.py:118)."""
+
+    def __init__(self, manager, num_layers: int):
+        super().__init__()
+        self.decoder = _Block(manager, num_layers)  # GPTModel.__init__
+        self.decoder = _Block(manager, num_layers)  # "# rebuild the transformer block"
+
+
+def test_prune_to_model_keeps_the_live_routers_of_a_rebuilt_block():
+    # job 2245536: the discarded block's replays took streams 0..39, the live routers took
+    # 40..79, and register_replay_list_moe filled the discarded half
+    manager = _enabled_manager()
+    model = _RebuildingModel(manager, num_layers=4)
+    assert len(manager.replays) == 8, "both blocks registered"
+
+    kept, dropped = manager.prune_to_model([model])
+
+    assert (kept, dropped) == (4, 4)
+    assert manager.replays == [layer.routing_replay for layer in model.decoder.layers]
+    assert [replay.index for replay in manager.replays] == [0, 1, 2, 3]
+
+
+def test_prune_to_model_is_a_no_op_for_a_model_that_builds_its_block_once():
+    manager = _enabled_manager()
+    model = _Block(manager, num_layers=3)
+    before = list(manager.replays)
+
+    assert manager.prune_to_model([model]) == (3, 0)
+    assert manager.replays == before

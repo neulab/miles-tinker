@@ -179,10 +179,18 @@ def setup_model_and_optimizer(
         model = get_model(provider_func, ModelType.encoder_or_decoder)
 
     for manager in all_replay_managers:
+        registered = len(manager.replays)
+        kept, dropped = manager.prune_to_model(model)
         logger.info(
             f"R3 registration ({role}): {manager.name} replay manager enabled={manager.enabled}, "
-            f"{len(manager.replays)} routers registered by this model build"
+            f"{registered} routers registered by this model build, {kept} live in the model, {dropped} dropped"
         )
+        if dropped:
+            logger.info(
+                f"R3 registration ({role}): {dropped} {manager.name} replays belonged to modules the model "
+                "build discarded (a wrapper that rebuilds a block registers its routers twice); the fill "
+                "maps the live ones"
+            )
 
     if args.debug_disable_optimizer:
         if is_first_replica_megatron_main_rank():
