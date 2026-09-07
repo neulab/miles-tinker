@@ -34,6 +34,7 @@ class GatewayConfig:
     coalesce_wait_s: float = 0.3  # planner: wait for more chunks of an open window
     coalesce_max_wait_s: float = 2.0
     max_concurrent_samples: int = 512  # in-flight /generate posts per gateway
+    routing_replay_policy: str = "natural"  # R3: "strict" fails uncovered datums, "natural" routes them live
 
     @property
     def is_lora(self) -> bool:

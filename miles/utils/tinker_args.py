@@ -56,3 +56,43 @@ def validate_tinker_serve_args(args) -> None:
         # Megatron's DDP nan check raises inside the grad sync and kills the actor; the executors veto the step instead.
         logger.info("Tinker gateway: setting check_for_nan_in_loss_and_grad=False (non-finite steps are vetoed)")
         args.check_for_nan_in_loss_and_grad = False
+    if getattr(args, "use_rollout_routing_replay", False):
+        _validate_routing_replay(args)
+    if getattr(args, "fused_lm_head_logprobs", False):
+        _validate_fused_lm_head(args)
+
+
+def _validate_routing_replay(args) -> None:
+    """R3 through the gateway: the routing cache stores one expert id per (token, layer, slot)."""
+    assert getattr(args, "num_experts", None), "--use-rollout-routing-replay needs an MoE model (--num-experts)"
+    assert not getattr(args, "sglang_speculative_algorithm", None), (
+        "--use-rollout-routing-replay through the Tinker gateway does not support speculative decoding "
+        "(the engines' routed-experts capture is target-only and its buffer ignores verify tokens); "
+        "drop --sglang-speculative-algorithm"
+    )
+    if getattr(args, "mtp_num_layers", None):
+        logger.warning(
+            "--use-rollout-routing-replay with --mtp-num-layers %s: the MTP block is excluded from the replay on "
+            "both sides; pass --mtp-num-layers 0 unless MTP training is intended",
+            args.mtp_num_layers,
+        )
+
+
+def _validate_fused_lm_head(args) -> None:
+    """The fused chunked head only yields target-token logprobs of the policy loss."""
+    assert (
+        getattr(args, "loss_type", "policy_loss") == "policy_loss"
+    ), f"--fused-lm-head-logprobs serves policy_loss only, got --loss-type {args.loss_type!r}"
+    assert not getattr(
+        args, "calculate_per_token_loss", False
+    ), "--fused-lm-head-logprobs is incompatible with --calculate-per-token-loss"
+    assert not getattr(
+        args, "true_on_policy_mode", False
+    ), "--fused-lm-head-logprobs computes fp32 logits per chunk; --true-on-policy-mode is not supported"
+    assert not getattr(args, "enable_mtp_training", False) and not getattr(args, "mtp_num_layers", None), (
+        "--fused-lm-head-logprobs cannot serve the MTP block's logits; drop --enable-mtp-training and pass "
+        "--mtp-num-layers 0"
+    )
+    assert getattr(
+        args, "untie_embeddings_and_output_weights", True
+    ), "--fused-lm-head-logprobs takes the output layer's own weight; tied embeddings are not supported"

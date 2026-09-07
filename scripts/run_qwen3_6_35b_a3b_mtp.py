@@ -165,7 +165,7 @@ def execute(args: ScriptArgs):
         "--sglang-speculative-eagle-topk 1 "
         "--sglang-speculative-num-draft-tokens 3 "
         "--sglang-max-running-requests 256 "
-        "--sglang-mamba-scheduler-strategy extra_buffer "
+        "--sglang-mamba-radix-cache-strategy extra_buffer "
     )
 
     mtp_args = "--enable-mtp-training " "--mtp-num-layers 1 " "--mtp-loss-scaling-factor 0.2 "

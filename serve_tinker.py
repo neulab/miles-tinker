@@ -64,7 +64,11 @@ async def serve(args):
         retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
         sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
         coalesce_wait_s=args.tinker_coalesce_wait_s,
+        coalesce_max_wait_s=args.tinker_coalesce_max_wait_s,
         max_concurrent_samples=args.tinker_max_concurrent_samples,
+        max_tokens_per_datum=args.tinker_max_tokens_per_datum,
+        max_tokens_per_request=args.tinker_max_tokens_per_request,
+        routing_replay_policy=args.tinker_routing_replay_policy,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)

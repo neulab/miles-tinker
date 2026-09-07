@@ -459,6 +459,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--fused-lm-head-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "Compute target-token logprobs with a fused chunked lm head (fp32 logits per chunk, never a "
+                    "materialized [T, V] tensor); policy_loss only, no entropy, no true-on-policy, no MTP"
+                ),
+            )
+            parser.add_argument(
+                "--fused-lm-head-chunk-size",
+                type=int,
+                default=1024,
+                help="Rows per chunk of the fused lm head (default: 1024)",
+            )
+            parser.add_argument(
                 "--indep-dp",
                 action="store_true",
                 default=False,
@@ -1902,6 +1917,64 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=262_144,
                 help="Maximum tokens the planner packs into one training work unit (default: 262144)",
+            )
+            parser.add_argument(
+                "--tinker-max-tokens-per-datum",
+                type=int,
+                default=32768,
+                help="Maximum tokens (model_input + target) of one Datum; longer rows are rejected (default: 32768)",
+            )
+            parser.add_argument(
+                "--tinker-max-tokens-per-request",
+                type=int,
+                default=4_000_000,
+                help="Maximum total tokens of one forward/forward_backward request (default: 4000000)",
+            )
+            parser.add_argument(
+                "--tinker-coalesce-max-wait-s",
+                type=float,
+                default=2.0,
+                help=(
+                    "Upper bound in seconds an under-filled work unit is held open for more chunks of the same "
+                    "window, counted from its first chunk (default: 2.0)"
+                ),
+            )
+            parser.add_argument(
+                "--tinker-routing-replay-policy",
+                type=str,
+                choices=["strict", "natural"],
+                default="natural",
+                help=(
+                    "With --use-rollout-routing-replay: a datum without cached routing fails the request "
+                    "('strict') or trains through the live router with a logged metric ('natural', default)"
+                ),
+            )
+            parser.add_argument(
+                "--tinker-routing-cache-max-bytes",
+                type=int,
+                default=137_438_953_472,
+                help="Byte cap of the gateway's rollout routing cache; unpinned leaves are evicted LRU (default: 128 GiB)",
+            )
+            parser.add_argument(
+                "--tinker-routing-cache-ttl-s",
+                type=float,
+                default=21600.0,
+                help="Seconds a cached rollout routing survives after capture (default: 21600)",
+            )
+            parser.add_argument(
+                "--tinker-routing-prefix-stride",
+                type=int,
+                default=256,
+                help="Token stride of the routing cache's prefix-hash index (default: 256)",
+            )
+            parser.add_argument(
+                "--tinker-r3-check",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the routing replay result check (routing_replay_manager.enable_check_replay_result) "
+                    "on the gateway's trainer; threshold from MILES_TEST_R3_THRESHOLD"
+                ),
             )
             parser.add_argument(
                 "--multi-lora-n-adapters",

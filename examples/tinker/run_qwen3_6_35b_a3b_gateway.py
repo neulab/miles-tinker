@@ -1,4 +1,4 @@
-"""Tinker gateway launcher for Qwen3.6-35B-A3B (hybrid GDN/attention MoE, 1 MTP layer).
+"""Tinker gateway launcher for Qwen3.6-35B-A3B (hybrid GDN/attention MoE, MTP block unused).
 
 Serves ``serve_tinker.py`` disaggregated: ``actor_num_nodes`` x 8 GPUs train
 (Megatron, TP1 / EP8 / ETP1, distributed optimizer, full uniform recompute) and
@@ -11,7 +11,23 @@ The weights load through megatron-bridge (``--megatron-to-hf-mode bridge``):
 the HF snapshot is a ``Qwen3_5MoeForConditionalGeneration`` wrapper, which the
 bridge maps to its Qwen3.5-VL MoE provider (language model + vision tower + the
 MTP block read from ``mtp_num_hidden_layers``), so no torch_dist conversion is
-needed. Model args come from ``scripts/models/qwen3.6-35B-A3B.py``.
+needed. Model args come from ``scripts/models/qwen3.6-35B-A3B.py``; the
+launcher overrides its ``--mtp-num-layers 1`` with ``0`` (argparse last wins)
+and never passes ``--enable-mtp-training``: the engines run without EAGLE, the
+fused lm head cannot serve the MTP block's logits, and one layer of activations
+is saved. The engines load the MTP weights from HF and never use them.
+
+Numerics are matched across the two sides: the engines run with
+``--sglang-enable-fp32-lm-head`` and the trainer scores the same fp32 logits
+through the fused chunked head (``--fused-lm-head-logprobs``). Rollout routing
+replay (R3, ``--use-rollout-routing-replay``) is on by default: the gateway
+caches every sample's routed experts and replays them on the datums that
+train (``--tinker-routing-*``); ``--routing-policy strict`` fails a datum whose
+routing is not cached instead of routing it live.
+
+The engines need no mamba flag: the image's ``ServerArgs`` resolves
+``mamba_radix_cache_strategy=auto`` to ``extra_buffer`` for this architecture
+(check the engine log for ``mamba_radix_cache_strategy=extra_buffer``).
 
 Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RAY=1``,
 ``MASTER_ADDR`` set), the HF snapshot under ``--hf-checkpoint``, and the
@@ -27,20 +43,36 @@ Args:
   --actor-num-nodes / --actor-num-gpus-per-node / --rollout-num-gpus /
     --rollout-num-gpus-per-engine: the train / sample split.
   --tp / --ep / --etp: tensor, expert and expert-tensor parallel sizes (PP=CP=1).
-  --max-tokens-per-gpu: packed tokens per training microbatch; keep it small
-    when the expert DP is 1 (the expert optimizer state is not sharded).
+    ``--tp 2`` is the memory fallback (``--sequence-parallel`` becomes effective,
+    expert DP halves); a resumed run must keep the TP/EP/DP of its save.
+  --max-tokens-per-gpu: packed tokens per training microbatch (one 64k row).
+  --context-len: model_input tokens per datum; datums are ``context_len + 1``
+    tokens, the engines get ``context_len + 1`` as context length and
+    ``--rollout-max-context-len context_len``.
+  --max-tokens-per-datum / --unit-token-budget / --coalesce-wait-s /
+    --coalesce-max-wait-s / --max-concurrent-samples / --lease-timeout-s: the
+    gateway limits (``--tinker-*`` flags).
+  --routing-replay / --routing-policy / --routing-cache-max-bytes /
+    --routing-cache-ttl-s / --routing-prefix-stride / --r3-check: R3 knobs.
+  --fused-lm-head / --fused-lm-head-chunk-size: the fused fp32 head; with
+    ``--no-fused-lm-head`` the trainer falls back to ``--log-probs-chunk-size``.
+  --balance-data: Karmarkar-Karp token balancing across DP ranks per unit.
   --recompute-args: Megatron recompute flags (default full uniform, 1 layer).
   --moe-token-dispatcher-type: Megatron MoE dispatcher (``alltoall``).
   --pause-generation-mode: ``retract`` (a base-weight push drops the prefix cache).
-  --update-weight-buffer-size: bytes per weight-update batch (1 GiB).
-  --sglang-ep-size / --sglang-mem-fraction-static / --sglang-context-length /
-    --sglang-chunked-prefill-size / --sglang-max-running-requests: engine knobs.
+  --update-weight-buffer-size: bytes per weight-update batch (2 GiB).
+  --sglang-ep-size / --sglang-mem-fraction-static / --sglang-chunked-prefill-size /
+    --sglang-max-running-requests / --sglang-max-total-tokens /
+    --sglang-fp32-lm-head: engine knobs (``--sglang-max-total-tokens`` bounds
+    the KV pool and the pinned routed-experts host cache when set).
+  --check-weight-update-equal: compare the first weight push against the
+    engines (smoke runs only).
   --extra-args: appended verbatim to the ``serve_tinker.py`` argv.
 
 Example:
   MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
     python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --mode full \\
-      --actor-num-nodes 1 --rollout-num-gpus 8 --max-tokens-per-gpu 8192 --tinker-port 20613
+      --actor-num-nodes 4 --rollout-num-gpus 8 --tinker-port 20613 --check-weight-update-equal
 """
 
 from dataclasses import dataclass
@@ -77,21 +109,46 @@ class ScriptArgs(U.ExecuteTrainConfig):
     ep: int = 8
     etp: int = 1
 
-    # Training performance knobs.
+    # Training performance knobs: one 64k row (65536 model_input + 1 target token) per DP rank per microbatch.
     max_tokens_per_gpu: int = 65537
+    context_len: int = 65536
+    balance_data: bool = True
     recompute_args: str = "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"
     moe_token_dispatcher_type: str = "alltoall"
 
+    # Gateway limits: 32 rows of 64k per unit, wait for the SDK's one-datum chunks before training.
+    max_tokens_per_datum: int = 65537
+    unit_token_budget: int = 2_097_184
+    coalesce_wait_s: float = 5.0
+    coalesce_max_wait_s: float = 120.0
+    max_concurrent_samples: int = 1024
+    lease_timeout_s: float = 600.0
+
+    # R3: replay the engines' routing in training; the cache lives on the gateway host.
+    routing_replay: bool = True
+    routing_policy: str = "natural"
+    routing_cache_max_bytes: int = 128 * 1024**3
+    routing_cache_ttl_s: float = 21600.0
+    routing_prefix_stride: int = 256
+    r3_check: bool = False
+
+    # fp32 lm head: fused chunked head in the trainer, fp32 logits on the engines.
+    fused_lm_head: bool = True
+    fused_lm_head_chunk_size: int = 1024
+    log_probs_chunk_size: int = 2048  # only without the fused head
+    sglang_fp32_lm_head: bool = True
+
     # Weight pushes: a full-weight push must drop the engines' prefix cache, so retract.
     pause_generation_mode: str = "retract"
-    update_weight_buffer_size: int = 1024**3
+    update_weight_buffer_size: int = 2 * 1024**3
+    check_weight_update_equal: bool = False
 
     # Sampling engines.
     sglang_ep_size: int = 8
-    sglang_mem_fraction_static: float = 0.8
-    sglang_context_length: int = 65537
+    sglang_mem_fraction_static: float = 0.75
     sglang_chunked_prefill_size: int = 16384
-    sglang_max_running_requests: int = 256
+    sglang_max_running_requests: int = 128
+    sglang_max_total_tokens: int | None = None
 
     tinker_port: int = 10613
     extra_args: str = ""
@@ -106,10 +163,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
             "(LoRA on Qwen3.6-35B-A3B needs the bshd/TP2 layout of scripts/run_qwen3_5_35b_a3b_lora.py)"
         )
         assert self.pause_generation_mode in ("abort", "retract", "in_place"), self.pause_generation_mode
+        assert self.routing_policy in ("strict", "natural"), self.routing_policy
         assert self.rollout_num_gpus % self.rollout_num_gpus_per_engine == 0, (
             f"--rollout-num-gpus {self.rollout_num_gpus} is not a multiple of "
             f"--rollout-num-gpus-per-engine {self.rollout_num_gpus_per_engine}"
         )
+        assert (
+            self.max_tokens_per_gpu >= self.context_len + 1
+        ), f"--max-tokens-per-gpu {self.max_tokens_per_gpu} cannot hold one {self.context_len + 1}-token row"
+
+    @property
+    def sglang_context_length(self) -> int:
+        """One token of slack over the datum length: the gateway clamps generation to ``context_len``."""
+        return self.context_len + 1
 
 
 @app.command()
@@ -128,7 +194,9 @@ def serve(args: ScriptArgs):
         f"[run] tinker gateway mode={args.mode} {args.model_name}: "
         f"{args.actor_num_nodes}x{args.actor_num_gpus_per_node} train (TP{args.tp}/EP{args.ep}/ETP{args.etp}) + "
         f"{args.rollout_num_gpus} rollout GPUs ({args.rollout_num_gpus_per_engine} per engine), "
-        f"port {args.tinker_port}, checkpoints {args.checkpoint_root}"
+        f"port {args.tinker_port}, checkpoints {args.checkpoint_root}, "
+        f"r3={'on' if args.routing_replay else 'off'}/{args.routing_policy}, "
+        f"fused_lm_head={'on' if args.fused_lm_head else 'off'}"
     )
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
@@ -139,28 +207,56 @@ def serve(args: ScriptArgs):
         f"--tinker-server-port {args.tinker_port} "
         f"--tinker-checkpoint-root {args.checkpoint_root} "
         f"--tinker-base-model {args.model_name} "
+        f"--tinker-max-tokens-per-datum {args.max_tokens_per_datum} "
+        f"--tinker-unit-token-budget {args.unit_token_budget} "
+        f"--tinker-coalesce-wait-s {args.coalesce_wait_s} "
+        f"--tinker-coalesce-max-wait-s {args.coalesce_max_wait_s} "
+        f"--tinker-max-concurrent-samples {args.max_concurrent_samples} "
+        f"--tinker-lease-timeout-s {args.lease_timeout_s:g} "
+        f"--tinker-routing-replay-policy {args.routing_policy} "
+        f"--tinker-routing-cache-max-bytes {args.routing_cache_max_bytes} "
+        f"--tinker-routing-cache-ttl-s {args.routing_cache_ttl_s:g} "
+        f"--tinker-routing-prefix-stride {args.routing_prefix_stride} "
     )
+    if args.r3_check:
+        tinker_args += "--tinker-r3-check "
+
+    r3_args = "--use-rollout-routing-replay " if args.routing_replay else ""
+
+    if args.fused_lm_head:
+        head_args = f"--fused-lm-head-logprobs --fused-lm-head-chunk-size {args.fused_lm_head_chunk_size} "
+    else:
+        head_args = f"--log-probs-chunk-size {args.log_probs_chunk_size} "
 
     # initial config only; AdamParams come per optim_step request
-    optimizer_args = "--optimizer adam --lr 1e-6 --use-distributed-optimizer "
+    optimizer_args = "--optimizer adam --lr 3e-6 --use-distributed-optimizer --accumulate-allreduce-grads-in-fp32 "
 
     perf_args = (
-        f"--tensor-model-parallel-size {args.tp} --sequence-parallel "
+        f"--tensor-model-parallel-size {args.tp} "
         "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
         f"--expert-model-parallel-size {args.ep} --expert-tensor-parallel-size {args.etp} "
-        f"{args.recompute_args} "
+        "--sequence-parallel "  # a no-op at TP1 (Megatron disables it); effective under --tp 2
         f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
+        f"{'--balance-data ' if args.balance_data else ''}"
+        f"{args.recompute_args} "
         f"--moe-token-dispatcher-type {args.moe_token_dispatcher_type} "
     )
+
+    # last-wins over the model definition's --mtp-num-layers 1; no --enable-mtp-training
+    mtp_args = "--mtp-num-layers 0 "
 
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
         f"--sglang-ep-size {args.sglang_ep_size} "
         f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
         f"--sglang-context-length {args.sglang_context_length} "
+        f"--rollout-max-context-len {args.context_len} "
         f"--sglang-chunked-prefill-size {args.sglang_chunked_prefill_size} "
         f"--sglang-max-running-requests {args.sglang_max_running_requests} "
+        f"{'--sglang-enable-fp32-lm-head ' if args.sglang_fp32_lm_head else ''}"
     )
+    if args.sglang_max_total_tokens is not None:
+        sglang_args += f"--sglang-max-total-tokens {args.sglang_max_total_tokens} "
 
     update_weight_args = (
         f"--pause-generation-mode {args.pause_generation_mode} "
@@ -175,12 +271,13 @@ def serve(args: ScriptArgs):
 
     misc_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
-        "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
+        "--attention-softmax-in-fp32 --attention-backend flash "
+        f"{'--check-weight-update-equal ' if args.check_weight_update_equal else ''}"
     )
 
     train_args = (
-        f"{ckpt_args} {mode_args} {tinker_args} {optimizer_args} "
-        f"{perf_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {args.extra_args} "
+        f"{ckpt_args} {mode_args} {tinker_args} {r3_args} {head_args} {optimizer_args} "
+        f"{perf_args} {mtp_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {args.extra_args} "
     )
 
     U.execute_train(
