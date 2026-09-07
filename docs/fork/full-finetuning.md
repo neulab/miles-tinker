@@ -124,10 +124,14 @@ every 30 s), so 700 s guarantees that the next attempt re-acquires the slot and
 `rl.py` resumes from `<log_path>/<experiment>/<trial>/checkpoints.jsonl` with
 the same `TINKER_API_KEY` tenant and `RUN_NAME` (`--checkpoint-root`). Every
 (re)launch writes a fresh ~490 GB `kind=both` checkpoint under a new
-`model_id`; `deploy/abci/clients/prune_tinker_checkpoints.py` (run every 10 min
-by the client script) keeps the newest two records' directories across all
-`model_id`s, never the last `state_path` record's directory and never a
-directory modified in the last 30 min. Job layout and teardown:
+`model_id`, named `recovery-<start_batch>`; `checkpoint.recovery_every` writes
+one `recovery-<batch>` per step on top of the permanent `<batch>` checkpoints
+of `checkpoint.every`, so a crash loses at most one step.
+`deploy/abci/clients/prune_tinker_checkpoints.py` (run every 10 min by the
+client script) deletes `recovery-*` directories across all `model_id`s except
+the newest two recovery records', the last `state_path` record's and any
+directory modified in the last 30 min; permanent names (`<batch>`,
+`<batch>_interrupted`, `final`) are kept forever. Job layout and teardown:
 `docs/fork/deploy-pbs-15node.md`.
 
 ## Memory and performance (Qwen3-4B, 8 H200 trainers TP=1/DP=8)

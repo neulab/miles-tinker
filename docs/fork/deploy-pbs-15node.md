@@ -107,10 +107,14 @@ none of the ten names (nor a planted value) appears in the launcher or helper ou
 <yaml> --tinker_base_url ... --log_path <runs>/<RUN_NAME>/logs --train.num_concurrent_rollout_workflow_workers $WORKERS`
 with `TINKER_TELEMETRY=1` (SESSION_END frees the single full-FT slot on a clean exit; the
 gateway's 600 s lease frees it otherwise, so 700 s >= lease + 30 s sweep + margin), and resumes
-from `<log_path>/<experiment>/<trial>/checkpoints.jsonl` automatically. Every 600 s
-`prune_tinker_checkpoints.py --keep 2` keeps the newest two records' directories across all
-`model_id`s, never the last `state_path` record's directory, never a directory modified in the
-last 30 min, and removes the rest (a ~490 GB launch checkpoint per (re)launch).
+from `<log_path>/<experiment>/<trial>/checkpoints.jsonl` automatically. The client saves on an
+AReaL-style two-tier cadence: a permanent `<batch>` checkpoint every `checkpoint.every` steps and
+a disposable `recovery-<batch>` one every `checkpoint.recovery_every` steps (plus one per
+(re)launch), each a full ~490 GB `kind=both` save. Every 600 s
+`prune_tinker_checkpoints.py --keep 2` deletes `recovery-*` directories across all `model_id`s
+except the newest two recovery records', the last `state_path` record's, and any directory
+modified in the last 30 min; permanent names (`<batch>`, `<batch>_interrupted`, `final`) are
+never deleted.
 
 ## Validation without a job
 

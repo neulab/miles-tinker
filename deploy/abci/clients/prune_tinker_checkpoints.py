@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-"""Prune full fine-tuning checkpoints of a platoon/cookbook Tinker run (stdlib only).
+"""Prune the recovery checkpoints of a platoon/cookbook Tinker run (stdlib only).
 
 The client appends one record per save to ``<log_path>/<experiment>/<trial>/checkpoints.jsonl``
 (``{"name", "batch", "state_path": "tinker://<model_id>/weights/<name>",
 "sampler_path": "tinker://<model_id>/sampler_weights/<name>", ...}``); the gateway stores each
 path under ``<checkpoint_root>/<model_id>/<kind>/<name>/``. Every (re)launch creates a new
-``model_id`` and writes a fresh ~490 GB launch checkpoint before training, so the directories
-must be pruned across all ``model_id``s:
+``model_id``, so the directories must be pruned across all ``model_id``s.
 
-* the directories of the newest ``--keep`` records of every ``checkpoints.jsonl`` are kept;
-* the last record's ``state_path`` directory is never deleted (it is the resume point);
-* a directory modified within the last ``--grace-min`` minutes is never deleted (a save in
-  progress); the launch checkpoint therefore goes only once a later record exists and pushed
-  it out of the newest-``keep`` window;
-* every other ``<checkpoint_root>/*/weights/*`` and ``*/sampler_weights/*`` directory is removed.
+The client writes checkpoints on an AReaL-style two-tier cadence, and only the disposable tier
+is prunable:
+
+* **recovery** checkpoints - name ``recovery-<batch>``, written by ``checkpoint.recovery_every``
+  (typically every step) and by every (re)launch, each a full ~490 GB weights+optimizer save
+  that only exists so a crash loses at most one step. These are the ONLY prunable directories;
+* **permanent** checkpoints - every other name (``<batch>`` from ``checkpoint.every``,
+  ``<batch>_interrupted``, ``final``) - and any other directory that is not ``recovery-*``.
+
+The rules, in order:
+
+1. a ``recovery-*`` directory of one of the newest ``--keep`` recovery records of a
+   ``checkpoints.jsonl`` is kept (both its state and sampler directory);
+2. the last record WITH a ``state_path`` is the resume point (cookbook
+   ``get_last_checkpoint(required_key="state_path")``) and its state directory is kept whatever
+   its name;
+3. every directory whose name does not start with ``recovery-`` is kept forever;
+4. a directory modified within the last ``--grace-min`` minutes is kept (a save in progress, or
+   a recovery save whose record has not been appended yet);
+5. every other ``recovery-*`` directory under ``<checkpoint_root>/*/weights/`` and
+   ``*/sampler_weights/`` is removed. A record whose directory does not exist is tolerated: in
+   the gateway's full mode ``sampler_path`` has no directory of its own.
 
 Args:
   --log-path: the client's ``log_path`` (searched recursively for ``checkpoints.jsonl``).
   --checkpoint-root: the gateway's ``--checkpoint-root`` for this run.
-  --keep: records to keep per checkpoints.jsonl (default 2).
+  --keep: recovery records to keep per checkpoints.jsonl (default 2).
   --grace-min: minutes since the last modification below which a directory is untouched (30).
   --dry-run: print the plan without deleting.
 
@@ -39,6 +54,8 @@ from pathlib import Path, PurePosixPath
 
 CHECKPOINT_KINDS = ("weights", "sampler_weights")
 PATH_KEYS = ("state_path", "sampler_path")
+# platoon.train.tinker.rl.RECOVERY_CHECKPOINT_PREFIX: the disposable tier.
+RECOVERY_PREFIX = "recovery-"
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,11 @@ def list_checkpoint_dirs(checkpoint_root: Path) -> dict[Path, float]:
     return found
 
 
+def is_recovery_name(name: str) -> bool:
+    """A ``recovery-<batch>`` checkpoint: the disposable tier of the client's cadence."""
+    return name.startswith(RECOVERY_PREFIX)
+
+
 def plan_prune(
     record_lists: list[list[dict]],
     existing: dict[Path, float],
@@ -112,17 +134,19 @@ def plan_prune(
     """Pure decision: which existing directories to keep and which to delete.
 
     ``record_lists`` holds the records of every ``checkpoints.jsonl`` in append order;
-    ``existing`` maps every candidate directory to its mtime.
+    ``existing`` maps every candidate directory to its mtime. Only ``recovery-*``
+    directories are ever deleted; see the module docstring for the full rule order.
     """
     if keep < 1:
         raise ValueError("keep must be >= 1")
     keep_dirs: set[Path] = set()
     reasons: dict[Path, str] = {}
     for records in record_lists:
-        for record in records[-keep:]:
+        recovery = [r for r in records if is_recovery_name(str(r.get("name", "")))]
+        for record in recovery[-keep:]:
             for directory in record_dirs(record, checkpoint_root):
                 keep_dirs.add(directory)
-                reasons.setdefault(directory, f"newest {keep} record(s)")
+                reasons.setdefault(directory, f"newest {keep} recovery record(s)")
         # the resume point is the last record WITH a state_path (cookbook get_last_checkpoint(required_key="state_path"))
         for record in reversed(records):
             last_state = record.get("state_path")
@@ -132,13 +156,17 @@ def plan_prune(
                     keep_dirs.add(directory)
                     reasons[directory] = "last record's state_path"
                 break
+    for directory in existing:  # permanent names (NNNNNN, *_interrupted, final) are kept forever
+        if not is_recovery_name(directory.name):
+            keep_dirs.add(directory)
+            reasons.setdefault(directory, "permanent checkpoint")
     for directory, mtime in existing.items():
-        if now - mtime < grace_s:
+        if now - mtime < grace_s and directory not in keep_dirs:
             keep_dirs.add(directory)
             reasons[directory] = f"modified {int(now - mtime)} s ago (< {int(grace_s)} s grace)"
     delete = tuple(sorted(d for d in existing if d not in keep_dirs))
     for directory in delete:
-        reasons[directory] = "unreferenced or older than the newest records"
+        reasons[directory] = f"recovery checkpoint older than the newest {keep}"
     return PrunePlan(keep=frozenset(keep_dirs), delete=delete, reasons=reasons)
 
 

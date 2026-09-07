@@ -42,8 +42,9 @@ CKPT_ROOT=/groups/gai51740/aci18912it/miles-tinker/checkpoints/$RUN_NAME
 mkdir -p "$LOG_PATH"
 echo "platoon toolathlon -> $TINKER_BASE_URL config=$CONFIG workers=${WORKERS:-3} services=$OPENREWARD_SESSION_URLS_TOOLATHLON ($(date))"
 echo "platoon: $(git -C "$PLATOON_ROOT" rev-parse --short HEAD 2>/dev/null) $(git -C "$PLATOON_ROOT" branch --show-current 2>/dev/null); log_path=$LOG_PATH ckpt_root=$CKPT_ROOT"
-# checkpoint pruner: every 10 min keep the newest KEEP_CKPTS records of checkpoints.jsonl (never the last record's
-# state_path, never a directory written in the last 30 min); each full save is ~490 GB
+# checkpoint pruner: every 10 min delete the ~490 GB `recovery-*` checkpoints except the newest KEEP_CKPTS of them
+# (never the last record's state_path, never a directory written in the last 30 min); permanent checkpoints
+# (NNNNNN from checkpoint.every, *_interrupted, final) are kept forever
 ( while sleep 600; do
     python3 "$MILES_SRC/deploy/abci/clients/prune_tinker_checkpoints.py" --log-path "$LOG_PATH" --checkpoint-root "$CKPT_ROOT" --keep "${KEEP_CKPTS:-2}" || true
   done ) & PRUNE_PID=$!
