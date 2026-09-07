@@ -41,6 +41,10 @@ FAILED=0
 step() { echo; echo "===== [$1] $2 ($(date +%T))"; }
 run() { echo "+ $*"; "$@"; local st=$?; (( st == 0 )) || { echo "FAIL: exit $st: $*"; FAILED=$((FAILED + 1)); }; return $st; }
 expect_log() { local what=$1 pattern=$2 file=$3; if grep -qE -- "$pattern" "$file"; then echo "PASS $what: $(grep -E -- "$pattern" "$file" | head -1 | cut -c1-200)"; else echo "FAIL $what: /$pattern/ not in $(basename "$file")"; FAILED=$((FAILED + 1)); fi; }
+# like expect_log, but polls: the driver flushes its `tinker perf` line a few seconds after the client's call returns
+expect_log_soon() { local what=$1 pattern=$2 file=$3 budget=${4:-90} t=0
+  while (( t < budget )); do grep -qE -- "$pattern" "$file" && break; sleep 5; t=$((t + 5)); done
+  expect_log "$what" "$pattern" "$file"; }
 expect_no_log() { local what=$1 pattern=$2 file=$3; if grep -qE -- "$pattern" "$file" 2>/dev/null; then echo "FAIL $what: $(grep -E -- "$pattern" "$file" | head -1 | cut -c1-200)"; FAILED=$((FAILED + 1)); else echo "PASS $what"; fi; }
 # PASS when any file named $3 under directory $4 matches the ERE $2 (step 9's rollout artifacts)
 expect_files() { local what=$1 pattern=$2 include=$3 dir=$4 hit; hit=$(grep -rlE --include="$include" --binary-files=without-match -- "$pattern" "$dir" 2>/dev/null | head -1); if [[ -n $hit ]]; then echo "PASS $what: ${hit#"$dir"/}"; else echo "FAIL $what: /$pattern/ in no $include under $dir"; FAILED=$((FAILED + 1)); fi; }
@@ -65,7 +69,7 @@ step 2 "0.16.1 R3 probe (policy=$R3_POLICY) then the SDK 0.27.1 smoke (proto)"
 run "$PLATOON_PY" deploy/clients/tinker_r3_probe.py --endpoint-file "$ENDPOINT_FILE" --base-model "$MODEL_NAME" --policy "$R3_POLICY"
 # the gateway logs the first prefix-parent hits (runtime.py _begin_capture) and counts them in the optim metrics
 expect_log "gateway saw a prefix-parent hit on an extended turn" 'prefix parent hit .*routed_experts_start_len=[1-9]' "$HEAD_LOG"
-expect_log "optim metrics count prefix-parent hits (routing_prefix_hits)" '"routing_prefix_hits": [1-9]' "$HEAD_LOG"
+expect_log_soon "optim metrics count prefix-parent hits (routing_prefix_hits)" 'routing_prefix_hits": [1-9]' "$HEAD_LOG"
 if [[ $R3_POLICY == strict ]]; then
   echo "SKIP (R3_POLICY=strict): the SDK smoke, the 64k bench, the numerics check and the resume gate train datums"
   echo "  without a routing_handle, which strict fails typed by design; run them on the natural-policy launch."
