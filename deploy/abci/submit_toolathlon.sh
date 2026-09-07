@@ -57,6 +57,13 @@ VARS+=",MILES_SRC=$MILES_SRC,PLATOON_ROOT=$PLATOON_ROOT,CLIENT_SCRIPT=$CLIENT_SC
 [[ -n $LAUNCHER_ARGS ]] && VARS+=",LAUNCHER_ARGS=$LAUNCHER_ARGS"
 [[ -n ${EXTRA_ARGS:-} ]] && VARS+=",EXTRA_ARGS=$EXTRA_ARGS"
 [[ -n ${KEEP_GATEWAY:-} ]] && VARS+=",KEEP_GATEWAY=$KEEP_GATEWAY"
+# Smoke-mode knobs read by clients/smoke_q36.sh; forwarded only when set (they must reach the client through -v,
+# because the CLIENT_SCRIPT inherits the job environment, not this shell's).
+for knob in R3_CHECK R3_POLICY FUSED_HEAD PLATOON_STEP SMOKE_WANDB PLATOON_TIMEOUT BENCH_DATUMS BENCH_SEQ_LEN; do
+  [[ -n ${!knob:-} ]] || continue
+  [[ ${!knob} != *,* ]] || { echo "qsub -v splits on commas; $knob value not allowed: ${!knob}" >&2; exit 2; }
+  VARS+=",$knob=${!knob}"
+done
 QSUB=(qsub -N "miles-ta-$preset" -l "select=$NODES:mpiprocs=8" -l "walltime=$WALLTIME" -v "$VARS" "$MILES_SRC/deploy/abci/tinker_gateway.pbs")
 echo "preset=$preset nodes=$NODES ($TRAIN_NODES train + $((NODES - TRAIN_NODES)) engine/service) walltime=$WALLTIME run=$RUN_NAME"
 echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD 2>/dev/null) $(git -C "$MILES_SRC" branch --show-current 2>/dev/null); platoon: $(git -C "$PLATOON_ROOT" rev-parse --short HEAD 2>/dev/null)"
