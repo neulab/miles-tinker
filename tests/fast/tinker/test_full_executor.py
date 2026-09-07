@@ -1,7 +1,8 @@
 """The full fine-tuning executor's optim window: finalize exactly once per
 window, AdamParams applied per step, non-finite grads vetoed, windows
-discarded on failure. Megatron and the heavy miles modules are stubbed; the
-test drives the executor's own state machine."""
+discarded on failure, rollout routing replay (R3) filled and cleared around
+the pass. Megatron and the heavy miles modules are stubbed; the test drives
+the executor's own state machine."""
 
 import importlib
 import sys
@@ -11,6 +12,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+# imported before the rig installs its module stubs so the real module binds its real dependencies
+import miles.backends.training_utils.replay_data as replay_data_mod
+from miles.utils.replay_base import Replay, indexer_replay_manager, routing_replay_manager
 
 EXECUTOR = "miles.backends.megatron_utils.full.executor"
 ADAM = {
@@ -270,3 +275,87 @@ def test_reset_to_base_reloads_the_startup_weights(rig):
     assert optimizer.inner.state["p"]["step"].item() == 0
     assert rig.executor._state["num_updates"] == 0
     assert (rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng) == (False, False, False)
+
+
+# ------------------------------- rollout routing replay (R3) -------------------------------
+
+
+def _replay_rig(rig, monkeypatch, *, flag: bool, enabled: bool):
+    """Point the routing manager at one queued replay and record the fills the executor asks for."""
+    rig.args.use_rollout_routing_replay = flag
+    replay = Replay()
+    replay.top_indices_list = [torch.zeros(2, 3, dtype=torch.int32)]
+    monkeypatch.setattr(routing_replay_manager, "enabled", enabled)
+    monkeypatch.setattr(routing_replay_manager, "stage", "fallthrough")
+    monkeypatch.setattr(routing_replay_manager, "replays", [replay])
+    monkeypatch.setattr(routing_replay_manager, "register_replay_list_func", _register_moe)
+    monkeypatch.setattr(indexer_replay_manager, "enabled", False)
+    fills: list[dict] = []
+
+    def fill_replay_data(**kwargs):
+        fills.append({**kwargs, "stage": routing_replay_manager.stage})
+        del kwargs["rollout_data"][kwargs["data_key"]]
+
+    monkeypatch.setattr(replay_data_mod, "fill_replay_data", fill_replay_data)
+    stages: list[str] = []
+    run = rig.executor.run_forward_backward_pass
+
+    def spy(*args, **kwargs):
+        stages.append(routing_replay_manager.stage)
+        return run(*args, **kwargs)
+
+    rig.executor.run_forward_backward_pass = spy
+    return SimpleNamespace(fills=fills, stages=stages, replay=replay)
+
+
+def _register_moe(replay_list, replay_data, *, models, **_kwargs):
+    raise AssertionError("the stubbed fill never registers")
+
+
+def test_r3_fills_the_routing_replay_and_clears_it_after_the_pass(rig, monkeypatch):
+    r3 = _replay_rig(rig, monkeypatch, flag=True, enabled=True)
+    rollout_data = {"rollout_routed_experts": ["rows"], "tokens": ["t"]}
+
+    rig.executor.forward_backward(rig.args, 1, rig.model, FakeOptimizer(), rollout_data)
+
+    assert len(r3.fills) == 1
+    fill = r3.fills[0]
+    assert fill["data_key"] == "rollout_routed_experts"
+    assert fill["replay_list"] is routing_replay_manager.replays
+    assert fill["register_replay_list_func"] is _register_moe
+    assert fill["if_sp_region"] is True and fill["indices_are_token_positions"] is False
+    assert fill["args"] is rig.args and fill["models"] is rig.model and fill["num_microbatches"] == [1]
+    assert fill["stage"] == "fallthrough", "filled before the stage is raised"
+    assert r3.stages == ["replay_backward"], "the pass runs with the backward recompute replaying"
+    assert routing_replay_manager.stage == "fallthrough", "back to the live router after the unit"
+    assert r3.replay.top_indices_list == [] and r3.replay.backward_index == 0, "queues cleared"
+    assert "rollout_routed_experts" not in rollout_data
+
+
+def test_r3_clears_the_replay_when_the_pass_fails(rig, monkeypatch):
+    r3 = _replay_rig(rig, monkeypatch, flag=True, enabled=True)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("cuda oom")
+
+    rig.executor.run_forward_backward_pass = boom
+    with pytest.raises(RuntimeError):
+        rig.executor.forward_backward(rig.args, 1, rig.model, FakeOptimizer(), {"rollout_routed_experts": ["rows"]})
+
+    assert len(r3.fills) == 1
+    assert routing_replay_manager.stage == "fallthrough"
+    assert r3.replay.top_indices_list == []
+    assert rig.executor._state["dirty"] is True
+
+
+@pytest.mark.parametrize("flag, enabled", [(False, True), (True, False), (False, False)])
+def test_r3_is_not_filled_unless_the_flag_and_the_manager_are_on(rig, monkeypatch, flag, enabled):
+    r3 = _replay_rig(rig, monkeypatch, flag=flag, enabled=enabled)
+    rollout_data = {"rollout_routed_experts": ["rows"]}
+
+    rig.executor.forward_backward(rig.args, 1, rig.model, FakeOptimizer(), rollout_data)
+
+    assert r3.fills == []
+    assert r3.stages == ["fallthrough"]
+    assert r3.replay.top_indices_list != [], "an inactive manager is left alone"
+    assert "rollout_routed_experts" in rollout_data

@@ -1,6 +1,10 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Protocol
 
 import torch
+
+from miles.utils.replay_base import BaseReplayManager, all_replay_managers
 
 from .cp_utils import slice_with_cp
 from .parallel import get_parallel_state
@@ -132,3 +136,42 @@ def fill_replay_data(
 
     for iterator in data_iterator:
         iterator.reset()
+
+
+def active_rollout_replay_managers(args) -> list[BaseReplayManager]:
+    """Managers that replay rollout data: enabled at init and requested by ``--use-rollout-<name>-replay``."""
+    return [m for m in all_replay_managers if m.enabled and getattr(args, f"use_rollout_{m.name}_replay", False)]
+
+
+@contextmanager
+def rollout_replay_stage(args, models, data_iterator, num_microbatches, rollout_data, *, stage: str) -> Iterator[None]:
+    """Replay the rollout's routing (R3) for one pass over ``data_iterator``.
+
+    Loads ``rollout_data[m.data_key]`` into every active manager's replay queues
+    (``fill_replay_data``, which also deletes the key) and holds ``m.stage`` at
+    ``stage`` (``replay_backward`` for a training pass, ``replay_forward`` for a
+    forward-only pass; ``forward_step`` forces ``replay_forward`` during the
+    forward itself). On exit, success or failure, the queues are cleared and the
+    stage falls through to the live router. Inactive managers are untouched.
+    """
+    active = active_rollout_replay_managers(args)
+    try:
+        for m in active:
+            fill_replay_data(
+                args=args,
+                models=models,
+                data_iterator=data_iterator,
+                num_microbatches=num_microbatches,
+                rollout_data=rollout_data,
+                data_key=m.data_key,
+                replay_list=m.replays,
+                register_replay_list_func=m.register_replay_list_func,
+                if_sp_region=m.if_sp_region,
+                indices_are_token_positions=m.replay_indices_are_token_positions,
+            )
+            m.stage = stage
+        yield
+    finally:
+        for m in active:
+            m.clear_all()
+            m.stage = "fallthrough"

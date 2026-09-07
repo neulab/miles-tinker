@@ -52,7 +52,7 @@ from ..training_utils.loss import (
     log_train_advantage_computation_event,
 )
 from ..training_utils.parallel import get_parallel_state
-from ..training_utils.replay_data import fill_replay_data, register_replay_list_sequential
+from ..training_utils.replay_data import fill_replay_data, register_replay_list_sequential, rollout_replay_stage
 from .checkpoint import load_checkpoint
 from .ft.checkpoint_transfer import recv_ckpt
 from .ft.checkpoint_transfer import send_ckpt as _send_ckpt
@@ -442,6 +442,11 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
             stack.enter_context(store_get_result)
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            stack.enter_context(
+                rollout_replay_stage(
+                    self.args, self.model, data_iterator, num_microbatches, rollout_data, stage="replay_forward"
+                )
+            )
             outputs = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=unit_id)
         if not get_parallel_state().is_pp_last_stage:
             return None

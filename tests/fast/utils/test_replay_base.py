@@ -31,15 +31,51 @@ def _make_replay_manager(top_indices):
     return manager
 
 
-def test_get_topk_fn_fills_all_invalid_rows_with_arange():
-    # an all-(-1) row is a masked/pad token; fill it with arange to avoid reading
-    # invalid (-1) positions downstream
+def test_get_topk_fn_routes_all_invalid_rows_through_the_live_router():
+    # an all-(-1) row (padding, or a datum without cached rollout routing) takes
+    # the natural top-k of the live router, never a synthetic arange fill
     scores = torch.arange(5, dtype=torch.float32).unsqueeze(0)
     manager = _make_replay_manager(torch.tensor([[-1, -1, -1]], dtype=torch.int32))
 
     topk_fn = manager.get_topk_fn(_topk, return_probs=False)
 
-    torch.testing.assert_close(topk_fn(scores, 3), torch.tensor([[0, 1, 2]], dtype=torch.int32))
+    torch.testing.assert_close(topk_fn(scores, 3), torch.tensor([[4, 3, 2]], dtype=torch.int32))
+
+
+def test_get_topk_fn_mixed_batch_keeps_replayed_rows_and_routes_uncovered_rows_naturally():
+    scores = torch.tensor(
+        [
+            [0.0, 1.0, 2.0, 3.0, 4.0],
+            [4.0, 3.0, 2.0, 1.0, 0.0],
+            [0.0, 4.0, 1.0, 3.0, 2.0],
+            [1.0, 0.0, 4.0, 2.0, 3.0],
+        ]
+    )
+    replayed = torch.tensor([[1, 0, 3], [-1, -1, -1], [2, -1, -1], [-1, -1, -1]], dtype=torch.int32)
+    manager = _make_replay_manager(replayed)
+
+    topk_fn = manager.get_topk_fn(_topk, return_probs=False)
+    out = topk_fn(scores, 3)
+
+    expected = torch.tensor([[1, 0, 3], [0, 1, 2], [2, -1, -1], [2, 4, 3]], dtype=torch.int32)
+    torch.testing.assert_close(out, expected)
+    assert out.dtype == replayed.dtype
+
+
+def test_get_topk_fn_fallback_accepts_megatron_tuple_topk_and_returns_probs():
+    # Megatron's _compute_topk returns (values, indices) with int64 indices; the
+    # fallback takes the indices and keeps the replayed dtype for the gather
+    def megatron_topk(scores, topk):
+        return torch.topk(scores, topk, dim=1)
+
+    scores = torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0, 0.0]])
+    replayed = torch.tensor([[-1, -1, -1], [4, 3, 1]], dtype=torch.int32)
+    manager = _make_replay_manager(replayed)
+
+    probs, top_indices = manager.get_topk_fn(megatron_topk, return_probs=True)(scores, 3)
+
+    torch.testing.assert_close(top_indices, torch.tensor([[4, 3, 2], [4, 3, 1]], dtype=torch.int32))
+    torch.testing.assert_close(probs, torch.tensor([[4.0, 3.0, 2.0], [0.0, 1.0, 3.0]]))
 
 
 def test_get_topk_fn_preserves_partial_padding():

@@ -99,14 +99,14 @@ class BaseReplayManager:
             if self.enable_check_replay_result:
                 self.check_replay_result(old_topk_fn, scores, topk, top_indices, *args, **kwargs)
 
-            # fill padding tokens with arange to avoid invalid reading
+            # rows without any recorded routing (padding, or a datum the rollout side could not
+            # cover) take the live router's top-k; rows with some valid picks keep their -1 padding
             all_invalid = (top_indices == -1).all(dim=-1)
             if all_invalid.any():
-                ar = (
-                    torch.arange(top_indices.shape[1], device=top_indices.device, dtype=top_indices.dtype)
-                    % scores.shape[1]
-                )
-                top_indices = torch.where(all_invalid.unsqueeze(-1), ar, top_indices)
+                natural = old_topk_fn(scores, topk, *args, **kwargs)
+                if isinstance(natural, tuple):
+                    _, natural = natural
+                top_indices = torch.where(all_invalid.unsqueeze(-1), natural.to(top_indices.dtype), top_indices)
 
             if return_probs:
                 return scores.gather(1, top_indices), top_indices

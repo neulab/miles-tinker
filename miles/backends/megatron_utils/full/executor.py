@@ -63,6 +63,7 @@ from miles.backends.training_utils.data import get_data_iterator
 from miles.backends.training_utils.log_utils import aggregate_train_losses
 from miles.backends.training_utils.loss_hub.tinker_losses import drain_per_datum_outputs, start_per_datum_outputs
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.replay_data import rollout_replay_stage
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -112,10 +113,11 @@ def forward_backward(
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=unit_id)
     start_per_datum_outputs()
     try:
-        with timer(tinker_perf.ACTOR_TRAIN_TIMER):
-            losses_reduced = run_forward_backward_pass(
-                args, dumper_phase_util, data_iterator, model, num_microbatches[0], num_rollouts=None
-            )
+        with rollout_replay_stage(args, model, data_iterator, num_microbatches, rollout_data, stage="replay_backward"):
+            with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+                losses_reduced = run_forward_backward_pass(
+                    args, dumper_phase_util, data_iterator, model, num_microbatches[0], num_rollouts=None
+                )
     except Exception:
         # partially accumulated grads: optim_step discards the window
         _state["dirty"] = True
