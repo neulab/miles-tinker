@@ -5,7 +5,10 @@ A fork of [radixark/miles](https://github.com/radixark/miles) that serves the
 `serve_tinker.py`, so that an unmodified **tinker-cookbook** (SDK 0.27.1) and
 **platoon** (SDK 0.16.1) train against a miles cluster. Targets: LoRA
 (multi-slot, several clients on one base) and full fine-tuning (single tenant),
-Qwen3-4B-Instruct-2507 on two 8xH200 ABCI nodes, training MFU above 12%.
+Qwen3-4B-Instruct-2507 on two 8xH200 ABCI nodes, training MFU above 12%; then
+Qwen3.6-35B-A3B full fine-tuning at 64k context on 15 nodes with rollout routing
+replay (R3) and a fused fp32 lm head (`docs/fork/r3.md`, `fused-lm-head.md`,
+`deploy-pbs-15node.md`).
 
 Branch: `miles-tinker`. Base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
 `upstream/yueming/multi-lora-example` @ `06716481e`), see
@@ -51,7 +54,7 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/tinker/core/types.py` | `GatewayConfig` gains train_mode, lease_timeout_s (600 s; SDK heartbeats every 10 s, G21), retrieve_poll_timeout_s, sampler_versions_to_keep, coalesce_wait_s, max_concurrent_samples; `ModelRecord.is_lora/sdk_version`, `lora_rank` int (0 = FFT) | yes |
 | `miles/tinker/core/service.py` | `end_session` (SESSION_END -> immediate lease expiry); wire-safe optim metrics (non-finite -> 0.0); abstract `ExecutorBackend` (optim_step metrics dict, discard_grads, unload_adapter, warmup, push_slot version); unnamed sampler saves return `sampling_session_id` (G1); per-session leases and X-API-Key tenant (G4); `/weights_info` + sidecar-based resume (G5); idempotent create_model (G19); sampler-version GC via unload_adapter (G10); UserInputError instead of 500s (G13); FFT latest-only sampler resolution (G18) | yes |
 | `miles/tinker/core/planner.py` | coalesce forward_backward chunks of one window (coalesce_wait_s / max_wait) so an SDK request split into chunks trains as one unit | yes |
-| `miles/tinker/core/stream.py` | loss class keyed by the set of optional inputs present (G11) | yes |
+| `miles/tinker/core/stream.py` | loss class keyed by `loss_fn` + `loss_fn_config` only (G11); optional inputs such as `routing_handle` never split a window into units | yes |
 | `miles/tinker/core/promise.py` | per-promise event for the long-poll of `/retrieve_future` (G3); delivered promises expire after 60 s (memory + GC pauses at RL request rates) | yes |
 | `miles/tinker/server/app.py` | X-API-Key tenant (G4); long-poll retrieve_future capped below the SDK's 45 s (G3); `/weights_info` (G5); `GET/DELETE training_runs` (G6); richer `get_info` (G7); `GET /samplers/{id}` (G8); `POST /forward` for SDK 0.16.1 (G9); category `server` (G12); `/telemetry` releases a session's slots on the SDK's SESSION_END event; tenant headers read directly and results answered as `JSONResponse` (per-request overhead) | yes |
 | `miles/tinker/server/encoding.py` | default chunk `type` for SDK 0.16.1 (G2); NaN-safe JSON and 0.16.1 topk shape (G14); unknown AdamParams keys warned, not rejected (G20); request-level `num_tokens:sum`/`num_datums:sum` metrics | yes |
@@ -64,8 +67,8 @@ the rationale column of this table, so keep one row per file or directory
 
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
-| `miles/backends/megatron_utils/full/` | full fine-tuning executor for slot 0 (E7): reuses `run_forward_backward_pass`, defers `finalize_model_grads` to optim_step, Megatron dist-ckpt save/load, `update_weights()` as the sampler push | yes |
-| `miles/backends/megatron_utils/actor.py` | executor selection by `--tinker-train-mode`; FFT commands no longer assert `multi_lora` | yes |
+| `miles/backends/megatron_utils/full/` | full fine-tuning executor for slot 0 (E7): reuses `run_forward_backward_pass`, defers `finalize_model_grads` to optim_step, Megatron dist-ckpt save/load, `update_weights()` as the sampler push; R3: `run_forward_backward_pass` wrapped in `rollout_replay_stage(stage="replay_backward")` | yes |
+| `miles/backends/megatron_utils/actor.py` | executor selection by `--tinker-train-mode`; FFT commands no longer assert `multi_lora`; `forward_only_logprobs` replays rollout routing (`rollout_replay_stage(stage="replay_forward")`); `--tinker-r3-check` (like `--ci-test`) turns on the replay managers' `enable_check_replay_result` | yes |
 | `miles/backends/megatron_utils/model.py` | grad finalize hook split so LoRA and FFT executors share it | yes |
 | `miles/backends/megatron_utils/checkpoint.py` | FFT checkpoint directory layout under `<checkpoint_root>/<model_id>/weights/<name>/` | yes |
 | `miles/backends/megatron_utils/lora/executor.py` | `actor_train` timer + `log_perf_data` on the tinker path (MFU instrumentation, E5); `discard_grads` | yes |
@@ -76,10 +79,33 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/backends/training_utils/loss_hub/tinker_losses.py` | loss fixes found in the review (E2) | yes |
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
 | `miles/tinker/runtime.py` (MilesBackend) | dp padding of units and output stripping; FFT `train_data` without `adapter_slots`; optim_step metrics passthrough and `<checkpoint_root>/perf.jsonl` (per-slot MFU records) | yes |
-| `serve_tinker.py` | uvloop when installed, no uvicorn access log, 60 s keep-alive; `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode | yes |
-| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA) | yes |
-| `miles/utils/train_metric_utils.py`, `miles/utils/timer.py`, `miles/utils/flops_utils.py` | only if needed for per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`) | yes |
+| `serve_tinker.py` | uvloop when installed, no uvicorn access log, 60 s keep-alive; `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode; `--tinker-max-tokens-per-datum`, `--tinker-max-tokens-per-request`, `--tinker-coalesce-max-wait-s`, `--tinker-routing-replay-policy`, `--tinker-routing-cache-max-bytes`, `--tinker-routing-cache-ttl-s`, `--tinker-routing-prefix-stride`, `--tinker-r3-check` wired into `GatewayConfig` (`max_tokens_per_datum`, `max_tokens_per_request`, `coalesce_max_wait_s`, `routing_replay_policy`) | yes |
+| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above plus `--fused-lm-head-logprobs` / `--fused-lm-head-chunk-size`; serve-mode validation: full mode forces `retract` pausing, warns on TP*EP>1 for LoRA; R3 requires `--num-experts`, rejects speculative decoding, warns on `--mtp-num-layers`; the fused head requires `policy_loss`, no per-token loss, no true-on-policy, no `--use-rollout-entropy`, no MTP, untied embeddings | yes |
+| `miles/utils/train_metric_utils.py`, `miles/utils/timer.py` | per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`); the FLOPs model itself is `miles/utils/flops_utils.py` below | yes |
 | `tests/fast/tinker/test_runtime.py`, `tests/fast/tinker/test_full_executor.py`, `tests/fast/backends/` | padding, FFT executor and metrics tests | yes |
+
+### Rollout routing replay (R3), fused fp32 lm head, MFU - Qwen3.6-35B-A3B at 64k context
+
+Operator docs: `docs/fork/r3.md`, `docs/fork/r3-trainer.md`,
+`docs/fork/fused-lm-head.md`, `docs/fork/mfu.md`, `docs/fork/flags-and-launcher.md`.
+
+| File | Rationale | Upstream-worthy? |
+|---|---|---|
+| `miles/tinker/routing_cache.py` | R3 routing store for the gateway: per-tenant entries of sampled routing (uint8 [rows, L, K]) chained through prefix parents (stride-256 blake2b prefix index + exact LCP -> `routed_experts_start_len`), pins, consumed-leaf release, TTL + byte-cap LRU sweep, stats; materializes int32 `[T-1, L, K]` at unit build | yes |
+| `miles/tinker/runtime.py` (R3) | `/generate` with `return_routed_experts` (+ `routed_experts_start_len`), off-loop JSON/base64 decode with the sglang_rollout stop-edge trim and shape/range checks, `routing_id` per sequence, `rollout_routed_experts` materialized in an executor with `object_store.put` (pad rows and uncovered datums -1; `--tinker-routing-replay-policy strict|natural`), `routing_*`/`fused_lm_head` optim metrics in perf.jsonl | yes |
+| `miles/tinker/server/encoding.py` (R3) | `loss_fn_inputs["routing_handle"]` (int64 `[1]`) -> `row["routing_handle"]: int`, length-1 check | yes |
+| `miles/tinker/core/service.py` (R3) | tenant on sample payloads and unit rows; one WARNING per handle-less `forward_backward` when the backend replays routing; `backend.sweep()` from the lease sweep | yes |
+| `miles/backends/training_utils/replay_data.py` | `rollout_replay_stage` / `active_rollout_replay_managers`: one context manager that fills every active replay manager (`m.enabled` and `--use-rollout-<name>-replay`) from `rollout_data` before a pass, holds the stage (`replay_backward` training, `replay_forward` forward-only) and clears the queues on exit, success or failure (R3 on the Tinker path) | yes |
+| `miles/utils/replay_base.py` | R3 rows without any recorded routing (padding, uncovered datums) take the live router's top-k (`old_topk_fn`) instead of `arange % num_experts`; partial rows unchanged | yes |
+| `miles/backends/training_utils/loss_hub/fused_lm_head.py` | fused chunked lm head for the Tinker full-FT logprob path (`--fused-lm-head-logprobs`, port of platoon's areal `fused_linear_logprobs.py`): the Megatron `output_layer` returns TP/SP-mapped hidden states and target log-probs are computed per `--fused-lm-head-chunk-size` tokens with `torch.mm(..., out_dtype=float32)` numerics (= SGLang `--enable-fp32-lm-head`), recomputed in backward, fp32 dW added into DDP `main_grad`; never materializes `[T, V]` logits (65 GB at 64k x 248k) | yes |
+| `miles/backends/training_utils/loss_hub/math_utils.py` | `calculate_log_probs_and_entropy` dispatches to `fused_lm_head.target_logprobs` when the fused head is active (entropy / true-on-policy / sampling masks asserted off) | yes |
+| `miles/backends/megatron_utils/full/executor.py`, `miles/backends/megatron_utils/actor.py` (`compute_log_prob`) | `fused_lm_head.maybe_activate(args, model)` around the forward/backward pass and the forward-only log-prob pass | yes |
+| `miles/utils/flops_utils.py` | layer_types-aware FLOPs model: Gated DeltaNet `linear_attention` layers (no S^2 term), attention output gate (q width x2), MTP depths (layer + eh_proj + embedding + lm head); `ensure_hf_layer_pattern(args)` fills `flops_layer_types` / `flops_linear_attention` once from the HF config (never raises); dense/MoE arithmetic unchanged without the attributes. Qwen3.6-35B-A3B at 64k: 11.20 vs 26.60 GFLOPs/token (old formula over-credited 2.4x). See `docs/fork/mfu.md` | yes |
+| `miles/backends/megatron_utils/tinker_perf.py`, `miles/utils/train_metric_utils.py` | call `ensure_hf_layer_pattern(args)` before the FLOPs model on the Tinker optim window and the native `perf/actor_train_*` site | yes |
+| `scripts/run_qwen3_6_35b_a3b_mtp.py` | `--sglang-mamba-scheduler-strategy` -> `--sglang-mamba-radix-cache-strategy` (the image's canonical field; the old name is only a deprecated alias) | yes |
+| `tests/fast/utils/test_replay_base.py`, `tests/fast/utils/test_replay_data_sp.py`, `tests/fast/backends/training_utils/test_replay_data.py` | natural-fallback and mixed-batch top-k cases; TP2 sequence-parallel slice of `fill_replay_data`; `rollout_replay_stage` fill/stage/clear cases | yes |
+| `tests/fast/backends/training_utils/test_fused_lm_head.py` | CPU tests for the fused head: fp32 reference at 1e-6, gradients, chunk sizes 1/5/64, fake 2-shard TP with and without sequence parallelism, both weight-grad paths, install guards, wrapper, dispatch | yes |
+| `tests/fast/utils/test_flops_layer_types.py` | dense/MoE goldens unchanged, GDN + 64k hand formulas, 2.2-2.6 ratio band, MTP term, `ensure_hf_layer_pattern` on fake configs | yes |
 
 ### Fork-only tooling, deployment and docs
 
@@ -88,12 +114,27 @@ the rationale column of this table, so keep one row per file or directory
 | `README.md` | fork banner prepended above upstream's README (conflict policy: keep the banner, take upstream's body) | no |
 | `FORK.md` | this file | no |
 | `tools/fork/` | `upstream_sync.py` + `upstream_state.json`: base selection, merge/rebase, conflict report, fast tests, state record | no |
-| `tests/fast/fork/` | tests for the sync tool | no |
+| `tests/fast/fork/` | tests for the sync tool, the gateway launchers, the PBS/service dry runs and the checkpoint pruner | no |
+| `tools/fork/dump_sglang_server_args.py`, `tests/fast/fork/data/sglang_server_args_fields.txt` | `dataclasses.fields(ServerArgs)` snapshot of the serving image; the launcher test rejects any `--sglang-<name>` that is not a field (caught the stale `--sglang-mamba-scheduler-strategy`) | no |
+| `tests/fast/fork/test_qwen36_gateway_launcher.py` | flag multiset of the 35B recipe + the `--sglang-*` allowlist | no |
+| `tests/fast/fork/test_deploy_dry_run.py`, `tests/fast/fork/test_prune_tinker_checkpoints.py` | DRY_RUN coverage of the PBS job, service helper, guard self-test, submit presets; pruner rules | no |
 | `.claude/skills/upstream-sync/` | Claude Code skill wrapping the sync tool and the conflict policy | no |
-| `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node, `CLIENT_SCRIPT` runs the client on the head node and the job ends when it exits), `clients/*.sh` ready-made client scripts, `pull_image.pbs`, `smoke_container.pbs`, README runbook | no |
+| `deploy/abci/` | ABCI PBS launchers for N nodes (2 for the 4B smoke, 5/15 for Qwen3.6-35B-A3B): trainers are the `TRAIN_NODES` lowest-IP nodes, engine nodes also host one Toolathlon service + memory guard when `SERVICES=1`; one container per node, `CLIENT_SCRIPT` runs the client on the head node and the job ends when it exits; `clients/*.sh` ready-made client scripts, `pull_image.pbs`, `smoke_container.pbs`, README runbook (sections 3-8) and `docs/fork/deploy-pbs-15node.md`. The PBS job and the service helper have a `DRY_RUN=1` mode that runs on a login node (`tests/fast/fork/test_deploy_dry_run.py`) | no |
+| `deploy/abci/tinker_gateway.pbs` | N-node PBS job (trainers = TRAIN_NODES lowest IPoIB IPs as `placement_group.sort_key`, `--actor-num-nodes/--rollout-num-gpus` derived, Toolathlon services before Ray, release health quorum + monitor, C10 client exports, 4-phase teardown, `DRY_RUN=1` on a login node) | no |
+| `deploy/abci/toolathlon_service.sh`, `deploy/abci/toolathlon.env`, `deploy/abci/openreward-node-memory-guard.py` | one Toolathlon service + node memory guard per engine node (trimmed from the platoon release helper; C12 non-secret env with the derived-SIF sha pins; guard is a verbatim release copy) | no |
+| `deploy/abci/kill-leftovers.sh`, `deploy/abci/submit_toolathlon.sh` | teardown sweep run on every node (Toolathlon containers have no PID namespace); qsub presets smoke/recursive/nonrecursive with `--dry-run` | no |
+| `deploy/abci/clients/platoon_toolathlon.sh`, `deploy/abci/clients/prune_tinker_checkpoints.py`, `deploy/abci/clients/smoke_q36.sh` | platoon Toolathlon client under `restart_wrapper` (lease 600 s / delay 700 s resume), checkpoint pruner driven by `checkpoints.jsonl`, the 5-node Qwen3.6 smoke (design 10.2) | no |
 | `deploy/clients/` | client launchers (refuse login nodes via `hostguard`; run them through `CLIENT_SCRIPT`): cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
+| `deploy/clients/tinker_r3_probe.py` | SDK 0.16.1 R3 probe: `routing_id` on every sequence, `routing_handle` datum, `routing_covered/uncovered_datums` metrics | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | `execute_train`-shaped launcher for the gateway (lora/full) on 8 + 8 GPUs | maybe (as `examples/tinker/`) once FFT lands upstream |
-| `docs/fork/` | fork overview, full fine-tuning semantics, acceptance procedure | no |
+| `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` | Qwen3.6-35B-A3B full-FT gateway recipe (bridge load, TP1/EP8/DP32, `--mtp-num-layers 0` without MTP training, R3 on, fused fp32 head + `--sglang-enable-fp32-lm-head`, 64k gateway limits, `--balance-data`, `--tp 2` fallback, no `--sglang-mamba-*` flag) | maybe (as `examples/tinker/`) once FFT lands upstream |
+| `docs/fork/` | operator docs: `README.md` (overview), `full-finetuning.md`, `acceptance.md`, `r3.md`, `r3-trainer.md`, `fused-lm-head.md`, `mfu.md`, `flags-and-launcher.md`, `deploy-pbs-15node.md` | no |
+| `docs/fork/r3.md` | R3 protocol, capture/cache/materialization semantics, metrics, run-checklist notes | no |
+| `docs/fork/r3-trainer.md` | trainer-side R3: data contract, the one context manager around the pass, natural fallback, SP note | no |
+| `docs/fork/fused-lm-head.md` | why the fused head exists, numerics parity with `--sglang-enable-fp32-lm-head`, memory, flags/requirements, smoke validation steps | no |
+| `docs/fork/mfu.md` | MFU formulas, Qwen3.6 numbers at 64k, the 0.05-0.35 sanity band | no |
+| `docs/fork/flags-and-launcher.md` | the `--tinker-*` / fused-head flags, their `args.<attr>` and `GatewayConfig` names, serve-time validation, the 35B launcher decisions, allowlist regeneration | no |
+| `docs/fork/deploy-pbs-15node.md` | topology, service/secret/teardown contracts (C10, C12) of the N-node job | no |
 
 ## Running the fast tests
 
@@ -105,10 +146,30 @@ module load python/3.12/3.12.9   # ABCI login node
 PY=/path/to/venv/bin/python      # pytest, pytest-asyncio, tinker>=0.27, fastapi, httpx, uvicorn, numpy, zstandard, torch (cpu), ray
 PYTHONPATH=$PWD PYTHONDONTWRITEBYTECODE=1 $PY -m pytest tests/fast/tinker -p no:cacheprovider --confcutdir=tests/fast/tinker -o addopts=""
 PYTHONPATH=$PWD PYTHONDONTWRITEBYTECODE=1 $PY -m pytest tests/fast/fork   -p no:cacheprovider --confcutdir=tests/fast/fork   -o addopts=""
+PYTHONPATH=$PWD PYTHONDONTWRITEBYTECODE=1 $PY -m pytest tests/fast/launch_scripts -p no:cacheprovider --confcutdir=tests/fast/launch_scripts -o addopts=""
+# R3 / fused head / MFU (CPU). Run these by path: the whole tests/fast/utils and
+# tests/fast/backends trees also hold files that import sglang, which the venv lacks.
+PYTHONPATH=$PWD PYTHONDONTWRITEBYTECODE=1 $PY -m pytest \
+  tests/fast/utils/test_replay_base.py tests/fast/utils/test_replay_data_sp.py \
+  tests/fast/utils/test_flops_layer_types.py tests/fast/utils/test_flops_from_hf_config.py \
+  tests/fast/utils/test_train_metric_utils.py tests/fast/utils/test_dp_schedule.py \
+  tests/fast/backends/training_utils/test_fused_lm_head.py tests/fast/backends/training_utils/test_replay_data.py \
+  tests/fast/backends/megatron_utils/test_tinker_perf.py \
+  -p no:cacheprovider --confcutdir=tests/fast -o addopts=""
 ```
 
-Inside the serving container the same command works with the image's python
-(`deploy/abci/smoke_container.pbs` runs it).
+Inside the serving container the same commands work with the image's python
+(`deploy/abci/smoke_container.pbs` runs them).
+
+`tests/fast/fork/test_qwen36_gateway_launcher.py` checks every `--sglang-*`
+flag of the 35B launcher against the serving image's `ServerArgs` fields.
+Regenerate the snapshot after an image change (`PYTHONNOUSERSITE=1` is required
+on the login node because `~/.local` site-packages shadow the image's PIL):
+
+```bash
+SIF=/groups/gai51740/aci18912it/miles-tinker/images/miles-latest-cu13.sif
+singularity exec --env PYTHONNOUSERSITE=1 $SIF python tools/fork/dump_sglang_server_args.py > tests/fast/fork/data/sglang_server_args_fields.txt
+```
 
 ## Upstream sync procedure (summary)
 

@@ -178,9 +178,13 @@ datum with a `routing_handle` and one without -> `routing_covered_datums == 1`, 
 the 64k memory bench (`tinker_mfu_bench.py --num-datums 32 --seq-len 65536`), sampler-vs-trainer numerics,
 the MFU band (0.05-0.35), weight-push timings, and the resume gate (`tinker_sdk_smoke.py --unload-before-resume`).
 Checks that need another gateway configuration are relaunches of the same preset: R3 equivalence with
-`LAUNCHER_ARGS="--check-weight-update-equal --tinker-r3-check"` and `R3_CHECK=1`, the strict policy with
-`EXTRA_ARGS="--tinker-routing-replay-policy strict"` and `R3_POLICY=strict`, the fused-head off compare with
-`FUSED_HEAD=0` (pass them through `qsub -v` / `submit_toolathlon.sh` overrides).
+`LAUNCHER_ARGS="--check-weight-update-equal --r3-check"` (the launcher emits `--tinker-r3-check`) and `R3_CHECK=1`,
+the strict policy with `LAUNCHER_ARGS="--check-weight-update-equal --routing-policy strict"` (or
+`EXTRA_ARGS="--tinker-routing-replay-policy strict"`, appended last so it wins) and `R3_POLICY=strict`, the
+fused-head off compare with `LAUNCHER_ARGS="--check-weight-update-equal --no-fused-lm-head"` and `FUSED_HEAD=0`.
+`submit_toolathlon.sh` forwards `LAUNCHER_ARGS` / `EXTRA_ARGS` from its environment; the `R3_CHECK` / `R3_POLICY` /
+`FUSED_HEAD` knobs are read by the client script from the job environment, so append them to the `qsub -v` list
+that `--dry-run` prints and submit that line by hand.
 
 `clients/platoon_toolathlon.sh` sources `/home/aci18912it/rasp/config/abci.env` (secrets.env must be 0600) in the
 client process only, exports the C11 client env (`TINKER_TELEMETRY=1`, HF offline, `OPENREWARD_*`), runs the trainer

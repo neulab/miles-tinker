@@ -11,6 +11,12 @@ repo root; this directory holds the operator-facing docs.
 | `FORK.md` (repo root) | fork deltas by file, base-branch strategy, fast tests, upstream sync summary |
 | `docs/fork/full-finetuning.md` | `--tinker-train-mode full`: latest-only sampler, `weights_info` compatibility, resume, memory |
 | `docs/fork/acceptance.md` | the two acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
+| `docs/fork/flags-and-launcher.md` | the `--tinker-*` and fused-head flags, serve-time validation, the Qwen3.6-35B-A3B launcher recipe and the `--sglang-*` allowlist |
+| `docs/fork/r3.md` | rollout routing replay through the gateway: `routing_id` / `routing_handle` protocol, routing cache, materialization, metrics |
+| `docs/fork/r3-trainer.md` | R3 on the trainer: replay context manager around each pass, natural fallback for uncovered rows, SP note |
+| `docs/fork/fused-lm-head.md` | the fused chunked fp32 lm head (`--fused-lm-head-logprobs`): numerics parity with `--sglang-enable-fp32-lm-head`, memory, requirements, validation |
+| `docs/fork/mfu.md` | the FLOPs model behind `actor_train_mfu` (GDN linear attention, output gate, MTP), Qwen3.6 numbers, sanity band |
+| `docs/fork/deploy-pbs-15node.md` | the N-node ABCI job: topology and roles, Toolathlon services, secrets, teardown, client restart/resume, dry runs |
 | `deploy/abci/README.md` | ABCI runbook: image pull, rootfs, gateway launch, endpoint file, clients, logs, stop |
 | `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc, kept in step by P1) |
 | `.claude/skills/upstream-sync/SKILL.md` | the upstream-sync procedure and conflict policy |
@@ -29,7 +35,8 @@ client (tinker SDK) --HTTP--> serve_tinker.py (FastAPI, miles/tinker/server)
    full: single-tenant executor on the base weights  full: base weights, latest push only
 ```
 
-Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gateway.py --mode`):
+Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gateway.py --mode`;
+`run_qwen3_6_35b_a3b_gateway.py` is the full-mode 35B MoE recipe with R3 and the fused head):
 
 - **lora** (`--multi-lora-n-adapters N`): N training clients share one frozen
   base; each `save_weights_for_sampler` registers a versioned adapter in every
@@ -46,18 +53,25 @@ Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gatew
   the SDK's 45 s), `sampler_versions_to_keep` (3), `coalesce_wait_s` /
   `coalesce_max_wait_s` (0.3 / 2.0 s: wait for more chunks of an open
   forward_backward window before training a unit), `max_concurrent_samples`
-  (512), `unit_token_budget` (262,144 tokens). `serve_tinker.py` sets them
-  from `--tinker-train-mode`, `--tinker-lease-timeout-s`,
-  `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`,
-  `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s` and
-  `--tinker-unit-token-budget` (`n_slots` comes from `--multi-lora-n-adapters`,
-  `base_model` / `checkpoint_root` from `--tinker-base-model` /
-  `--tinker-checkpoint-root`; `coalesce_max_wait_s` keeps its default).
+  (512), `unit_token_budget` (262,144 tokens), `max_tokens_per_datum` (32768) /
+  `max_tokens_per_request` (4,000,000), `routing_replay_policy` (`natural`).
+  `serve_tinker.py` sets them from `--tinker-train-mode`,
+  `--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`,
+  `--tinker-coalesce-wait-s`, `--tinker-coalesce-max-wait-s`,
+  `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`,
+  `--tinker-unit-token-budget`, `--tinker-max-tokens-per-datum`,
+  `--tinker-max-tokens-per-request` and `--tinker-routing-replay-policy`
+  (`n_slots` comes from `--multi-lora-n-adapters`, `base_model` /
+  `checkpoint_root` from `--tinker-base-model` / `--tinker-checkpoint-root`).
+  The routing-cache sizes (`--tinker-routing-cache-*`, `--tinker-r3-check`) and
+  the fused head (`--fused-lm-head-*`) are read from `args` by the backend, see
+  `flags-and-launcher.md`.
 - `ExecutorBackend` (`miles/tinker/core/service.py`): `load_slot`,
   `unload_slot`, `forward_backward`, `forward_only`, `optim_step` (returns a
   per-slot metrics dict: `grad_norm`, `skipped`, `lr`, `num_tokens`,
   `num_datums`, `num_units`, `actor_train_time`, `actor_train_tflops`,
-  `actor_train_mfu`, `actor_train_tok_per_s`), `discard_grads`, `save_slot`,
+  `actor_train_mfu`, `actor_train_tok_per_s`; with R3 on also `routing_*`
+  and `fused_lm_head`, see `r3.md`), `discard_grads`, `save_slot`,
   `push_slot` (LoRA: None; full: the new engine weight version),
   `unload_adapter`, `warmup`, `sample`.
 - Checkpoints: `<checkpoint_root>/<model_id>/<weights|sampler_weights>/<name>/`

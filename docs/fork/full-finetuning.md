@@ -1,8 +1,9 @@
 # Full fine-tuning through the Tinker gateway
 
-`serve_tinker.py --tinker-train-mode full` (launcher: `run_qwen3_4b_gateway.py
-serve --mode full`) trains the **base weights** of the served model instead of
-LoRA adapters. The Tinker SDKs only expose `create_lora_training_client`, so
+`serve_tinker.py --tinker-train-mode full` (launchers: `examples/tinker/
+run_qwen3_4b_gateway.py` and `run_qwen3_6_35b_a3b_gateway.py`, `serve --mode
+full`) trains the **base weights** of the served model instead of LoRA
+adapters. The Tinker SDKs only expose `create_lora_training_client`, so
 this page documents where the full-fine-tuning (FFT) gateway deviates from
 Tinker's LoRA semantics and why unmodified clients still work.
 
@@ -24,8 +25,9 @@ Code: `miles/backends/megatron_utils/full/executor.py` (P2),
   `learning_rate=1e-6`; the LoRA default is 3e-5).
 - A second concurrent training client gets `UserInputError("this full
   fine-tuning gateway serves one model at a time")` until the first model's
-  lease expires (`--tinker-lease-timeout-s`, default 600 s after the last
-  heartbeat) or its session ends. Run one client at a time.
+  lease expires (`--tinker-lease-timeout-s` after the last heartbeat: flag
+  default 3600 s, the 35B launcher passes 600 s) or its session ends. Run one
+  client at a time.
 - Every fresh `create_model` starts from the pristine base: `load_slot(slot=0,
   ckpt_path=None)` reloads the weights the server started from (the HF
   snapshot through the bridge) and zeroes the optimizer moments and step
@@ -111,6 +113,23 @@ gateway's mode (`UserInputError`).
 - Deleting a checkpoint (`DELETE .../checkpoints/...`) removes the directory;
   a missing checkpoint is treated as already deleted.
 
+## Restart and resume on the ABCI Toolathlon jobs
+
+On the ABCI Toolathlon jobs the client runs under
+`platoon.train.tinker.restart_wrapper --max-restarts 20 --restart-delay 700`
+with `TINKER_TELEMETRY=1`: a clean exit sends SESSION_END and frees the single
+full-FT slot immediately; a killed trainer frees it when the 600 s lease
+expires (the launcher passes `--tinker-lease-timeout-s 600`; the sweep runs
+every 30 s), so 700 s guarantees that the next attempt re-acquires the slot and
+`rl.py` resumes from `<log_path>/<experiment>/<trial>/checkpoints.jsonl` with
+the same `TINKER_API_KEY` tenant and `RUN_NAME` (`--checkpoint-root`). Every
+(re)launch writes a fresh ~490 GB `kind=both` checkpoint under a new
+`model_id`; `deploy/abci/clients/prune_tinker_checkpoints.py` (run every 10 min
+by the client script) keeps the newest two records' directories across all
+`model_id`s, never the last `state_path` record's directory and never a
+directory modified in the last 30 min. Job layout and teardown:
+`docs/fork/deploy-pbs-15node.md`.
+
 ## Memory and performance (Qwen3-4B, 8 H200 trainers TP=1/DP=8)
 
 - Static ~30 GB per rank (bf16 params, replicated fp32 grad buffer, distributed
@@ -135,3 +154,119 @@ their cache during the push and re-prefill in-flight requests. `in_place`
 pausing is only sound for LoRA adapter pushes, whose cache keys include the
 adapter name. (A possible follow-up is a per-version `cache_salt` on
 `/generate`, which would make `in_place` safe for full mode too.)
+
+## Gateway limits and the 35B recipe
+
+- The per-datum and per-request token caps are flags:
+  `--tinker-max-tokens-per-datum` (default 32768; the 35B launcher passes 65537
+  = 65536 `model_input` tokens + 1 target) and `--tinker-max-tokens-per-request`
+  (4,000,000).
+- `--tinker-coalesce-max-wait-s` (default 2.0 s) bounds how long an under-filled
+  unit waits for more SDK chunks of the same window, counted from the window's
+  first chunk; `--tinker-coalesce-wait-s` is the quiet time after the last
+  chunk. The 35B recipe uses 5 s / 120 s with `--tinker-unit-token-budget
+  2097184` so that 32 one-datum SDK chunks of 64k form one DP32 unit.
+- `--tinker-lease-timeout-s` defaults to 3600 s; the 35B launcher passes 600 s
+  so a restarted platoon client (restart delay 700 s) finds the single full-FT
+  slot released.
+- The Qwen3.6-35B-A3B recipe (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`)
+  overrides the model definition's `--mtp-num-layers 1` with `0` and never
+  passes `--enable-mtp-training`: engines run without EAGLE and load the MTP
+  weights unused.
+- The R3 knobs (`--tinker-routing-replay-policy`,
+  `--tinker-routing-cache-max-bytes`, `--tinker-routing-cache-ttl-s`,
+  `--tinker-routing-prefix-stride`, `--tinker-r3-check`), the fused head
+  (`--fused-lm-head-logprobs`, `--fused-lm-head-chunk-size`) and the serve-time
+  validation behind them (R3 needs an MoE model and no speculative decoding,
+  warns on MTP layers; the fused head needs `--loss-type policy_loss`, no
+  `--calculate-per-token-loss`, no `--true-on-policy-mode`, no
+  `--use-rollout-entropy`, no MTP training/layers and untied embeddings) are
+  described in
+  `docs/fork/flags-and-launcher.md`.
+
+## Rollout routing replay (R3)
+
+With `--use-rollout-routing-replay` the gateway captures the expert routing
+SGLang used for every sampled sequence and replays it in the trainer, so the
+MoE routers train on the experts that produced the tokens.
+
+- Protocol: SDK 0.16.1 JSON sample responses carry `routing_id` per sequence;
+  a datum sends it back as `loss_fn_inputs["routing_handle"]` (int64 `[1]`,
+  the id of the last sample call merged into the datum, whose prompt +
+  generated tokens must equal the datum's tokens). Proto clients (cookbook,
+  SDK 0.27.1) send no handle and train through the live router.
+- Materialization: the gateway attaches `rollout_routed_experts` (int32
+  `[T-1, L, K]`) to every row of a unit. Datums without cached routing get rows
+  of -1 and train through the live router under
+  `--tinker-routing-replay-policy natural` (default; counted in
+  `optim/routing_uncovered_datums`) or fail typed under `strict`.
+- Rows for radix-cached prefixes come from the KV slots' last prefill: after a
+  retract push the prefix is re-prefilled under the new weights, so prompt rows
+  may mix weight versions (inherent, same as AReaL). LCP parents from other
+  trajectories are equivalent to SGLang's own radix reuse; a datum trained
+  twice (platoon never does) misses the released leaf and falls back to natural
+  routing.
+- The cache is bounded by `--tinker-routing-cache-max-bytes` (128 GiB) and
+  `--tinker-routing-cache-ttl-s` (6 h); a gateway restart empties it (one
+  staleness window of natural routing, visible in the metrics). No EAGLE/MTP
+  speculative decoding with R3; keep `--sglang-chunked-prefill-size 16384 >=
+  --sglang-max-running-requests 128`.
+- Trainer: one context manager
+  (`miles/backends/training_utils/replay_data.py:rollout_replay_stage`) wraps
+  each unit's pass. It loads `rollout_data["rollout_routed_experts"]` (one
+  int32 `[len(tokens)-1, L, K]` tensor per row, DP pad rows included) into the
+  MoE routers' replay queues with `fill_replay_data` (which consumes the key),
+  holds the routing manager at `replay_backward` for `forward_backward` (the
+  forward step forces `replay_forward` itself and restores `replay_backward`
+  for the recompute) or `replay_forward` for `forward_only`, and on exit,
+  success or failure, clears the queues and falls through to the live router.
+  A manager is active only when it was enabled at actor init
+  (`use_routing_replay`, derived from `--use-rollout-routing-replay`) and the
+  flag is set; nothing changes without the flag. Rows that carry no routing at
+  all (padding, or a datum the gateway could not cover under `natural`) take
+  the live router's own top-k, not the old `arange % num_experts` fill; rows
+  with some valid picks keep their -1 padding. The sequence-parallel slice in
+  `fill_replay_data` is a no-op at TP1 (Megatron disables SP there) and is
+  exercised only by the TP2 fallback (`tests/fast/utils/test_replay_data_sp.py`).
+
+Full details: `docs/fork/r3.md` (gateway) and `docs/fork/r3-trainer.md`
+(trainer).
+
+## Log-probs at 64k context: the fused fp32 head
+
+With `--fused-lm-head-logprobs` the trainer never materializes the `[T, V]`
+logits. The Megatron output layer is wrapped so that, during `forward_backward`
+and `forward` (`forward_only_logprobs`), it returns the TP/SP-mapped hidden
+states; `calculate_log_probs_and_entropy` then projects the response rows in
+chunks of `--fused-lm-head-chunk-size` tokens (default 1024) inside a custom
+autograd function that recomputes the projection in backward. Each chunk's
+logits are `torch.mm(h_bf16, W_bf16.T, out_dtype=float32)`, the same expression
+SGLang uses under `--sglang-enable-fp32-lm-head`, so the trainer scores exactly
+the distribution the sampler sampled from; the fp32 weight gradient is added
+straight into the DDP `main_grad` buffer (accumulation across
+`forward_backward` calls is unchanged). Peak transient memory at chunk 1024 is
+~1 GB in forward and ~4.5 GB in backward instead of 2 x 32.5 GB of bf16 logits
++ gradient (plus a 65 GB fp32 copy when `--log-probs-chunk-size` is -1).
+Requirements: `policy_loss`-style tinker losses without entropy, no
+`--true-on-policy-mode`, no MTP (`--mtp-num-layers 0`), one lm head per
+pipeline rank, no lm-head bias. Fallback without the fused head:
+`--log-probs-chunk-size 2048` and TP2. Details and the validation procedure:
+`docs/fork/fused-lm-head.md`.
+
+## MFU
+
+`actor_train_mfu` / `actor_train_tflops` use a layer_types-aware FLOPs model.
+When `--hf-checkpoint` points at a Qwen3.5/3.6-style config, the trainer reads
+`layer_types` (or `full_attention_interval`) and the `linear_*` Gated DeltaNet
+dims once per process and charges quadratic attention only on the
+full-attention layers; the attention output gate (`--attention-output-gate`)
+doubles the q projection and `--enable-mtp-training --mtp-num-layers N` adds N
+MTP depths. Dense and plain-MoE models keep the previous numbers exactly. For
+Qwen3.6-35B-A3B at 64k context the model credits 11.20 GFLOPs/token (the old
+formula gave 26.60, a 2.4x over-count), i.e. 3 x 11.20 G x 65536 = 2.20 PFLOP
+per 64k row per rank, so an MFU of 0.15 at 989 TFLOPS needs <= 14.8 s per row.
+Sanity band for the 64k smoke and the 15-node runs: 0.05-0.35; above 0.35 means
+the layer pattern was not applied (look for the `MFU: could not read the layer
+pattern` warning or the missing `MFU: 30 linear-attention + 10 full-attention
+layers` info line); `actor_train_tok_per_s` and seconds per 64k row remain the
+primary throughput numbers. Formulas and numbers: `docs/fork/mfu.md`.

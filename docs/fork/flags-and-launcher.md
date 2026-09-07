@@ -43,6 +43,7 @@ In addition to the existing full-mode / LoRA-mode checks:
   `--mtp-num-layers` is non-zero (the MTP block is outside the replay).
 - `--fused-lm-head-logprobs` requires `--loss-type policy_loss`, no
   `--calculate-per-token-loss`, no `--true-on-policy-mode`, no
+  `--use-rollout-entropy` (the head yields target log-probs only), no
   `--enable-mtp-training` and `--mtp-num-layers 0`/unset (the MTP block calls
   `output_layer` for its own logits), and untied embeddings.
 
