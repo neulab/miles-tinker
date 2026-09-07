@@ -1,0 +1,28 @@
+# Sourceable client environment for the platoon Toolathlon RL client (design C10/C11 contracts).
+# Sourced by BOTH deploy/abci/clients/platoon_toolathlon.sh (the production client) and step 9 of
+# deploy/abci/clients/smoke_q36.sh, so the smoke exercises the exact production environment.
+# It validates its inputs and exports; it defines no function and starts no process, so a caller
+# can source it and keep its own shell semantics.
+# Inputs, exported into CLIENT_SCRIPT by deploy/abci/tinker_gateway.pbs (C10): TINKER_BASE_URL,
+# OPENREWARD_SESSION_URLS_TOOLATHLON, PBS_LOCALDIR; optional TINKER_API_KEY (tml-local), WANDB_MODE.
+# Secrets (W&B, OpenAI/LiteLLM judges, HF) are sourced HERE ONLY, from
+# /home/aci18912it/rasp/config/abci.env (which chains secrets.env, mode 0600) - never in the batch
+# shell, the service helper or any container.
+# A missing precondition `exit 2`s the sourcing shell: a caller that must survive that (the smoke,
+# which has to print its verdict summary) sources this in a subshell.
+[[ -n ${TINKER_BASE_URL:-} ]] || { echo "TINKER_BASE_URL is not set (run through tinker_gateway.pbs CLIENT_SCRIPT)" >&2; exit 2; }
+[[ -n ${OPENREWARD_SESSION_URLS_TOOLATHLON:-} ]] || { echo "OPENREWARD_SESSION_URLS_TOOLATHLON is empty: launch with SERVICES=1" >&2; exit 2; }
+[[ $(stat -c %a /home/aci18912it/rasp/config/secrets.env) == 600 ]] || { echo "secrets.env must be mode 0600" >&2; exit 2; }
+set +x
+# shellcheck disable=SC1091
+source /home/aci18912it/rasp/config/abci.env   # secrets only here; exports PLATOON_MODEL_SNAPSHOT, HF_HOME, chains secrets.env + .netrc
+[[ -z ${HF_TOKEN:-} && -r ~/.cache/huggingface/token ]] && export HF_TOKEN=$(<~/.cache/huggingface/token)
+export TINKER_BASE_URL TINKER_API_KEY=${TINKER_API_KEY:-tml-local} TINKER_TELEMETRY=1
+export HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS=$OPENREWARD_SESSION_URLS_TOOLATHLON
+export OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only OPENREWARD_DISABLE_UPDATE_CHECK=1
+export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
+export WANDB_MODE=${WANDB_MODE:-online}
+CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client
+mkdir -p "$CLIENT_LOCAL"/{home,tmp,xdg}
+export TMPDIR=$CLIENT_LOCAL/tmp XDG_CACHE_HOME=$CLIENT_LOCAL/xdg

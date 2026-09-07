@@ -17,10 +17,12 @@ commands is `deploy/abci/README.md`.
 | `deploy/abci/openreward-node-memory-guard.py` | verbatim copy of `platoon-v8r36-07bebf9-057108f/pbs-scripts/openreward-node-memory-guard.py` (a test asserts byte equality when the release is present) |
 | `deploy/abci/kill-leftovers.sh` | teardown sweep on every node, extended to the Toolathlon process names (`nginx postgres uvicorn node chrome ... /opt/venv/bin/ /app/openreward`) |
 | `deploy/abci/clients/platoon_toolathlon.sh` | CLIENT_SCRIPT: platoon Toolathlon RL under `restart_wrapper`, checkpoint pruner, `perf_report.py` |
+| `deploy/abci/clients/platoon_env.sh` | the platoon client environment (C10/C11 exports + the `abci.env` secrets); sourced by `platoon_toolathlon.sh` and by smoke step 9, so both run the same environment |
 | `deploy/abci/clients/prune_tinker_checkpoints.py` | prunes `<checkpoint_root>/<model_id>/{weights,sampler_weights}/<name>` from `checkpoints.jsonl` (stdlib; `tests/fast/fork/test_prune_tinker_checkpoints.py`) |
-| `deploy/abci/clients/smoke_q36.sh` | CLIENT_SCRIPT: design 10.2 steps 1-8 on the 5-node smoke |
+| `deploy/abci/clients/smoke_q36.sh` | CLIENT_SCRIPT: design 10.2 steps 1-9 on the 5-node smoke (9 = the end-to-end platoon run) |
 | `deploy/clients/tinker_r3_probe.py` | SDK 0.16.1 probe: `routing_id` on every sequence, `routing_handle` datum, C6 optim metrics |
 | `tests/fast/fork/test_deploy_dry_run.py` | `bash -n`, PBS DRY_RUN (2 and 15 fake nodes), service-helper DRY_RUN, guard self-test, submit presets |
+| `tests/fast/fork/test_smoke_q36_step9.py` | smoke step 9: the shared client env, the override list against platoon's dataclasses, `PLATOON_STEP=0`, and the whole step run against a stub trainer |
 
 ## Topology and roles (C10)
 
@@ -86,9 +88,10 @@ The batch shell unsets `WANDB_API_KEY OPENAI_API_KEY OPENAI_BASE_URL LITELLM_API
 LITELLM_BASE_URL RUBRIC_DEFAULT_LLM HF_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN` first thing and never sources `abci.env`/`secrets.env`; every pbsdsh line runs
 under `/usr/bin/env -i` and every container under `--cleanenv`, so no credential can reach a
-node helper or a container. Only `clients/platoon_toolathlon.sh` sources `abci.env` (after
-checking `secrets.env` is mode 0600), inside the client process. The DRY_RUN tests assert that
-none of the ten names (nor a planted value) appears in the launcher or helper output.
+node helper or a container. Only `clients/platoon_env.sh` sources `abci.env` (after checking
+`secrets.env` is mode 0600), inside the client process - `clients/platoon_toolathlon.sh` and
+smoke step 9 both get their environment from it and neither has its own copy. The DRY_RUN tests
+assert that none of the ten names (nor a planted value) appears in the launcher or helper output.
 
 ## Teardown (4 phases)
 
@@ -116,6 +119,52 @@ except the newest two recovery records', the last `state_path` record's, and any
 modified in the last 30 min; permanent names (`<batch>`, `<batch>_interrupted`, `final`) are
 never deleted.
 
+## Smoke (design 10.2, `submit_toolathlon.sh smoke`)
+
+5 nodes (4 train + 1 TP8 engine + 1 Toolathlon service), 6 h, `CLIENT_SCRIPT=clients/smoke_q36.sh`.
+Steps 1-8 are gateway/trainer checks (startup and engine flags, the 0.16.1 R3 probe + the 0.27.1
+SDK smoke, R3 equivalence, 64k memory, sampler-vs-trainer numerics, MFU, weight-push timing, the
+resume gate); each `PASS`/`FAIL` line is one named check and the script exits non-zero if any
+failed. Steps that need another gateway configuration are relaunches of the same preset
+(`R3_CHECK`, `R3_POLICY=strict`, `FUSED_HEAD=0`).
+
+**Step 9** is the only end-to-end step and runs last, after the resume gate, so steps 1-8 always
+produce their verdicts first. It runs the *production* client - the same
+`restart_wrapper -> train_tinker` argv as `clients/platoon_toolathlon.sh` and the same
+`clients/platoon_env.sh` environment - on the recursive yaml with a tiny run size:
+`--train.max_training_steps 2 --train.batch_size 2 --train.workflow_config.group_size 2
+--train.num_concurrent_rollout_workflow_workers 2` (+ `straggler_quorum 2`,
+`min_successful_group_size 1`: the yaml's 6/4 are illegal at group_size 2), rollout
+`max_steps 12 / timeout 600 / step_timeout 240`, `--checkpoint.every 1000
+--checkpoint.recovery_every 1` (a recovery checkpoint per step, no periodic permanent one),
+`--stats.wandb.mode offline`, `--log_path $JOBDIR/platoon-smoke` and an experiment/trial pair
+containing `smoke`. The yaml itself is never modified. The whole run is wrapped in
+`timeout -k 120 $PLATOON_TIMEOUT` (2400 s) so a hung rollout cannot eat the job's walltime, and
+`PLATOON_STEP=0` skips it. Knobs: `PLATOON_STEP` (1), `PLATOON_TIMEOUT` (2400),
+`SMOKE_WANDB` (offline; `online` writes to the production W&B project), `SMOKE_EXPERIMENT`,
+`SMOKE_TRIAL`, `CONFIG`.
+
+Its named checks and the evidence each reads (`$RUN=$JOBDIR/platoon-smoke/<experiment>/<trial>`):
+
+| Check | Evidence |
+|---|---|
+| trainer completed >= 2 optim steps | `>= 2` records with `num_datums > 0` appended to `$CHECKPOINT_ROOT/perf.jsonl` after the step started |
+| R3 covered the run's datums / left none uncovered | `routing_covered_datums > 0` and `routing_uncovered_datums == 0` summed over those records (C6) |
+| gateway extended a turn-1 prefix | `routing_prefix_hits` grew over the step (only a turn >= 2 request extends a turn-1 prefix) |
+| a recovery checkpoint record has a state_path | a `recovery-*` record with a `state_path` in `$RUN/checkpoints.jsonl` |
+| episodes ran >= 2 agent steps | `"step_index": 1` in `$RUN/rollouts/train/<version>/events/events_*.jsonl` |
+| episodes emitted tool calls | `"tool_name":` in the same events (OpenHands `ActionEvent`) |
+| Toolathlon executed a tool | `"type": "tool_result"` in `.../openreward/<task>/<id>/bridge/bridge_events.jsonl` |
+| the job's Toolathlon service served the run | that bridge's `session_started` carries the job's `OPENREWARD_SESSION_URLS_TOOLATHLON` URL |
+| clean trainer exit, no watchdog kill, no unhandled exception | `Training completed successfully` and no `WATCHDOG: ... Forcing exit` in `$JOBDIR/platoon-smoke/platoon-step9.log`, no traceback in its last 40 lines |
+
+The service's own access lines (`services-<host>.log`) are printed as context, not as a verdict:
+their format comes from the container's uvicorn/nginx. On any step-9 failure the block prints the
+last 40 lines of the platoon log and the tail of every service log. Disk: the step writes 3-4 full
+`kind=both` saves (~490 GB each: launch, step 1, step 2, and the permanent `final` that
+`rl.py` always writes on a clean finish); the recovery ones are pruned to 1 at the end of the
+step, `final` is kept like every permanent name.
+
 ## Validation without a job
 
 ```bash
@@ -128,4 +177,10 @@ DRY_RUN=1 DRY_RUN_IPS=10.0.1.9,10.0.1.10,10.0.0.200,10.0.1.100,10.0.0.5,10.0.2.1
   MODE=full SERVICES=1 CLIENT_SCRIPT=$PWD/deploy/abci/clients/smoke_q36.sh bash deploy/abci/tinker_gateway.pbs
 DRY_RUN=1 MILES_SRC=$PWD bash deploy/abci/toolathlon_service.sh    # resolved SIF + sha 11d158f7..., guard argv, container line
 deploy/abci/submit_toolathlon.sh smoke --dry-run
+# step 9's overrides against the real platoon dataclasses (no gateway, no GPU; needs the platoon venv)
+cd /home/aci18912it/source/platoon-tinker/plugins/openreward && HF_HUB_OFFLINE=1 .venv/bin/python -c "
+from platoon.utils.config import load_config
+from platoon.openreward.tinker_config import OpenRewardTinkerTrainerConfig as C
+cfg, _ = load_config(args='--config platoon/openreward/configs/tinker/abci_toolathlon_15node_recursive_qwen36_miles_tinker_r3_v1.yaml --train.batch_size 2 --train.workflow_config.group_size 2 --train.workflow_config.straggler_quorum 2 --train.workflow_config.min_successful_group_size 1'.split(), config_class=C)
+print(cfg.train.batch_size, cfg.train.workflow_config.group_size)"
 ```

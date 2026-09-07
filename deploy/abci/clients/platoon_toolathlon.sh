@@ -2,8 +2,9 @@
 # CLIENT_SCRIPT for tinker_gateway.pbs: the platoon Toolathlon RL client (SDK 0.16.1, cispo) on the job's head node.
 # The launcher exports TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME HF_HOME no_proxy MILES_SRC
 # PLATOON_ROOT SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS (C10).
-# Secrets (W&B, OpenAI/LiteLLM judges, HF) are sourced HERE ONLY, from /home/aci18912it/rasp/config/abci.env (which
-# chains secrets.env, mode 0600) - never in the batch shell, the service helper or any container.
+# The client environment (C10/C11 exports + the secrets, from /home/aci18912it/rasp/config/abci.env, which chains
+# secrets.env, mode 0600) lives in clients/platoon_env.sh and is sourced THERE ONLY - never in the batch shell, the
+# service helper or any container. smoke_q36.sh step 9 sources the same file, so the smoke runs this environment.
 # Knobs: CONFIG (plugin-relative yaml), WORKERS (3), MAX_RESTARTS (20), RESTART_DELAY (700 s >= lease 600 + sweep 30
 # + margin), KEEP_CKPTS (2), WANDB_MODE (online), WANDB_TRIAL (RUN_NAME), EXTRA (verbatim platoon --a.b.c overrides).
 # Restart/resume: platoon.train.tinker.restart_wrapper restarts the trainer on the watchdog exit code (2). The SDK
@@ -21,22 +22,8 @@ PY=$PLUGIN/.venv/bin/python
 CONFIG=${CONFIG:-platoon/openreward/configs/tinker/abci_toolathlon_15node_recursive_qwen36_miles_tinker_r3_v1.yaml}
 [[ -x $PY ]] || { echo "platoon venv python missing: $PY" >&2; exit 2; }
 [[ -r $PLUGIN/$CONFIG ]] || { echo "config missing: $PLUGIN/$CONFIG" >&2; exit 2; }
-[[ -n ${TINKER_BASE_URL:-} ]] || { echo "TINKER_BASE_URL is not set (run through tinker_gateway.pbs CLIENT_SCRIPT)" >&2; exit 2; }
-[[ -n ${OPENREWARD_SESSION_URLS_TOOLATHLON:-} ]] || { echo "OPENREWARD_SESSION_URLS_TOOLATHLON is empty: launch with SERVICES=1" >&2; exit 2; }
-[[ $(stat -c %a /home/aci18912it/rasp/config/secrets.env) == 600 ]] || { echo "secrets.env must be mode 0600" >&2; exit 2; }
-set +x
-# shellcheck disable=SC1091
-source /home/aci18912it/rasp/config/abci.env   # secrets only here; exports PLATOON_MODEL_SNAPSHOT, HF_HOME, chains secrets.env + .netrc
-[[ -z ${HF_TOKEN:-} && -r ~/.cache/huggingface/token ]] && export HF_TOKEN=$(<~/.cache/huggingface/token)
-export TINKER_BASE_URL TINKER_API_KEY=${TINKER_API_KEY:-tml-local} TINKER_TELEMETRY=1
-export HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS=$OPENREWARD_SESSION_URLS_TOOLATHLON
-export OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only OPENREWARD_DISABLE_UPDATE_CHECK=1
-export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
-export WANDB_MODE=${WANDB_MODE:-online}
-CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client
-mkdir -p "$CLIENT_LOCAL"/{home,tmp,xdg}
-export TMPDIR=$CLIENT_LOCAL/tmp XDG_CACHE_HOME=$CLIENT_LOCAL/xdg
+# shellcheck source=deploy/abci/clients/platoon_env.sh
+source "$MILES_SRC/deploy/abci/clients/platoon_env.sh"   # C10/C11 env + secrets; shared with smoke_q36.sh step 9
 LOG_PATH=/groups/gai51740/aci18912it/miles-tinker/runs/$RUN_NAME/logs
 CKPT_ROOT=/groups/gai51740/aci18912it/miles-tinker/checkpoints/$RUN_NAME
 mkdir -p "$LOG_PATH"
