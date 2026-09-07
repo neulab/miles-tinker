@@ -182,7 +182,9 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             for m in all_replay_managers:
                 m.enabled = getattr(self.args, f"use_{m.name}_replay", False)
-                m.enable_check_replay_result = m.enabled and self.args.ci_test
+                m.enable_check_replay_result = m.enabled and (
+                    self.args.ci_test or getattr(self.args, "tinker_r3_check", False)
+                )
 
         checkpointing_context = None
         if recv_ckpt_src_rank is not None:

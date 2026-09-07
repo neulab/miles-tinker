@@ -80,6 +80,9 @@ def _validate_routing_replay(args) -> None:
 
 def _validate_fused_lm_head(args) -> None:
     """The fused chunked head only yields target-token logprobs of the policy loss."""
+    assert not getattr(args, "use_rollout_entropy", False), (
+        "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
+    )
     assert (
         getattr(args, "loss_type", "policy_loss") == "policy_loss"
     ), f"--fused-lm-head-logprobs serves policy_loss only, got --loss-type {args.loss_type!r}"
