@@ -53,7 +53,10 @@ LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 JOB=${PBS_JOBID%%.*}
 RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
-JOBDIR=$PROJECT_ROOT/jobs/$RUN_NAME
+# Per-attempt log dir. A resume reuses RUN_NAME (the checkpoint path depends on it), so a flat
+# jobs/$RUN_NAME overwrote the previous attempt's head.log and destroyed the evidence for two
+# engine crashes on 2026-09-08. Nest by job id; CHECKPOINT_ROOT below deliberately stays flat.
+JOBDIR=$PROJECT_ROOT/jobs/$RUN_NAME/$JOB
 NODE_LOCAL=${PBS_LOCALDIR:?}/miles
 RAY_PORT=6379; DASH_PORT=8265
 CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints/$RUN_NAME
@@ -116,6 +119,10 @@ exec > >(tee -a "$REPORT") 2>&1
 mkdir -p "$NODE_LOCAL/tmp" && chmod 1777 "$NODE_LOCAL/tmp" || { echo "init_failed $(hostname -s)"; exit 1; }
 ip=$(ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}')
 echo "init_ok $(hostname -s) $ip"
+# GPU health baseline. ECC and retired-page counters are cumulative, so this plus the teardown snapshot
+# bracket the run: a delta is hardware, no delta makes the transient-fault hypothesis much less likely.
+command -v nvidia-smi >/dev/null && nvidia-smi -q -d ECC,PAGE_RETIREMENT,PERFORMANCE \
+  > "$(dirname "$REPORT")/gpu-baseline-$(hostname -s).txt" 2>&1 || true
 d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -1)
 while [[ $d == /sys/fs/cgroup/* ]]; do
   [[ -r $d/memory.max ]] && echo "init_info $(hostname -s) cgroup=$d memory.max=$(cat "$d/memory.max") memory.current=$(cat "$d/memory.current" 2>/dev/null)"
@@ -178,6 +185,13 @@ CONTAINER_ARGS=(
   --env DG_JIT_CACHE_DIR=/tmp/deepgemm --env RAY_TMPDIR=/tmp/ray --env RAY_memory_monitor_refresh_ms=0
   --env "NCCL_SOCKET_IFNAME=$IFNAME" --env "GLOO_SOCKET_IFNAME=$IFNAME" --env "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
   --env TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  # RAY_DEDUP_LOGS=0: Ray collapses identical lines across actors into "[repeated Nx across cluster]",
+  # which made per-engine attribution impossible when diagnosing the sampler NaN. Costs log bytes, not inodes.
+  --env RAY_DEDUP_LOGS=0
+  # SGLANG_SANITIZE_NAN_LOGITS: on a NaN/Inf logit row, warn (throttled) and nan_to_num_ in place instead of
+  # letting torch.multinomial fire a device-side assert that poisons the CUDA context and kills the engine -
+  # which then takes the whole 15-node job down at the next weight push. Turns a fatal into one bad token.
+  --env SGLANG_SANITIZE_NAN_LOGITS=1
   --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --env "MASTER_ADDR=$HEAD_IP" --env MILES_SCRIPT_EXTERNAL_RAY=1
   --env "WANDB_MODE=${WANDB_MODE:-offline}" --env "WANDB_DIR=$JOBDIR/wandb"

@@ -6,6 +6,11 @@
 # ignored TERM leaves ray daemons / SGLang engines holding the GPUs; this kills everything of ours that matches.
 [[ $(hostname -s) == login* ]] && { echo "refusing to run on $(hostname -s)" >&2; exit 1; }
 [[ -n ${1:-} ]] && exec >> "$1/teardown-$(hostname -s).log" 2>&1
+# Final GPU snapshot to pair with node-init.sh's baseline (ECC/retired pages are cumulative).
+if [[ -n ${1:-} ]] && command -v nvidia-smi >/dev/null; then
+  nvidia-smi -q -d ECC,PAGE_RETIREMENT,PERFORMANCE > "$1/gpu-final-$(hostname -s).txt" 2>&1 || true
+  dmesg 2>/dev/null | grep -i "xid\|nvrm" | tail -40 > "$1/xid-$(hostname -s).txt" 2>&1 || true
+fi
 me=$(id -un)
 NAMES='python|python3|raylet|gcs_server|starter|starter-suid|sinit|nginx|postgres|uvicorn|node|chrome|chromium|headless_shell|npx|uv'
 CMDS='^(ray::|sglang::|/usr/bin/singularity|/opt/venv/bin/|/app/openreward)'

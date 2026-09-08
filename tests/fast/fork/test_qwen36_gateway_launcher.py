@@ -93,7 +93,10 @@ _EXPECTED_DEFAULT_ARGV = (
     "--sglang-max-running-requests 128 --sglang-enable-fp32-lm-head "
     "--pause-generation-mode retract --update-weight-buffer-size 2147483648 "
     "--num-gpus-per-node 8 --actor-num-nodes 4 --actor-num-gpus-per-node 8 --rollout-num-gpus 88 "
-    "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend flash"
+    "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend flash "
+    # Engine fault tolerance: heal a rollout cell whose engine died instead of losing the whole job at the
+    # next weight push. first-wait must exceed engine startup or a respawned cell is failed while loading.
+    "--use-fault-tolerance --rollout-health-check-failure-threshold 3 --rollout-health-check-first-wait 600.0"
 )
 
 

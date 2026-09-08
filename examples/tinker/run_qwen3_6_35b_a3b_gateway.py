@@ -165,6 +165,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # weight pushes (inference_controller._health_monitoring_pause), so this only guards
     # against transient load.
     rollout_health_check_failure_threshold: int = 3
+    # Grace before the FIRST probe of a cell. Miles defaults this to 0.0 for the rollout prefix, so a cell
+    # that the controller just respawned is probed while it is still loading a 35B checkpoint and building
+    # CUDA graphs - it would fail immediately and respawn again, a loop. Engine startup measured ~2 min here.
+    rollout_health_check_first_wait: float = 600.0
 
     # Sampling engines.
     sglang_ep_size: int = 8
@@ -306,6 +310,7 @@ def serve(args: ScriptArgs):
     ft_args = (
         f"--use-fault-tolerance "
         f"--rollout-health-check-failure-threshold {args.rollout_health_check_failure_threshold} "
+        f"--rollout-health-check-first-wait {args.rollout_health_check_first_wait} "
         if args.use_fault_tolerance
         else ""
     )
