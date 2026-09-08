@@ -27,8 +27,12 @@
 # Step-9 run size (defaults = the tiny run; raise them to reproduce production concurrency on 5 nodes):
 #   PLATOON_WORKERS (2), PLATOON_GROUP_SIZE (2), PLATOON_BATCH_SIZE (2), PLATOON_QUORUM (2), PLATOON_MIN_SUCCESS (1),
 #   PLATOON_TRAIN_STEPS (2), PLATOON_MAX_STEPS (12), PLATOON_ROLLOUT_TIMEOUT (600), PLATOON_STEP_TIMEOUT (240),
-#   PLATOON_STRAGGLER_TIMEOUT (180), PLATOON_WATCHDOG (1200).  Production is WORKERS=3 GROUP_SIZE=8 (24 concurrent
-#   root trajectories in one asyncio process), which is what step 9's mcp_failure_rate_pct check is calibrated for.
+#   PLATOON_STRAGGLER_TIMEOUT (180), PLATOON_WATCHDOG (1200), PLATOON_EXTRA (verbatim platoon --a.b.c overrides,
+#   appended last so they win).  PLATOON_EXTRA is how the end-to-end step exercises a production-only flip before a
+#   168-hour run takes it on trust, e.g. PLATOON_EXTRA='--train.workflow_config.rollout_isolation process' to run
+#   every rollout in its own worker process (routing_covered_datums > 0 is then the R3 proof across that boundary).
+#   Production is WORKERS=3 GROUP_SIZE=8 (24 concurrent root trajectories in one asyncio process), which is what
+#   step 9's mcp_failure_rate_pct check is calibrated for.
 # The SDK sends SESSION_END only from a fatal-exception path (never on a clean exit), so every client here frees
 # its model itself (unload_model at exit); a client that leaks one holds the single full-FT slot for the 600 s lease.
 # Step 9's trainer does not (production does not either): it is the last step, and the lease frees the slot.
@@ -176,6 +180,13 @@ else
     --checkpoint.every 1000 --checkpoint.recovery_every 1
     --watchdog.timeout_seconds "${PLATOON_WATCHDOG:-1200}"
   )
+  # Appended last, so an override wins over the defaults above.  Deliberate word
+  # splitting: PLATOON_EXTRA is a verbatim argv fragment, exactly like EXTRA in
+  # clients/platoon_toolathlon.sh.
+  if [[ -n ${PLATOON_EXTRA:-} ]]; then
+    # shellcheck disable=SC2206
+    PLATOON_ARGV+=(${PLATOON_EXTRA})
+  fi
   run_platoon() {
     (
       cd "$PLUGIN" || exit 2

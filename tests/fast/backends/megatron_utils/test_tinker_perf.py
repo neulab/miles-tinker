@@ -362,3 +362,33 @@ class TestUnitShape:
         Timer().dp_seq_lens = "not a split"
         shape = tinker_perf.unit_shape(Namespace(), {"total_lengths": [1]}, [object()])
         assert "mb_tokens" not in shape and "dp_seq_lens" not in shape
+
+
+def test_discard_window_forgets_a_poisoned_window(monkeypatch):
+    """A window whose gradients were discarded must not be charged to the next one.
+
+    _discard_dirty drops the grads and fails the optim_step, so
+    pop_optim_window_metrics never drains that window; without discard_window its
+    units and its actor_train seconds would land in the following window and
+    overstate its MFU (and inflate the gateway's pad_rows, which is computed
+    against padded_num_datums).
+    """
+    monkeypatch.setattr(tinker_perf, "fwd_tflops_per_gpu", lambda seq_lens, args, world_size: float(sum(seq_lens)))
+    tinker_perf.note_unit([100, 200], {"dp_seq_lens": [[100], [200]]})
+    with tinker_perf.stage(tinker_perf.STAGE_DATA_FETCH):
+        pass
+    Timer().add(tinker_perf.ACTOR_TRAIN_TIMER, 7.0)
+
+    tinker_perf.discard_window()
+
+    assert tinker_perf.pop_window() == ([], 0)
+    assert tinker_perf.pop_diagnostics() == ([], {})
+    assert tinker_perf.ACTOR_TRAIN_TIMER not in Timer().log_dict()
+
+    # the next window sees only its own work
+    tinker_perf.note_unit([5])
+    Timer().add(tinker_perf.ACTOR_TRAIN_TIMER, 1.0)
+    metrics = tinker_perf.pop_optim_window_metrics(Namespace(mfu_peak_tflops=100.0))
+    assert metrics["num_tokens"] == 5 and metrics["num_units"] == 1
+    assert metrics["actor_train_time"] == 1.0
+    assert "actor_data_fetch_time" not in metrics

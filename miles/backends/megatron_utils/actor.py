@@ -501,6 +501,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def unload_slot(self, slot: int) -> None:
         if self._tinker_full_mode():
             full_executor.discard_grads(self.model, self.optimizer)
+            tinker_perf.discard_window()
         else:
             lora_executor.unload_slot(self.model, self.optimizer, slot)
 
@@ -510,6 +511,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self._heartbeat.bump()
         if self._tinker_full_mode():
             full_executor.discard_grads(self.model, self.optimizer)
+            # The units of a discarded window were never stepped, so leaving them
+            # in the window charges their tokens, FLOPs and stage seconds to the
+            # NEXT optim_step -- overstating its MFU and inflating pad_rows, since
+            # the gateway does drop its own per-slot counts here. Tinker full mode
+            # trains exactly one slot per process, so this window is only ever
+            # this slot's. The multi-LoRA path keeps its existing behaviour: the
+            # window there is shared by every slot in the process.
+            tinker_perf.discard_window()
         else:
             lora_executor.discard_grads(self.model, slot)
 

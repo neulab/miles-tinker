@@ -214,6 +214,15 @@ each, so `pad_token_frac` is ~1e-5 (744 of 22.9M tokens on the live run).
 Padding is not the problem. The block is emitted only when one slot stepped,
 because the trainer's `padded_num_*` window is process-wide.
 
+A window whose gradients are discarded (`_discard_dirty`: one forward_backward
+in the window failed, so the optim_step is failed typed and the grads dropped)
+never reaches `pop_optim_window_metrics`, so its units would otherwise be
+charged to the next window - overstating that window's MFU and inflating
+`pad_rows`, since the gateway *does* drop its own per-slot counts there. In
+tinker full mode, where the process trains exactly one slot,
+`tinker_perf.discard_window()` drops the units, the stage seconds and the
+accumulated `actor_train` time with them.
+
 Tests: `tests/fast/utils/test_flops_layer_types.py` (dense/MoE goldens
 unchanged, hand formulas for the GDN layer and the 64k total, the 2.2-2.6
 ratio band, the MTP term, `ensure_hf_layer_pattern` on fake configs),

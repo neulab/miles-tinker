@@ -42,6 +42,11 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
+    # MFU diagnostics: the whole batch's per-DP-rank row lengths, added to every
+    # shard by _package_shards. Declared so the non-delayed split, which puts its
+    # shards through the object store, carries it with the same codec as
+    # total_lengths instead of relying on a default for an unschema'd field.
+    "dp_seq_lens": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
     "num_microbatches": ValueSpec(codec="auto"),
     "micro_batch_indices": ValueSpec(codec="auto"),

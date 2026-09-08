@@ -103,6 +103,22 @@ def reset_window() -> None:
     pop_diagnostics()
 
 
+def discard_window() -> None:
+    """Forget a window whose gradients were thrown away.
+
+    ``_discard_dirty`` drops the gradients of a poisoned optim window and fails
+    its optim_step, so ``pop_optim_window_metrics`` never runs for it. Without
+    this the units that *did* complete stay in the window and are charged to the
+    NEXT one: its MFU would be computed over tokens it never forwarded, and
+    ``pad_rows`` (gateway counts minus the trainer's padded counts, and the
+    gateway does reset its own per-slot window here) would come out inflated.
+    Also drops the accumulated ``actor_train`` time, which belongs to the same
+    discarded window.
+    """
+    reset_window()
+    Timer().reset(ACTOR_TRAIN_TIMER)
+
+
 @contextmanager
 def stage(name: str):
     """Accumulate wall clock into the window's ``name`` stage. Never raises, and
