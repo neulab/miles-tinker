@@ -148,6 +148,24 @@ class ScriptArgs(U.ExecuteTrainConfig):
     check_weight_update_equal: bool = False
     freeze_vision_model: bool = True  # text-only RL: never train (or weight-decay) the VL tower
 
+    # Engine fault tolerance. A single SGLang replica dying takes the whole job with it
+    # otherwise: the trainer's next push_slot to the dead engine raises, the client exits 1,
+    # and restart_wrapper only retries on the watchdog's exit code 2. That is how both
+    # 15-node runs died on 2026-09-08 after one engine hit a CUDA device-side assert
+    # ("probability tensor contains either `inf`, `nan` or element < 0") - the other ten
+    # replicas kept serving the identical weights for another 25 minutes.
+    # --use-fault-tolerance health-checks each rollout cell with a real generation probe and
+    # lets the mini controller suspend+resume a Fatal cell, respawning the engine instead.
+    # A respawned cell gets a fresh workers_hash, so end_update_weights will not mark it
+    # weights-ready and the next push waits for it: it cannot silently serve stale weights.
+    use_fault_tolerance: bool = True
+    # Consecutive failed probes before a cell is declared unhealthy. Miles defaults to 1;
+    # 3 costs ~90 s of detection instead of ~30 s and avoids respawning the cache-affinity
+    # hot replica just because it is briefly busy. Health checks are already paused around
+    # weight pushes (inference_controller._health_monitoring_pause), so this only guards
+    # against transient load.
+    rollout_health_check_failure_threshold: int = 3
+
     # Sampling engines.
     sglang_ep_size: int = 8
     sglang_mem_fraction_static: float = 0.75
@@ -283,9 +301,18 @@ def serve(args: ScriptArgs):
         f"{'--check-weight-update-equal ' if args.check_weight_update_equal else ''}"
     )
 
+    # --ft-components defaults to "rollout" under --use-fault-tolerance, which is what we want:
+    # heal sampling engines, leave the trainer cell alone.
+    ft_args = (
+        f"--use-fault-tolerance "
+        f"--rollout-health-check-failure-threshold {args.rollout_health_check_failure_threshold} "
+        if args.use_fault_tolerance
+        else ""
+    )
+
     train_args = (
         f"{ckpt_args} {mode_args} {tinker_args} {r3_args} {head_args} {optimizer_args} "
-        f"{perf_args} {mtp_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {args.extra_args} "
+        f"{perf_args} {mtp_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {ft_args} {args.extra_args} "
     )
 
     U.execute_train(
