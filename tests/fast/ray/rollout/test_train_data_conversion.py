@@ -835,6 +835,52 @@ class TestSplitTrainDataRaw:
         assert "seq_witness_ids" not in result[0]
 
 
+class TestDpSeqLensForMfuDiagnostics:
+    """Every shard carries the whole batch's per-DP-rank row lengths, so the trainer can
+    report rank imbalance without a collective (docs/fork/mfu.md)."""
+
+    @staticmethod
+    def _data() -> dict:
+        return {
+            "tokens": [[0] * n for n in (10, 20, 30, 40)],
+            "response_lengths": [1, 1, 1, 1],
+            "loss_masks": [[1], [1], [1], [1]],
+        }
+
+    def test_every_shard_sees_every_rank_and_it_matches_the_partitions(self) -> None:
+        args = MagicMock()
+        args.balance_data = True
+
+        shards = split_train_data_by_dp_raw(args, self._data(), dp_size=2)
+
+        # balanced by the SUM of lengths with equal row counts: {10, 40} against {20, 30}
+        assert shards[0]["dp_seq_lens"] == [[10, 40], [20, 30]]
+        assert shards[1]["dp_seq_lens"] == shards[0]["dp_seq_lens"], "every rank sees the same split"
+        for rank, shard in enumerate(shards):
+            assert shard["dp_seq_lens"][rank] == [shard["total_lengths"][i] for i in shard["partition"]]
+
+    def test_strided_split_reports_the_strided_lengths(self) -> None:
+        args = MagicMock()
+        args.balance_data = False
+
+        shards = split_train_data_by_dp_raw(args, self._data(), dp_size=2)
+        assert shards[0]["dp_seq_lens"] == [[10, 30], [20, 40]]
+
+    def test_train_side_moves_it_onto_the_timer_and_out_of_the_batch(self) -> None:
+        from miles.ray.rollout.train_data_conversion import process_rollout_data_shard
+        from miles.utils.timer import Timer
+
+        args = MagicMock()
+        args.balance_data = True
+        shard = split_train_data_by_dp_raw(args, self._data(), dp_size=2)[1]
+
+        rollout_data = process_rollout_data_shard(args, shard)
+
+        assert "dp_seq_lens" not in rollout_data, "diagnostics never reach the data iterator"
+        assert Timer().dp_seq_lens == [[10, 40], [20, 30]]
+        assert Timer().seq_lens == [10, 20, 30, 40]
+
+
 FULL_SCHEDULE_CONFIG = {
     "dp_size": 2,
     "cp_size": 1,

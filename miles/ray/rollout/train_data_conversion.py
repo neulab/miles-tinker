@@ -355,6 +355,10 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:
     """Package one rollout_data shard per DP rank from precomputed partitions."""
     shards = []
+    # MFU diagnostics: every shard carries the whole batch's per-DP-rank row lengths so
+    # the trainer can measure rank imbalance without a collective (docs/fork/mfu.md).
+    # A few hundred ints next to the batch's tensors; absent when lengths are unknown.
+    dp_seq_lens = _dp_seq_lens(data, partitions)
 
     for i in range(len(partitions)):
         rollout_data = {}
@@ -403,8 +407,21 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             rollout_data[key] = data[key]
         if "adapter_slots" in rollout_data:
             rollout_data["n_adapters"] = args.multi_lora_n_adapters
+        if dp_seq_lens is not None:
+            rollout_data["dp_seq_lens"] = dp_seq_lens
         shards.append(rollout_data)
     return shards
+
+
+def _dp_seq_lens(data: dict[str, Any], partitions) -> list[list[int]] | None:
+    """``[[length of every row rank r trains]]``, or None when it cannot be built."""
+    total_lengths = data.get("total_lengths")
+    if not total_lengths:
+        return None
+    try:
+        return [[int(total_lengths[j]) for j in partition] for partition in partitions]
+    except (IndexError, KeyError, TypeError, ValueError):  # a caller-supplied partition we do not understand
+        return None
 
 
 def process_rollout_data_shard(args, rollout_data):
@@ -415,6 +432,8 @@ def process_rollout_data_shard(args, rollout_data):
 
     # save the seqlen of the whole rollout batch
     Timer().seq_lens = total_lengths
+    # ... and the per-DP-rank split of it, for the rank-imbalance metrics
+    Timer().dp_seq_lens = rollout_data.pop("dp_seq_lens", None)
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data

@@ -153,7 +153,7 @@ def rig(monkeypatch):
     executor._state.update(pending_finalize=False, dirty=False, num_updates=0)
     from miles.backends.megatron_utils import tinker_perf
 
-    tinker_perf.pop_window()
+    tinker_perf.reset_window()
     monkeypatch.setattr(tinker_perf, "pop_optim_window_metrics", lambda args: {"actor_train_time": 0.5})
     from miles.utils.timer import Timer
 
@@ -359,3 +359,47 @@ def test_r3_is_not_filled_unless_the_flag_and_the_manager_are_on(rig, monkeypatc
     assert r3.stages == ["fallthrough"]
     assert r3.replay.top_indices_list != [], "an inactive manager is left alone"
     assert "rollout_routed_experts" in rollout_data
+
+
+def test_the_r3_fill_and_the_schedule_get_their_own_wall_clock_stages(rig, monkeypatch):
+    """actor_train_time covers only the forward/backward; the R3 fill (~29 GB of int32
+    routing per step) and the micro-batch schedule are charged separately so the gap
+    between two optimizer steps can be accounted for (docs/fork/mfu.md)."""
+    from miles.backends.megatron_utils import tinker_perf
+    from miles.utils.timer import Timer
+
+    tinker_perf.reset_window()
+    _replay_rig(rig, monkeypatch, flag=True, enabled=True)
+    ticks = iter([0.0, 1.0, 10.0, 14.0])
+    monkeypatch.setattr(tinker_perf, "time", lambda: next(ticks))
+    monkeypatch.setattr(
+        rig.executor,
+        "get_data_iterator",
+        lambda args, model, rollout_data: (
+            [SimpleNamespace(reset=lambda: None, micro_batch_indices=None, micro_batch_size=2)],
+            [1],
+        ),
+    )
+    monkeypatch.setattr(Timer(), "dp_seq_lens", [[5, 7], [9]], raising=False)
+
+    rig.executor.forward_backward(
+        rig.args, 1, rig.model, FakeOptimizer(), {"rollout_routed_experts": ["rows"], "total_lengths": [5, 7]}
+    )
+
+    shapes, stages = tinker_perf.pop_diagnostics()
+    assert stages[tinker_perf.STAGE_DATA_ITER] == pytest.approx(1.0)
+    assert stages[tinker_perf.STAGE_REPLAY_FILL] == pytest.approx(4.0)
+    assert shapes == [{"dp_seq_lens": [[5, 7], [9]], "mb_tokens": [12]}]
+
+
+def test_the_optimizer_step_is_charged_inside_the_train_timer(rig, monkeypatch):
+    from miles.backends.megatron_utils import tinker_perf
+
+    tinker_perf.reset_window()
+    ticks = iter([0.0, 3.0])
+    monkeypatch.setattr(tinker_perf, "time", lambda: next(ticks))
+
+    rig.executor.optim_step(rig.args, rig.model, FakeOptimizer(), ADAM)
+
+    _, stages = tinker_perf.pop_diagnostics()
+    assert stages == {tinker_perf.STAGE_OPTIM: pytest.approx(3.0)}

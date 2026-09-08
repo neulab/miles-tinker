@@ -158,6 +158,18 @@ async def test_full_mode_units_carry_no_adapter_slots():
     assert "adapter_slots" not in seen[0] and seen[0]["dynamic_global_batch_size"] == 2
 
 
+def _shape_of(lengths: list[int]) -> dict:
+    """The datum_seq_len_* block a window of these unpadded rows reports."""
+    ordered = sorted(lengths)
+    return {
+        "datum_seq_len_count": float(len(ordered)),
+        "datum_seq_len_mean": pytest.approx(sum(ordered) / len(ordered)),
+        "datum_seq_len_p50": float(ordered[(len(ordered) - 1) // 2]),
+        "datum_seq_len_p90": float(ordered[-1]),
+        "datum_seq_len_max": float(ordered[-1]),
+    }
+
+
 class TestOptimStep:
     async def _train_one_unit(self, backend, slot_rows):
         async def fake_run_unit(method, unit_id, train_data):
@@ -188,6 +200,12 @@ class TestOptimStep:
                 "num_tokens": 7,
                 "num_datums": 3,
                 "num_units": 2,
+                # rows 3, 2, 2: the shape metrics see the unpadded lengths
+                "datum_seq_len_count": 3.0,
+                "datum_seq_len_mean": pytest.approx(7 / 3),
+                "datum_seq_len_p50": 2.0,
+                "datum_seq_len_p90": 3.0,
+                "datum_seq_len_max": 3.0,
             }
         }, "padded actor counts are replaced by the driver's exact per-slot counts"
         record = json.loads((tmp_path / "perf.jsonl").read_text().splitlines()[0])
@@ -200,8 +218,20 @@ class TestOptimStep:
         await self._train_one_unit(backend, [(3, _row([1, 2, 3])), (5, _row([4, 5]))])
 
         metrics = await backend.optim_step({3: {}, 5: {}})
-        assert metrics[3] == {"grad_norm": 1.0, "num_tokens": 3, "num_datums": 1, "num_units": 1}
-        assert metrics[5] == {"grad_norm": 2.0, "num_tokens": 2, "num_datums": 1, "num_units": 1}
+        assert metrics[3] == {
+            "grad_norm": 1.0,
+            "num_tokens": 3,
+            "num_datums": 1,
+            "num_units": 1,
+            **_shape_of([3]),
+        }
+        assert metrics[5] == {
+            "grad_norm": 2.0,
+            "num_tokens": 2,
+            "num_datums": 1,
+            "num_units": 1,
+            **_shape_of([2]),
+        }
 
         trainer.optim_metrics = {3: {"grad_norm": 0.0}}
         assert (await backend.optim_step({3: {}}))[3] == {
@@ -211,6 +241,56 @@ class TestOptimStep:
             "num_units": 0,
         }
 
+    async def test_padding_is_measured_against_the_trainers_padded_window(self):
+        """Pad rows are a third of the row SLOTS and ~1e-5 of the tokens; the metric
+        exists so padding is never again mistaken for the throughput problem."""
+        trainer = FakeTrainer()
+        # the trainer forwarded 4 rows / 9 tokens; the client asked for 3 rows / 7 tokens
+        trainer.optim_metrics = {0: {"grad_norm": 0.0, "padded_num_datums": 4, "padded_num_tokens": 9}}
+        backend = _backend(trainer)
+        await self._train_one_unit(backend, [(0, _row([1, 2, 3])), (0, _row([4, 5]))])
+        await self._train_one_unit(backend, [(0, _row([6, 7]))])
+
+        metrics = (await backend.optim_step({0: {}}))[0]
+
+        assert metrics["real_rows"] == 3
+        assert metrics["pad_rows"] == 1
+        assert metrics["pad_tokens"] == 2
+        assert metrics["pad_row_frac"] == pytest.approx(0.25), "a quarter of the row slots"
+        assert metrics["pad_token_frac"] == pytest.approx(2 / 9), "but only 2 of 9 tokens"
+
+    async def test_padding_is_absent_when_it_cannot_be_attributed_to_one_slot(self):
+        """The trainer's window is process-wide: with two slots stepped together its
+        padded counts cover both, so the per-slot subtraction would be nonsense."""
+        trainer = FakeTrainer()
+        padded = {"padded_num_datums": 4, "padded_num_tokens": 9}
+        trainer.optim_metrics = {3: {**padded}, 5: {**padded}}
+        backend = _backend(trainer)
+        await self._train_one_unit(backend, [(3, _row([1, 2, 3])), (5, _row([4, 5]))])
+
+        metrics = await backend.optim_step({3: {}, 5: {}})
+        assert not any(key.startswith("pad_") for key in metrics[3])
+
+    async def test_padding_is_absent_when_the_trainer_reports_no_padded_counts(self):
+        trainer = FakeTrainer()
+        trainer.optim_metrics = {0: {"grad_norm": 0.0}}
+        backend = _backend(trainer)
+        await self._train_one_unit(backend, [(0, _row([1, 2, 3]))])
+
+        metrics = (await backend.optim_step({0: {}}))[0]
+        assert not any(key.startswith("pad_") or key == "real_rows" for key in metrics)
+
+    async def test_padding_is_absent_when_the_two_windows_disagree(self):
+        """A window the trainer discarded (fewer padded rows than the gateway counted)
+        reports nothing rather than a negative pad count."""
+        trainer = FakeTrainer()
+        trainer.optim_metrics = {0: {"padded_num_datums": 1, "padded_num_tokens": 2}}
+        backend = _backend(trainer)
+        await self._train_one_unit(backend, [(0, _row([1, 2, 3])), (0, _row([4, 5]))])
+
+        metrics = (await backend.optim_step({0: {}}))[0]
+        assert not any(key.startswith("pad_") for key in metrics)
+
     async def test_discard_grads_drops_the_window_and_reaches_the_trainer(self):
         trainer = FakeTrainer()
         trainer.optim_metrics = {0: {"grad_norm": 0.0}}
@@ -218,7 +298,9 @@ class TestOptimStep:
         await self._train_one_unit(backend, [(0, _row([1, 2, 3]))])
         await backend.discard_grads(0)
         assert trainer.calls == [("discard_grads", {"slot": 0})]
-        assert (await backend.optim_step({0: {}}))[0]["num_datums"] == 0
+        metrics = (await backend.optim_step({0: {}}))[0]
+        assert metrics["num_datums"] == 0
+        assert not any(key.startswith("datum_seq_len") for key in metrics), "the shape window went with it"
 
 
 class TestControlCommands:

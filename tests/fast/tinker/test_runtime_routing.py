@@ -276,6 +276,11 @@ class TestMaterialization:
             "routing_cache_evictions",
             "routing_prefix_hits",
             "fused_lm_head",
+            "datum_seq_len_count",
+            "datum_seq_len_mean",
+            "datum_seq_len_p50",
+            "datum_seq_len_p90",
+            "datum_seq_len_max",
         }
         assert set(metrics) == expected_keys
         assert metrics["routing_covered_datums"] == 1 and metrics["routing_cache_entries"] == 0

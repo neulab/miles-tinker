@@ -10,6 +10,7 @@ place allowed to import miles.ray / miles.backends.
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from argparse import Namespace
@@ -76,6 +77,8 @@ class MilesBackend(ExecutorBackend):
         self.perf_log_path = Path(checkpoint_root) / PERF_LOG_NAME if checkpoint_root else None
         # exact (unpadded) per-slot counts of the open optim window
         self._window_counts: dict[int, dict[str, int]] = {}
+        # the same window's unpadded row lengths, for the datum_seq_len_* shape metrics
+        self._window_seq_lens: dict[int, list[int]] = {}
         # bound lazily to the serving loop; see _generate_session
         self._generate_client: aiohttp.ClientSession | None = None
         # R3: routing captured at sampling time, materialized into the units (docs/fork/r3.md)
@@ -115,7 +118,7 @@ class MilesBackend(ExecutorBackend):
         )
 
     async def unload_slot(self, slot: int) -> None:
-        self._window_counts.pop(slot, None)
+        self._forget_window(slot)
         await self.trainer.unload_slot(slot)
 
     async def forward_backward(self, unit_id: int, slot_rows: list, loss_fn: str, loss_fn_config: dict) -> list[dict]:
@@ -150,12 +153,21 @@ class MilesBackend(ExecutorBackend):
         worker_results = await self.trainer.optim_step(adam_params_by_slot=adam_params_by_slot)
         metrics_by_slot = {}
         routing_metrics = self._routing_metrics()
+        # padding is only attributable to a slot when the process trained exactly one
+        single_slot = len(worker_results[0]) == 1
         for slot, metrics in worker_results[0].items():
             counts = self._window_counts.pop(slot, _empty_window(self.routing_replay))
+            seq_lens = self._window_seq_lens.pop(slot, [])
+            shape = _seq_len_metrics(seq_lens)
+            padding = _padding_metrics(counts, metrics) if single_slot else {}
             # trainer metrics win over the gateway defaults (fused_lm_head); exact window counts win over both
-            metrics_by_slot[slot] = {**routing_metrics, **metrics, **counts}
+            metrics_by_slot[slot] = {**routing_metrics, **metrics, **counts, **shape, **padding}
             self._log_perf(slot, metrics_by_slot[slot])
         return metrics_by_slot
+
+    def _forget_window(self, slot: int) -> None:
+        self._window_counts.pop(slot, None)
+        self._window_seq_lens.pop(slot, None)
 
     def sweep(self) -> None:
         """Periodic housekeeping from the service's lease sweep: routing cache TTL / byte cap."""
@@ -164,7 +176,7 @@ class MilesBackend(ExecutorBackend):
             logger.debug(f"tinker R3 cache: {stats}")
 
     async def discard_grads(self, slot: int) -> None:
-        self._window_counts.pop(slot, None)
+        self._forget_window(slot)
         await self.trainer.discard_grads(slot=slot)
 
     async def save_slot(self, slot: int, path: str) -> None:
@@ -237,6 +249,7 @@ class MilesBackend(ExecutorBackend):
             counts = self._window_counts.setdefault(slot, _empty_window(self.routing_replay))
             counts["num_tokens"] += len(row["tokens"])
             counts["num_datums"] += 1
+            self._window_seq_lens.setdefault(slot, []).append(len(row["tokens"]))
             if slot not in touched:
                 counts["num_units"] += 1
                 touched.add(slot)
@@ -516,6 +529,59 @@ def _empty_window(routing: bool = False) -> dict[str, int | float]:
         window.update(dict.fromkeys(ROUTING_WINDOW_KEYS, 0))
         window["routing_materialize_s"] = 0.0
     return window
+
+
+def _percentile(ordered: list[int], quantile: float) -> float:
+    """Nearest-rank percentile of an already sorted list (p50 of [1,2,3,4] is 2)."""
+    index = min(len(ordered) - 1, max(0, math.ceil(quantile * len(ordered)) - 1))
+    return float(ordered[index])
+
+
+def _seq_len_metrics(seq_lens: list[int]) -> dict[str, float]:
+    """Shape of the window's real (unpadded) datums.
+
+    This is the legitimate half of a low MFU: work per token falls with sequence
+    length because attention is quadratic only on the full-attention layers, so
+    a 29k-mean window earns fewer FLOPs per token than the uniform 64k benchmark
+    (read against ``fwd_gflops_per_token``, docs/fork/mfu.md). Measured here
+    rather than in the trainer because the gateway sees rows before the DP
+    padding, which is a third of the row slots and would halve every percentile.
+    """
+    if not seq_lens:
+        return {}
+    ordered = sorted(seq_lens)
+    return {
+        "datum_seq_len_count": float(len(ordered)),
+        "datum_seq_len_mean": sum(ordered) / len(ordered),
+        "datum_seq_len_p50": _percentile(ordered, 0.50),
+        "datum_seq_len_p90": _percentile(ordered, 0.90),
+        "datum_seq_len_max": float(ordered[-1]),
+    }
+
+
+def _padding_metrics(counts: dict, trainer_metrics: dict) -> dict[str, float]:
+    """DP padding: rows the trainer carried that no datum asked for.
+
+    The gateway's ``counts`` are the real rows; the trainer's ``padded_num_*``
+    are what it actually forwarded. Pad rows are a third of the row SLOTS but
+    carry 2 tokens each, so ``pad_token_frac`` is ~1e-5: this metric exists so
+    padding is never again mistaken for the throughput problem.
+    """
+    padded_rows = trainer_metrics.get("padded_num_datums")
+    padded_tokens = trainer_metrics.get("padded_num_tokens")
+    if padded_rows is None or padded_tokens is None:
+        return {}
+    real_rows, real_tokens = counts.get("num_datums", 0), counts.get("num_tokens", 0)
+    if padded_rows < real_rows or padded_tokens < real_tokens:
+        return {}  # the windows disagree (a discarded window, or more than one slot)
+    pad_rows, pad_tokens = padded_rows - real_rows, padded_tokens - real_tokens
+    return {
+        "real_rows": float(real_rows),
+        "pad_rows": float(pad_rows),
+        "pad_tokens": float(pad_tokens),
+        "pad_row_frac": pad_rows / padded_rows if padded_rows else 0.0,
+        "pad_token_frac": pad_tokens / padded_tokens if padded_tokens else 0.0,
+    }
 
 
 def _make_routing_cache(args: Namespace) -> RoutingCache | None:

@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from torch_memory_saver import torch_memory_saver
 
+from miles.backends.megatron_utils import tinker_perf
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.backends.megatron_utils.full import executor as full_executor
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
@@ -424,7 +425,10 @@ class MegatronTrainRayActor(TrainRayActor):
         executor = full_executor if self._tinker_full_mode() else lora_executor
         self._heartbeat.bump()
         with ExitStack() as stack:
-            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
+            # the object-store fetch + H2D copies are the first slice of the gap that
+            # actor_train_time does not cover (docs/fork/mfu.md)
+            with tinker_perf.stage(tinker_perf.STAGE_DATA_FETCH):
+                rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
             stack.enter_context(store_get_result)
             return executor.forward_backward(self.args, unit_id, self.model, self.optimizer, rollout_data)
 

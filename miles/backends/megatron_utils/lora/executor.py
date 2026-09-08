@@ -41,7 +41,8 @@ def forward_backward(
     optimizer: MegatronOptimizer,
     rollout_data: RolloutBatch,
 ) -> dict:
-    data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
+    with tinker_perf.stage(tinker_perf.STAGE_DATA_ITER):
+        data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
     assert len(num_microbatches) == 1, "a work unit is a single forward/backward pass"
 
     for iterator in data_iterator:
@@ -61,7 +62,7 @@ def forward_backward(
     finally:
         per_datum_outputs = drain_per_datum_outputs()
     dumper_phase_util.finalize(model)
-    tinker_perf.note_unit(Timer().seq_lens)
+    tinker_perf.note_unit(Timer().seq_lens, tinker_perf.unit_shape(args, rollout_data, data_iterator))
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
@@ -77,7 +78,7 @@ def optim_step(
     """Step each requested slot on its accumulated grads; per slot a metrics dict
     (grad_norm is NaN and skipped=1 when the step was vetoed for non-finite grads)."""
     grad_norms: dict[int, float] = {}
-    with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+    with timer(tinker_perf.ACTOR_TRAIN_TIMER), tinker_perf.stage(tinker_perf.STAGE_OPTIM):
         for slot, adam_params in adam_params_by_slot.items():
             _apply_adam_params(optimizer, slot, adam_params)
             # batch size 1: grads step as accumulated; normalization is the client's loss weights

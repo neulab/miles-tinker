@@ -41,6 +41,7 @@ Design (see scratchpad note v2_executor_full_ft_design.md, section 4):
 import logging
 from argparse import Namespace
 from collections.abc import Sequence
+from contextlib import ExitStack
 
 import torch
 import torch.distributed as dist
@@ -100,7 +101,8 @@ def forward_backward(
     rollout_data: RolloutBatch,
 ) -> dict:
     _check_accumulation_config(args)
-    data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
+    with tinker_perf.stage(tinker_perf.STAGE_DATA_ITER):
+        data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
     assert len(num_microbatches) == 1, "a work unit is a single forward/backward pass"
 
     for iterator in data_iterator:
@@ -114,7 +116,15 @@ def forward_backward(
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=unit_id)
     start_per_datum_outputs()
     try:
-        with rollout_replay_stage(args, model, data_iterator, num_microbatches, rollout_data, stage="replay_backward"):
+        # ExitStack, not a nested `with`, only so the R3 fill (the context's __enter__:
+        # ~29 GB of int32 routing per step) is timed apart from the pass it wraps.
+        with ExitStack() as stack:
+            with tinker_perf.stage(tinker_perf.STAGE_REPLAY_FILL):
+                stack.enter_context(
+                    rollout_replay_stage(
+                        args, model, data_iterator, num_microbatches, rollout_data, stage="replay_backward"
+                    )
+                )
             with timer(tinker_perf.ACTOR_TRAIN_TIMER), fused_lm_head.maybe_activate(args, model):
                 losses_reduced = run_forward_backward_pass(
                     args, dumper_phase_util, data_iterator, model, num_microbatches[0], num_rollouts=None
@@ -126,7 +136,7 @@ def forward_backward(
     finally:
         per_datum_outputs = drain_per_datum_outputs()
     dumper_phase_util.finalize(model)
-    tinker_perf.note_unit(Timer().seq_lens)
+    tinker_perf.note_unit(Timer().seq_lens, tinker_perf.unit_shape(args, rollout_data, data_iterator))
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
@@ -134,7 +144,7 @@ def forward_backward(
 
 
 def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, adam_params: dict) -> dict:
-    with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+    with timer(tinker_perf.ACTOR_TRAIN_TIMER), tinker_perf.stage(tinker_perf.STAGE_OPTIM):
         grad_norm, skipped = _step_accumulated_grads(model, optimizer, adam_params)
     if not skipped:
         _state["num_updates"] += 1
