@@ -234,6 +234,7 @@ alive() { local p; for p in "$@"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && 
 cleanup() { local st=$?; trap - EXIT TERM INT; echo "cleanup status=$st $(date)"
   rm -f "$ENDPOINT_FILE"
   [[ -n $MONITOR_PID ]] && { kill "$MONITOR_PID" 2>/dev/null || true; }
+  [[ -n ${HEAD_GUARD_PID:-} ]] && { kill "$HEAD_GUARD_PID" 2>/dev/null || true; }
   if [[ -n $CLIENT_PID ]] && kill -0 "$CLIENT_PID" 2>/dev/null; then
     echo "client still running: TERM to its process group"; kill -TERM -- "-$CLIENT_PID" 2>/dev/null || kill -TERM "$CLIENT_PID" 2>/dev/null || true
     wait_gone 30 "$CLIENT_PID" || kill -KILL -- "-$CLIENT_PID" 2>/dev/null || true
@@ -356,6 +357,19 @@ monitor_loop() {
   done
 }
 if ! dry; then monitor_loop & MONITOR_PID=$!; fi
+
+# ---------------------------------------------------------------- head-node memory guard
+# With rollout_isolation=process the client forks one worker process per rollout (24 at WORKERS=3, more when it is
+# ramped) on top of the ray head, the driver, the gateway and this node's trainer ranks or engine. PBS kills the WHOLE
+# job when any node crosses its chunk limit, so fail this node closed instead, exactly as the service nodes do.
+if [[ ${HEAD_MEMORY_GUARD:-1} == 1 && -r $MILES_SRC/deploy/abci/openreward-node-memory-guard.py ]]; then
+  # shellcheck disable=SC2086
+  launch_bg "$JOBDIR/memory-guard-$HEAD_HOST.log" /usr/bin/python3 -I "$MILES_SRC/deploy/abci/openreward-node-memory-guard.py" \
+    --node-limit-bytes 2061584302080 --trigger-percent 85 --fallback-available-bytes 274877906944 \
+    --poll-seconds 2 --telemetry-seconds 60
+  HEAD_GUARD_PID=$LAST_PID
+  echo "head memory guard on $HEAD_HOST (pid ${HEAD_GUARD_PID:-dry}); telemetry in $(basename "$JOBDIR")/memory-guard-$HEAD_HOST.log"
+fi
 
 # ---------------------------------------------------------------- client on the head node (never on a login node)
 # CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway (and the services) are healthy,
