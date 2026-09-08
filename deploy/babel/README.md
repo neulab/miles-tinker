@@ -1,40 +1,21 @@
 # Training on Babel
 
-Requires Python and Apptainer. Run any repository training recipe with:
+With Python, Apptainer and GPUs available:
 
 ```bash
-python deploy/babel/run.py -- python scripts/run_qwen3_dense.py --help
+python deploy/babel/run.py
 ```
 
-The runner prepares the container and uv environment, installs this checkout,
-and runs setup before every command. The recipe controls the model, data, GPU
-count and parallelism. With no command, the runner only performs setup.
+This installs the server and Platoon client, downloads the model and dataset,
+starts the server, waits for it, and runs **100 number-search training steps**
+with **Qwen3-4B-Instruct-2507**, **LR 1e-6**, and **W&B online**. Your existing
+W&B login is used; otherwise the client prompts for it during setup.
 
-Options before `--`:
+Visible GPUs are split between learner and rollout (two each on four GPUs).
+The learner uses DP, a 1024-token microbatch target and CPU optimizer offload;
+the training batch is 32 groups of eight. This separate-server recipe needs
+at least two GPUs. The server is stopped when the client exits.
 
-- `--work-dir PATH`: runtime storage, mounted at `/run/miles`; defaults to node-local `/tmp/miles-<uid>`. Use persistent storage to retain outputs.
-- `--image IMAGE`: local SIF or compatible image; defaults to `docker://radixark/miles:latest`.
-- `--dry-run`: print the command without executing it.
-
-## Tinker example
-
-Prepare Qwen3-4B-Instruct-2507:
-
-```bash
-python deploy/babel/run.py -- python examples/tinker/run_qwen3_4b_gateway.py prepare
-```
-
-Start the server with two learner GPUs (DP=2) and two rollout GPUs, as in the
-[52m37s number-search run](https://wandb.ai/comp-code-llm/number-search-platoon-tinker/runs/d2ol7twe):
-
-```bash
-python deploy/babel/run.py -- python examples/tinker/run_qwen3_4b_gateway.py serve \
-  --mode full \
-  --num-gpus-per-node 4 \
-  --actor-num-nodes 1 --actor-num-gpus-per-node 2 \
-  --rollout-num-gpus 2 --tp 1 \
-  --max-tokens-per-gpu 1024 \
-  --extra-args "--chunked-optimizer-state-offload --optimizer-state-offload-chunk-size-mb 64"
-```
-
-Connect your Tinker client to `http://<server-host>:10613`.
+Outputs are under `/tmp/miles-<uid>/output`; use `--work-dir PATH` for persistent
+storage. `--steps 2` runs a short smoke test. See `--help` for optional settings.
+An explicit command after `--` still runs another repository recipe instead.
