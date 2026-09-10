@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import math
+import secrets
 import time
 import uuid
 from argparse import Namespace
@@ -72,6 +73,7 @@ class MilesBackend(ExecutorBackend):
         self.router_url = router_url
         self.inference_controller = inference_controller
         self.train_mode = getattr(args, "tinker_train_mode", "lora")
+        self.deterministic_inference = bool(getattr(args, "sglang_enable_deterministic_inference", False))
         self.dp_size = _actor_dp_size(args)
         checkpoint_root = getattr(args, "tinker_checkpoint_root", None)
         self.perf_log_path = Path(checkpoint_root) / PERF_LOG_NAME if checkpoint_root else None
@@ -429,8 +431,13 @@ class MilesBackend(ExecutorBackend):
             "top_k": params.get("top_k", -1),
             "no_stop_trim": True,  # the matched stop token stays in the returned tokens (Tinker semantics)
         }
-        if params.get("seed") is not None:
-            sampling_params["sampling_seed"] = params["seed"]
+        seed = params.get("seed")
+        if seed is None and self.deterministic_inference:
+            # SGLang's deterministic sampler defaults every unseeded request
+            # to 42. Independent Tinker calls must still draw independent samples.
+            seed = secrets.randbits(31)
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
         stop = params.get("stop")
         if stop == []:
             sampling_params["ignore_eos"] = True  # Tinker: an empty stop list disables every stop, EOS included
