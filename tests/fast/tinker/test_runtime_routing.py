@@ -162,6 +162,10 @@ async def test_a_response_without_routing_fails_the_sample_as_a_server_error(rou
         "pinned": 0,
         "capture_rejected": 1,
         "prefix_hits": 0,
+        "full_captures": 0,
+        "full_capture_rows": 0,
+        "verified_prefix_rows": 0,
+        "full_prefix_mismatches": 0,
     }
 
 
@@ -275,6 +279,11 @@ class TestMaterialization:
             "routing_cache_pinned",
             "routing_cache_evictions",
             "routing_prefix_hits",
+            "routing_full_capture",
+            "routing_full_captures",
+            "routing_full_capture_rows",
+            "routing_verified_prefix_rows",
+            "routing_full_prefix_mismatches",
             "fused_lm_head",
             "datum_seq_len_count",
             "datum_seq_len_mean",
@@ -302,3 +311,28 @@ def test_routing_needs_the_moe_shape_and_uint8_experts():
         MilesBackend(_args(num_experts=None), None, "http://router")
     with pytest.raises(ValueError, match="256"):
         MilesBackend(_args(num_experts=512), None, "http://router")
+
+
+@pytest.mark.parametrize("capture_mode", ["auto", "full"])
+async def test_retract_full_capture_requests_every_row_on_every_turn(router, capture_mode):
+    state, url = router
+    backend = MilesBackend(_args(pause_generation_mode="retract", tinker_routing_capture_mode=capture_mode), None, url)
+    try:
+        prompt = list(range(10))
+        for turn in range(3):
+            (sequence,) = (await backend.sample(_payload(prompt), lora_name=None))["sequences"]
+            assert state["bodies"][-1]["return_routed_experts"] is True
+            assert "routed_experts_start_len" not in state["bodies"][-1]
+            full = prompt + sequence["tokens"]
+            if turn == 2:
+                actual = backend.routing.materialize("t", sequence["routing_id"], full)
+                np.testing.assert_array_equal(actual, _routing_for(full, 0))
+            prompt = full + [60 + turn]
+        stats = backend.routing.stats()
+        assert stats["prefix_hits"] == 0
+        assert stats["full_captures"] == 3 and stats["verified_prefix_rows"] > 0
+        assert stats["pinned"] == 0 and backend._routing_metrics()["routing_full_capture"] == 1
+    finally:
+        if backend._generate_client is not None:
+            await backend._generate_client.close()
+        backend._routing_executor.shutdown(wait=True)

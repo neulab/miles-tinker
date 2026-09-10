@@ -1961,6 +1961,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--tinker-routing-capture-mode",
+                choices=["auto", "full", "incremental"],
+                default="auto",
+                help=(
+                    "R3 capture: auto returns full routing for retract-mode engines and incremental routing otherwise. "
+                    "Full capture shares stored prefixes only after comparing the captured expert IDs."
+                ),
+            )
+            parser.add_argument(
                 "--tinker-routing-cache-max-bytes",
                 type=int,
                 default=137_438_953_472,

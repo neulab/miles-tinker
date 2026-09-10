@@ -85,6 +85,14 @@ class MilesBackend(ExecutorBackend):
         self.routing: RoutingCache | None = _make_routing_cache(args)
         self.routing_replay = self.routing is not None
         self.routing_policy = getattr(args, "tinker_routing_replay_policy", ROUTING_POLICY_NATURAL)
+        capture_mode = getattr(args, "tinker_routing_capture_mode", "auto")
+        if capture_mode == "auto":
+            capture_mode = "full" if getattr(args, "pause_generation_mode", "in_place") == "retract" else "incremental"
+        if capture_mode not in ("full", "incremental"):
+            raise ValueError(f"unknown routing capture mode: {capture_mode}")
+        self.full_routing_capture = capture_mode == "full"
+        if self.routing is not None:
+            logger.info(f"tinker R3: capture_mode={capture_mode}, verified_prefix_storage={self.full_routing_capture}")
         self._prefix_hit_logs_left = PREFIX_HIT_LOG_LIMIT
         # JSON parse / base64 decode of /generate bodies, materialization and object_store.put run off the loop
         self._routing_executor = (
@@ -240,6 +248,11 @@ class MilesBackend(ExecutorBackend):
             "routing_cache_pinned": stats["pinned"],
             "routing_cache_evictions": stats["evictions"],
             "routing_prefix_hits": stats["prefix_hits"],
+            "routing_full_capture": int(self.full_routing_capture),
+            "routing_full_captures": stats["full_captures"],
+            "routing_full_capture_rows": stats["full_capture_rows"],
+            "routing_verified_prefix_rows": stats["verified_prefix_rows"],
+            "routing_full_prefix_mismatches": stats["full_prefix_mismatches"],
             "fused_lm_head": int(bool(getattr(self.args, "fused_lm_head_logprobs", False))),
         }
 
@@ -322,16 +335,16 @@ class MilesBackend(ExecutorBackend):
         return self._generate_client
 
     def _begin_capture(self, payload: dict, request: dict) -> "_RoutingCapture | None":
-        """R3: ask the engine for the routing and, when a cached sequence shares
-        a prefix with the prompt, only for the rows past it. The parent stays
-        pinned until every sample is recorded (or the request fails)."""
+        """Request full routing, or pin a prefix for explicit incremental capture."""
         if self.routing is None:
             return None
         tenant = payload.get("tenant", "")
         prompt_tokens = payload["prompt_tokens"]
         request["return_routed_experts"] = True
-        found = self.routing.find_prefix_parent(tenant, prompt_tokens)
         capture = _RoutingCapture(tenant=tenant, prompt_tokens=prompt_tokens)
+        if self.full_routing_capture:
+            return capture
+        found = self.routing.find_prefix_parent(tenant, prompt_tokens)
         if found is not None:
             capture.parent, capture.start_len = found
             capture.pins = 1
@@ -375,14 +388,24 @@ class MilesBackend(ExecutorBackend):
         for response, delta_rows in decoded:
             sequence = _to_sequence(response)  # abort -> RuntimeError before any record
             try:
-                sequence["routing_id"] = routing.record(
-                    capture.tenant,
-                    capture.prompt_tokens,
-                    sequence["tokens"],
-                    delta_rows,
-                    capture.parent,
-                    capture.start_len,
-                )
+                if self.full_routing_capture:
+                    sequence["routing_id"] = await loop.run_in_executor(
+                        self._routing_executor,
+                        routing.record_full,
+                        capture.tenant,
+                        capture.prompt_tokens,
+                        sequence["tokens"],
+                        delta_rows,
+                    )
+                else:
+                    sequence["routing_id"] = routing.record(
+                        capture.tenant,
+                        capture.prompt_tokens,
+                        sequence["tokens"],
+                        delta_rows,
+                        capture.parent,
+                        capture.start_len,
+                    )
             except RoutingCaptureError as error:
                 raise RuntimeError(f"routing capture rejected: {error}") from error
             if capture.parent is not None:
