@@ -26,6 +26,7 @@ import pybase64
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.service import ExecutorBackend
 from miles.tinker.core.types import UserInputError
+from miles.tinker.memory import process_memory_metrics
 from miles.tinker.routing_cache import (
     DEFAULT_MAX_BYTES,
     DEFAULT_PREFIX_STRIDE,
@@ -183,7 +184,12 @@ class MilesBackend(ExecutorBackend):
         """Periodic housekeeping from the service's lease sweep: routing cache TTL / byte cap."""
         if self.routing is not None:
             stats = self.routing.sweep()
-            logger.debug(f"tinker R3 cache: {stats}")
+            memory = process_memory_metrics()
+            snapshot = {**memory, "cache_entries": stats["entries"], "cache_bytes": stats["bytes"]}
+            logger.info("tinker R3 memory: %s", json.dumps(snapshot))
+            map_limit = memory.get("gateway_memory_map_limit", 0)
+            if map_limit and memory.get("gateway_memory_maps", 0) >= 0.8 * map_limit:
+                logger.warning("tinker R3 memory maps above 80%% of vm.max_map_count: %s", memory)
 
     async def discard_grads(self, slot: int) -> None:
         self._forget_window(slot)
@@ -244,6 +250,7 @@ class MilesBackend(ExecutorBackend):
             return {}
         stats = self.routing.stats()
         return {
+            **process_memory_metrics(),
             "routing_capture_rejected": stats["capture_rejected"],
             "routing_cache_entries": stats["entries"],
             "routing_cache_bytes": stats["bytes"],

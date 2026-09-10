@@ -4,6 +4,7 @@ under a per-sequence routing_id, and units carry rollout_routed_experts."""
 
 import json
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
 import pybase64
@@ -291,6 +292,10 @@ class TestMaterialization:
             "datum_seq_len_p90",
             "datum_seq_len_max",
         }
+        if Path("/proc/self/maps").exists():
+            expected_keys.update(
+                {"gateway_memory_maps", "gateway_memory_map_limit", "gateway_rss_bytes", "gateway_virtual_bytes"}
+            )
         assert set(metrics) == expected_keys
         assert metrics["routing_covered_datums"] == 1 and metrics["routing_cache_entries"] == 0
         assert metrics["fused_lm_head"] == 0

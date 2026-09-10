@@ -1,5 +1,12 @@
 import asyncio
 import logging
+import os
+
+from miles.tinker.memory import configure_numpy_allocation
+
+# NumPy checks this at import time. Ray/Torch/runtime imports below can import
+# NumPy, so configuring it inside serve() would be too late.
+configure_numpy_allocation()
 
 import uvicorn
 
@@ -28,6 +35,7 @@ async def serve(args):
     train_mode = args.tinker_train_mode
     assert train_mode == "full" or args.multi_lora, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
     configure_logger(args, source=MainProcessIdentity())
+    logger.info("tinker NumPy allocation: NUMPY_MADVISE_HUGEPAGE=%s", os.environ["NUMPY_MADVISE_HUGEPAGE"])
 
     # no RolloutExecutor here; the gateway posts /generate itself
     init_http_client(args)
