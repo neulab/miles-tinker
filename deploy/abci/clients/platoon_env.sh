@@ -14,13 +14,18 @@
 [[ -n ${OPENREWARD_SESSION_URLS_TOOLATHLON:-} ]] || { echo "OPENREWARD_SESSION_URLS_TOOLATHLON is empty: launch with SERVICES=1" >&2; exit 2; }
 [[ $(stat -c %a /home/aci18912it/rasp/config/secrets.env) == 600 ]] || { echo "secrets.env must be mode 0600" >&2; exit 2; }
 set +x
+# Preserve the trial's reward mode across the shared credential environment.
+PLATOON_TRIAL_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}
 # shellcheck disable=SC1091
 source /home/aci18912it/rasp/config/abci.env   # secrets only here; exports PLATOON_MODEL_SNAPSHOT, HF_HOME, chains secrets.env + .netrc
 [[ -z ${HF_TOKEN:-} && -r ~/.cache/huggingface/token ]] && export HF_TOKEN=$(<~/.cache/huggingface/token)
 export TINKER_BASE_URL TINKER_API_KEY=${TINKER_API_KEY:-tml-local} TINKER_TELEMETRY=1
 export HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS=$OPENREWARD_SESSION_URLS_TOOLATHLON
-export OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only OPENREWARD_DISABLE_UPDATE_CHECK=1
+export OPENREWARD_REWARD_MODE=$PLATOON_TRIAL_REWARD_MODE OPENREWARD_ENVIRONMENT_SET=toolathlon_only OPENREWARD_DISABLE_UPDATE_CHECK=1
+unset PLATOON_TRIAL_REWARD_MODE
+[[ $OPENREWARD_REWARD_MODE == partial || $OPENREWARD_REWARD_MODE == binary ]] || { echo "OPENREWARD_REWARD_MODE must be partial or binary" >&2; exit 2; }
+echo "platoon reward_mode=$OPENREWARD_REWARD_MODE"
 export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
 export WANDB_MODE=${WANDB_MODE:-online}
 CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client

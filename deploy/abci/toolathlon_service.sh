@@ -57,7 +57,8 @@ GUARD_ARGV=(/usr/bin/python3 -I "$MEMORY_GUARD"
 
 # ---------------------------------------------------------------- preconditions
 [[ $ENVIRONMENT_SET == toolathlon_only ]] || die "OPENREWARD_ENVIRONMENT_SET must be toolathlon_only, got $ENVIRONMENT_SET"
-[[ $REWARD_MODE == partial ]] || die "OPENREWARD_REWARD_MODE must be partial, got $REWARD_MODE"
+[[ $REWARD_MODE == partial || $REWARD_MODE == binary ]] || die "OPENREWARD_REWARD_MODE must be partial or binary, got $REWARD_MODE"
+log "reward_mode=$REWARD_MODE"
 [[ $RUNTIME == /* && -x $RUNTIME ]] || die "container runtime missing or not absolute: $RUNTIME"
 [[ -x $MKFS_EXT3 ]] || die "mkfs.ext3 is missing: $MKFS_EXT3"
 [[ -r $MEMORY_GUARD ]] || die "memory guard is missing: $MEMORY_GUARD"
@@ -84,7 +85,7 @@ STAGE_ARGV=("$RUNTIME" exec --fakeroot --cleanenv --no-home
   --bind "$STATE:/mnt/state,$STAGER:/app/openreward-toolathlon-stage-pgdata.sh:ro"
   "$LOCAL_SIF" /app/openreward-toolathlon-stage-pgdata.sh "$PGDATA_CONTAINER")
 MKFS_ARGV=("$MKFS_EXT3" -q -F -d "$LOCAL_ROOT/overlay-layout" "$OVERLAY")
-CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --overlay "$OVERLAY"
+CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --pid --overlay "$OVERLAY"
   --bind "$STATE:/mnt/state,$ENTRYPOINT:/app/openreward-toolathlon-resilient-entrypoint.sh:ro"
   "$LOCAL_SIF"
   env HOME=/mnt/state/home UV_CACHE_DIR=/mnt/state/cache/uv "${PORTABLE_ENV[@]}"
@@ -94,7 +95,7 @@ CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --overlay "$OVERLAY"
       OPENREWARD_STATE_DIR=/mnt/state "OPENREWARD_PGDATA=$PGDATA_CONTAINER"
       "OPENREWARD_PG_PORT=$PG_PORT" "OPENREWARD_PG_MAX_CONNECTIONS=$PG_MAX_CONNECTIONS"
       "OPENREWARD_PORT=$PORT" "OPENREWARD_WORKER_BASE_PORT=$WORKER_BASE_PORT" "OPENREWARD_WORKERS=$WORKERS"
-      OPENREWARD_WORKER_PID_ISOLATION=0
+      OPENREWARD_WORKER_PID_ISOLATION=1
       /app/openreward-toolathlon-resilient-entrypoint.sh)
 if dry; then
   echo "DRY_RUN resolved_sif: $OPENREWARD_TOOLATHLON_SIF"
