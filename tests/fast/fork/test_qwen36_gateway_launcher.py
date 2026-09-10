@@ -179,6 +179,22 @@ def test_context_length_drives_both_sides(launcher, monkeypatch):
     assert _flag(argv, "--max-tokens-per-gpu") == "32769"
 
 
+@pytest.mark.parametrize("nchannels", [8, 16])
+def test_deterministic_inference_matches_weight_transfer_peers(launcher, monkeypatch, nchannels):
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(sglang_deterministic_inference=True, deterministic_nccl_nchannels=nchannels)
+    assert "--sglang-enable-deterministic-inference" in shlex.split(captured["train_args"])
+    env = captured["extra_env_vars"]
+    assert env["NCCL_ALGO"] == "allreduce:tree"
+    assert env["NCCL_MIN_NCHANNELS"] == str(nchannels)
+    assert env["NCCL_MAX_NCHANNELS"] == str(nchannels)
+    assert env["SGLANG_DETERMINISTIC_NCCL_NCHANNELS"] == str(nchannels)
+    assert launcher.ScriptArgs().deterministic_env_vars == {}
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(deterministic_nccl_nchannels=0)
+
+
 def test_topology_flags_follow_the_split(launcher, monkeypatch):
     argv = _serve_argv(launcher, monkeypatch, actor_num_nodes=1, rollout_num_gpus=8)
     assert _flag(argv, "--actor-num-nodes") == "1" and _flag(argv, "--rollout-num-gpus") == "8"

@@ -67,8 +67,11 @@ Args:
   --update-weight-buffer-size: bytes per weight-update batch (2 GiB).
   --sglang-ep-size / --sglang-mem-fraction-static / --sglang-chunked-prefill-size /
     --sglang-max-running-requests / --sglang-max-total-tokens /
-    --sglang-fp32-lm-head: engine knobs (``--sglang-max-total-tokens`` bounds
+  --sglang-fp32-lm-head: engine knobs (``--sglang-max-total-tokens`` bounds
     the KV pool and the pinned routed-experts host cache when set).
+  --sglang-deterministic-inference / --deterministic-nccl-nchannels: enable
+    deterministic inference and match the NCCL algorithm/channel settings on
+    the trainer and engines, which share a weight-broadcast communicator.
   --check-weight-update-equal: compare the first weight push against the
     engines (smoke runs only).
   --extra-args: appended verbatim to the ``serve_tinker.py`` argv.
@@ -176,6 +179,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_chunked_prefill_size: int = 16384
     sglang_max_running_requests: int = 128
     sglang_max_total_tokens: int | None = None
+    sglang_deterministic_inference: bool = False
+    deterministic_nccl_nchannels: int = 8
 
     tinker_port: int = 10613
     extra_args: str = ""
@@ -191,6 +196,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
         )
         assert self.pause_generation_mode in ("abort", "retract", "in_place"), self.pause_generation_mode
         assert self.routing_policy in ("strict", "natural"), self.routing_policy
+        assert self.deterministic_nccl_nchannels > 0, self.deterministic_nccl_nchannels
         assert self.rollout_num_gpus % self.rollout_num_gpus_per_engine == 0, (
             f"--rollout-num-gpus {self.rollout_num_gpus} is not a multiple of "
             f"--rollout-num-gpus-per-engine {self.rollout_num_gpus_per_engine}"
@@ -203,6 +209,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
     def sglang_context_length(self) -> int:
         """One token of slack over the datum length: the gateway clamps generation to ``context_len``."""
         return self.context_len + 1
+
+    @property
+    def deterministic_env_vars(self) -> dict[str, str]:
+        if not self.sglang_deterministic_inference:
+            return {}
+        # SGLang otherwise pins channels only on the receivers. NCCL bootstrap
+        # then fails during the initial weight broadcast (1024 vs 512 bytes).
+        nchannels = str(self.deterministic_nccl_nchannels)
+        return {
+            "NCCL_ALGO": "allreduce:tree",
+            "NCCL_MIN_NCHANNELS": nchannels,
+            "NCCL_MAX_NCHANNELS": nchannels,
+            "SGLANG_DETERMINISTIC_NCCL_NCHANNELS": nchannels,
+        }
 
 
 @app.command()
@@ -284,6 +304,7 @@ def serve(args: ScriptArgs):
         f"--sglang-chunked-prefill-size {args.sglang_chunked_prefill_size} "
         f"--sglang-max-running-requests {args.sglang_max_running_requests} "
         f"{'--sglang-enable-fp32-lm-head ' if args.sglang_fp32_lm_head else ''}"
+        f"{'--sglang-enable-deterministic-inference ' if args.sglang_deterministic_inference else ''}"
     )
     if args.sglang_max_total_tokens is not None:
         sglang_args += f"--sglang-max-total-tokens {args.sglang_max_total_tokens} "
@@ -327,6 +348,7 @@ def serve(args: ScriptArgs):
         megatron_model_type=_MEGATRON_MODEL_TYPE,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
+        extra_env_vars=args.deterministic_env_vars,
     )
 
 

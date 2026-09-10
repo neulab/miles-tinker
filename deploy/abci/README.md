@@ -117,6 +117,15 @@ with the `apurvaga/Qwen3.6-35B-A3B-preserve-thinking` snapshot; the jobs run
 `clients/platoon_toolathlon.sh` with the recursive / non-recursive platoon yaml
 (`platoon/openreward/configs/tinker/abci_toolathlon_15node_{recursive,nonrecursive}_qwen36_miles_tinker_r3_v1.yaml`).
 
+For deterministic inference, set `LAUNCHER_ARGS=--sglang-deterministic-inference`.
+The launcher matches `NCCL_ALGO=allreduce:tree` and eight NCCL channels on the
+trainer and engines, including the shared weight-broadcast communicator. The
+channel count can be changed with `--deterministic-nccl-nchannels`. Passing only
+`--sglang-enable-deterministic-inference` through `EXTRA_ARGS` configures only the
+engines and can fail the first weight push with an NCCL bootstrap size mismatch.
+Full routing is selected independently with
+`EXTRA_ARGS='--tinker-routing-capture-mode full'`.
+
 Startup takes a few minutes on two nodes and longer on 15 (Ray join of 14 workers, bridge-mode
 HF load, TP8 engines, `warmup`, the ~50 s Toolathlon services). Watch it:
 
