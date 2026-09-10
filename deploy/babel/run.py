@@ -1,4 +1,4 @@
-"""Run Qwen3-4B number-search training on Babel, including setup and the server.
+"""Run Qwen3-4B number-search training, including setup and the server.
 
 Usage: python deploy/babel/run.py
 An explicit command after -- runs that command instead of number-search training.
@@ -8,6 +8,7 @@ import argparse
 import contextlib
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -28,6 +29,34 @@ exec "$@"
 """
 
 
+def _apptainer(work: Path, env: dict[str, str]) -> str:
+    if executable := shutil.which("apptainer"):
+        return executable
+    prefix = work / "apptainer"
+    executable = prefix / "usr/bin/apptainer"
+    if not executable.is_file():
+        architecture = {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
+        package = work / "apptainer.deb"
+        print("Installing Apptainer in the runtime directory...", flush=True)
+        urllib.request.urlretrieve(
+            f"https://github.com/apptainer/apptainer/releases/download/v1.5.3/apptainer_1.5.3_{architecture}.deb",
+            package,
+        )
+        subprocess.run(["dpkg-deb", "-x", str(package), str(prefix)], check=True)
+    if not list(prefix.glob("usr/lib/*/libprotobuf-c.so.1")):
+        subprocess.run(["apt-get", "download", "libprotobuf-c1"], cwd=prefix, check=True)
+        package = next(prefix.glob("libprotobuf-c1_*.deb"))
+        subprocess.run(["dpkg-deb", "-x", str(package), str(prefix)], check=True)
+    libraries = [str(path) for path in prefix.glob("usr/lib/*-linux-gnu")]
+    env["LD_LIBRARY_PATH"] = ":".join(filter(None, [*libraries, env.get("LD_LIBRARY_PATH", "")]))
+    # The unprivileged binary resolves these directories relative to usr/bin.
+    for name in ("etc", "var"):
+        link = prefix / "usr" / name
+        if not link.is_symlink() and not link.exists():
+            link.symlink_to(f"../{name}", target_is_directory=True)
+    return str(executable)
+
+
 def container_command(work: Path, image: str, command: list[str]) -> tuple[list[str], dict[str, str]]:
     argv = [
         "apptainer",
@@ -36,7 +65,8 @@ def container_command(work: Path, image: str, command: list[str]) -> tuple[list[
         "--contain",
         "--pid",
         "--ipc",
-        "--no-home",
+        "--home",
+        f"{work / 'home'}:{Path.home()}",
         "--no-mount",
         "cwd",
         "--no-eval",
@@ -66,7 +96,7 @@ def container_command(work: Path, image: str, command: list[str]) -> tuple[list[
         "HF_HOME": "/run/miles/hf",
         "XDG_CACHE_HOME": "/run/miles/.cache",
         "TMPDIR": "/tmp",
-        "NCCL_CUMEM_HOST_ENABLE": "0",  # Babel's Apptainer shared-memory compatibility.
+        "NCCL_CUMEM_HOST_ENABLE": "0",  # Apptainer shared-memory compatibility.
         "NETRC": "/run/miles/wandb.netrc",
     }
     # Inherit the launch environment, including GPU selection and multi-node settings.
@@ -115,7 +145,7 @@ def _training_commands(args, gpu_count: int, run_dir: Path, port: int) -> tuple[
         f"--tinker-port={port}",
         f"--output-dir={run_dir}",
         f"--checkpoint-root={run_dir / 'checkpoints'}",
-        "--extra-args=--chunked-optimizer-state-offload --optimizer-state-offload-chunk-size-mb 64",
+        "--extra-args=--chunked-optimizer-state-offload --optimizer-state-offload-chunk-size-mb 64 --sglang-device cuda",
     ]
     client = [
         "/run/miles/client/bin/python",
@@ -252,8 +282,9 @@ def main() -> None:
         print(shlex.join(argv), flush=True)
         return
     print(f"Runtime: {work}; training outputs: {work / 'output'}", flush=True)
-    for name in ("tmp", "models", "data", "output"):
+    for name in ("tmp", "home", "models", "data", "output"):
         (work / name).mkdir(parents=True, exist_ok=True)
+    argv[0] = _apptainer(work, env)
     os.execvpe(argv[0], argv, env)
 
 

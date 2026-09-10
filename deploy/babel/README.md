@@ -8,7 +8,8 @@ sbatch deploy/babel/train.sbatch
 
 Slurm allocates one node with four GPUs, 32 CPUs and 256 GB RAM for up to four
 hours, then starts setup and training. Edit the `#SBATCH` resource requests as
-needed; no GPU model or account is pinned. Python and Apptainer must be available.
+needed; no GPU model or account is pinned. Python must be available. The launcher
+uses an installed Apptainer or installs a local copy on Debian/Ubuntu without sudo.
 Export `WANDB_API_KEY` before submission or use an existing W&B login; batch
 jobs cannot answer login prompts.
 
@@ -26,3 +27,6 @@ Slurm logs go to `babel-<jobid>.log`; training outputs go to `.cache/babel/outpu
 in the checkout. `sbatch deploy/babel/train.sbatch --steps 2` submits a smoke
 test. Arguments after the template name are passed to `deploy/babel/run.py`;
 use `--work-dir PATH` to choose another storage location.
+
+Inside an existing allocation, run `python deploy/babel/run.py` directly.
+This uses `/tmp/miles-<uid>` for the runtime, models, data and outputs.

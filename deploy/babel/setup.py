@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import os
 import shutil
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,11 @@ def main() -> None:
     subprocess.run(
         ["uv", "venv", "--allow-existing", "--system-site-packages", "--python", sys.executable, str(venv)],
         check=True,
+    )
+    # Preserve image dependencies when its Python already belongs to a venv.
+    site_packages = venv / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    (site_packages / "runtime.pth").write_text(
+        "".join(f"import site; site.addsitedir({path!r})\n" for path in site.getsitepackages() if Path(path).is_dir())
     )
     install = ["uv", "pip", "install", "--python", str(venv / "bin/python")]
     # The runtime supplies the repository's GPU dependencies. Install our source over it.
