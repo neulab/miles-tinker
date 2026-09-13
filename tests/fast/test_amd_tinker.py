@@ -22,7 +22,24 @@ def test_relocated_backend_preserves_paths_and_explicit_mfu(tmp_path):
     assert _runtime_env(config)["MILES_SGLANG_LEGACY_WEIGHT_UPDATE"] == "1"
 
 
-@pytest.mark.parametrize("overrides", [{"train_gpus": 3, "tp": 2}, {"root": Path("/work1/not-local")}, {"peak_tflops": float("nan")}, {"rollout_gpus_per_engine": 3}])
+def test_custom_architecture_image_and_external_checkout(tmp_path):
+    config = BackendConfig(root=tmp_path, repo=Path("/work/miles"), image_uri="docker://rlsys/miles:MI300-latest")
+    command = _container_command(config, [config.python, "-c", "pass"])
+    assert "/work/miles:/work/miles" in command
+    assert str(config.image) in command
+    assert config.image != BackendConfig(root=tmp_path).image
+    assert _runtime_env(config)["PYTHONPATH"].startswith("/work/miles:")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"train_gpus": 3, "tp": 2},
+        {"root": Path("/work1/not-local")},
+        {"peak_tflops": float("nan")},
+        {"rollout_gpus_per_engine": 3},
+    ],
+)
 def test_invalid_configuration_fails_before_launch(overrides):
     with pytest.raises(ValueError):
         BackendConfig(**overrides)

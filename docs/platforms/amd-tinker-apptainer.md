@@ -1,5 +1,9 @@
 # Reusable AMD Tinker backend with Apptainer
 
+For MI300X, use the [MI300X server configuration guide](mi300-tinker-server.md).
+The MI350 image pinned on this page contains architecture-specific gfx950
+kernels and must not be treated as a universal MI300/MI350 image.
+
 This branch runs the experimental Miles Tinker API with **Megatron full
 fine-tuning and SGLang inference** on AMD MI350X GPUs. Apptainer supplies the
 ROCm dependencies; an editable install supplies this branch's Miles code.
@@ -12,9 +16,10 @@ does not prescribe a client training loop or a task plugin.
 ## Reproduce
 
 Prerequisites: an allocated MI350X node, access to its GPU devices, Apptainer,
-Git, and Python 3.9+ on the host. Docker is unnecessary. Keep the checkout,
-images, caches, temporary files, virtual environments, and checkpoints on local
-`/tmp`. The host tool uses only the standard library; GPU dependencies run in
+Git, and Python 3.9+ on the host. Docker is unnecessary. Keep images, caches,
+temporary files, virtual environments, and checkpoints on local `/tmp`.
+The checkout can remain elsewhere and is explicitly bound into Apptainer.
+The host tool uses only the standard library unless the optional Modal relay is enabled; GPU dependencies run in
 the container. `/tmp` is temporary storage and must be copied elsewhere if
 persistence is needed.
 
@@ -69,9 +74,10 @@ the launcher's initial learning rate is only a startup default.
 | `--max-tokens-per-gpu` | `16384` | Dynamic training batch token budget |
 | `--context-length` | `32768` | SGLang context limit |
 | `--mem-fraction` | `0.70` | SGLang memory allocation setting |
-| `--model-id`, `--revision`, `--model-type` | Pinned Qwen3-4B | HF model, snapshot, and Miles Python architecture definition |
+| `--model-id`, `--revision`, `--model-type` | Qwen3-4B, revision `main` | HF model, optional revision for setup, and Miles Python architecture definition |
 
-For another model, supply all three model options and appropriate parallelism.
+For another model, supply its model ID, architecture definition, and appropriate
+parallelism. The revision is optional and defaults to `main` during setup.
 Other models and multi-node configurations have not been validated by this
 deployment. Additional Miles arguments can follow `--`, for example
 `serve -- --sglang-max-running-requests 64`. MI355X or other hardware needs

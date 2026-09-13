@@ -1,4 +1,4 @@
-"""Provision and operate the Tinker gateway in the pinned MI350 Apptainer image.
+"""Provision and operate the Tinker gateway in an AMD Apptainer image.
 
 This stdlib-only host tool runs on Python 3.9+. It starts serve_tinker.py, whose
 Ray lifecycle differs from execute_train's one-shot training jobs. GPU packages
@@ -11,6 +11,7 @@ See docs/platforms/amd-tinker-apptainer.md for setup and reproduction.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -18,13 +19,16 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 IMAGE_URI = "docker://rlsys/miles@sha256:e60a69faa831ae2a146819290e8469cf23c81b97febeaf5d11e8baec2bfca285"
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
-DEFAULT_REVISION = "cdbee75f17c01a7cc42f958dc650907174af0554"
+DEFAULT_REVISION = "main"
+BRIDGE_REVISION = "3fd3768045422d0aa5c97e90a4e6c659aea9acb9"
+SGLANG_REVISION = "a929eb72882a8c47478de4d1eefd4a8ebb0716ff"
 OVERLAY_PACKAGES = (
     "ray[default]==2.56.0",
     "blake3==1.0.9",
@@ -35,6 +39,7 @@ OVERLAY_PACKAGES = (
     "psycopg[binary]==3.3.5",
     "backports.strenum==1.3.1",
 )
+IMAGE_COMPAT_PACKAGES = ("pylatexenc==2.10", "apache-tvm-ffi==0.1.13.post3")
 
 
 @dataclass(frozen=True)
@@ -55,13 +60,15 @@ class BackendConfig:
     max_tokens_per_gpu: int = 16384
     context_length: int = 32768
     mem_fraction: float = 0.70
+    image_uri: str = IMAGE_URI
+    image_workspace: str = "/sgl-workspace"
+    modal_relay: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "root", self.root.resolve())
         object.__setattr__(self, "repo", self.repo.resolve())
-        for path in (self.root, self.repo):
-            if not path.resolve().is_relative_to(Path("/tmp")):
-                raise ValueError("Keep both the checkout and deployment directory under /tmp")
+        if not self.root.is_relative_to(Path("/tmp")):
+            raise ValueError("Keep the deployment directory under /tmp")
         sizes = (self.train_gpus, self.rollout_gpus, self.rollout_gpus_per_engine, self.tp, self.pp, self.cp)
         if min(sizes) <= 0 or self.train_gpus % (self.tp * self.pp * self.cp):
             raise ValueError("Positive training GPU count must divide across TP/PP/CP")
@@ -71,12 +78,14 @@ class BackendConfig:
             raise ValueError("Provide a valid port and positive finite dense BF16 peak TFLOPS")
         if not 0 < self.mem_fraction < 1 or min(self.max_tokens_per_gpu, self.context_length) <= 0:
             raise ValueError("Invalid memory fraction or token limit")
-        if self.model_id != DEFAULT_MODEL and (self.revision == DEFAULT_REVISION or self.model_type == "qwen3-4B-Instruct-2507"):
-            raise ValueError("Another model requires its own --revision and --model-type")
+        if self.model_id != DEFAULT_MODEL and self.model_type == "qwen3-4B-Instruct-2507":
+            raise ValueError("Another model requires its own --model-type")
 
     @property
     def image(self):
-        return self.root / "images/miles-mi350.sif"
+        image_id = hashlib.sha256(self.image_uri.encode()).hexdigest()[:12]
+        filename = "miles-mi350.sif" if self.image_uri == IMAGE_URI else f"miles-{image_id}.sif"
+        return self.root / "images" / filename
 
     @property
     def python(self):
@@ -88,17 +97,26 @@ class BackendConfig:
 
 
 def _host_env(config):
-    return {**os.environ, "APPTAINER_CACHEDIR": str(config.root / "apptainer-cache"), "APPTAINER_TMPDIR": str(config.root / "apptainer-tmp"), "TMPDIR": str(config.root / "apptainer-tmp"), "PIP_CACHE_DIR": str(config.root / "pip-cache")}
+    return {
+        **os.environ,
+        "APPTAINER_CACHEDIR": str(config.root / "apptainer-cache"),
+        "APPTAINER_TMPDIR": str(config.root / "apptainer-tmp"),
+        "TMPDIR": str(config.root / "apptainer-tmp"),
+        "PIP_CACHE_DIR": str(config.root / "pip-cache"),
+    }
 
 
 def _runtime_env(config):
     root = config.root
+    megatron_path = "/root/Megatron-LM"
+    if config.image_uri != IMAGE_URI:
+        megatron_path = f"{config.image_workspace}/Megatron-LM:{megatron_path}"
     return {
         "HF_HOME": str(root / "hf-cache"),
         "XDG_CACHE_HOME": str(root / "container-home/.cache"),
         "TMPDIR": str(root / "runtime"),
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": f"{config.repo}:/root/Megatron-LM",
+        "PYTHONPATH": f"{config.repo}:{megatron_path}",
         "PATH": f"{root}/server-venv/bin:/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin",
         "RAY_TMPDIR": str(root / "runtime/ray"),
         "RAY_DEDUP_LOGS": "0",
@@ -127,7 +145,9 @@ def _container_command(config, command):
         "--bind",
         "/tmp:/tmp",
         "--bind",
-        f"{config.root}/deps/aiter:/sgl-workspace/aiter",
+        f"{config.repo}:{config.repo}",
+        "--bind",
+        f"{config.root}/deps/aiter:{config.image_workspace}/aiter",
         "--env",
         ",".join(f"{k}={v}" for k, v in _runtime_env(config).items()),
         "--pwd",
@@ -145,11 +165,36 @@ def _setup(config):
     for name in ("apptainer-cache", "apptainer-tmp", "container-home", "deps", "images", "logs", "runtime", "models"):
         (config.root / name).mkdir(parents=True, exist_ok=True)
     if not config.image.exists():
-        _run(config, ["apptainer", "pull", config.image, IMAGE_URI])
+        _run(config, ["apptainer", "pull", config.image, config.image_uri])
         _run(config, ["apptainer", "cache", "clean", "--force"])
     if not (config.root / "deps/aiter").exists():
-        _run(config, ["apptainer", "exec", "--cleanenv", "--no-mount", "cwd", "--bind", "/tmp:/tmp", "--home", f"{config.root}/container-home:/home/miles", "--pwd", "/tmp", config.image, "cp", "-a", "/sgl-workspace/aiter", config.root / "deps/aiter"])
-    _run(config, _container_command(config, ["/opt/venv/bin/python", "-m", "venv", "--system-site-packages", config.root / "server-venv"]))
+        _run(
+            config,
+            [
+                "apptainer",
+                "exec",
+                "--cleanenv",
+                "--no-mount",
+                "cwd",
+                "--bind",
+                "/tmp:/tmp",
+                "--home",
+                f"{config.root}/container-home:/home/miles",
+                "--pwd",
+                "/tmp",
+                config.image,
+                "cp",
+                "-a",
+                f"{config.image_workspace}/aiter",
+                config.root / "deps/aiter",
+            ],
+        )
+    _run(
+        config,
+        _container_command(
+            config, ["/opt/venv/bin/python", "-m", "venv", "--system-site-packages", config.root / "server-venv"]
+        ),
+    )
     pth_code = """import sys; from pathlib import Path
 root = Path(sys.argv[1]); version = f'{sys.version_info.major}.{sys.version_info.minor}'
 pth = root / f'server-venv/lib/python{version}/site-packages/image-deps.pth'
@@ -161,8 +206,79 @@ pth.write_text(f'import site; site.addsitedir("/opt/venv/lib/python{version}/sit
     _run(config, _container_command(config, [*pip, *OVERLAY_PACKAGES]))
     _run(config, _container_command(config, [*pip, "--no-deps", "nvidia-modelopt==0.44.0"]))
     _run(config, _container_command(config, [*pip, "--ignore-requires-python", "--no-deps", "tinker==0.27.1"]))
+    # Preserve the tested dependency stack in the original MI350 image.
+    if config.image_uri != IMAGE_URI:
+        _run(config, _container_command(config, [*pip, *IMAGE_COMPAT_PACKAGES]))
+        _ensure_bridge(config)
+        _ensure_sglang(config)
     download = "import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3])"
-    _run(config, _container_command(config, [config.python, "-c", download, config.model_id, config.revision, config.model_path]))
+    _run(
+        config,
+        _container_command(
+            config, [config.python, "-c", download, config.model_id, config.revision, config.model_path]
+        ),
+    )
+
+
+def _ensure_bridge(config):
+    probe = "from megatron.bridge.models.conversion.model_bridge import HFWeightTuple; assert 'megatron_param_name' in HFWeightTuple._fields"
+    result = subprocess.run(_container_command(config, [config.python, "-c", probe]), env=_host_env(config))
+    if result.returncode == 0:
+        return
+    bridge = config.root / "deps/Megatron-Bridge"
+    if not bridge.exists():
+        _run(config, ["git", "clone", "--no-checkout", "https://github.com/radixark/Megatron-Bridge.git", bridge])
+        # This compatible revision predates the fork's bridge-branch rebase.
+        _run(config, ["git", "-C", bridge, "fetch", "origin", BRIDGE_REVISION])
+        _run(config, ["git", "-C", bridge, "checkout", "--detach", BRIDGE_REVISION])
+    else:
+        revision = subprocess.check_output(["git", "-C", str(bridge), "rev-parse", "HEAD"], text=True).strip()
+        if revision != BRIDGE_REVISION:
+            raise ValueError(f"Existing Bridge checkout {bridge} is not at the required {BRIDGE_REVISION}")
+    pip = [config.python, "-m", "pip", "install"]
+    _run(config, _container_command(config, [*pip, "setuptools>=77,<81", "wheel", "hydra-core==1.3.2"]))
+    _run(config, _container_command(config, [*pip, "--no-deps", "--no-build-isolation", bridge]))
+
+
+def _ensure_sglang(config):
+    # Older MI300 images predate the dumper API imported by this Miles branch.
+    probe = """import importlib.util, sys
+from pathlib import Path
+package = Path(importlib.util.find_spec('sglang').origin).parent
+sys.exit('class DumperConfig' not in (package / 'srt/debug_utils/dumper.py').read_text())
+"""
+    result = subprocess.run(_container_command(config, [config.python, "-c", probe]), env=_host_env(config))
+    if result.returncode == 0:
+        return
+    source = config.root / "deps/sglang"
+    if not source.exists():
+        _run(
+            config,
+            [
+                "git",
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                "https://github.com/sgl-project/sglang.git",
+                source,
+            ],
+        )
+        _run(config, ["git", "-C", source, "checkout", "--detach", SGLANG_REVISION])
+    else:
+        revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        if revision != SGLANG_REVISION:
+            raise ValueError(f"Existing SGLang checkout {source} is not at the required {SGLANG_REVISION}")
+    # Build against the image's Torch/HIP and detected GPU. Reusing an MI350
+    # wheel here would reintroduce the gfx950-only kernel crash on MI300X.
+    build = "import os, sys; os.chdir(sys.argv[1]); os.execv(sys.executable, [sys.executable, 'setup_rocm.py', 'bdist_wheel'])"
+    _run(config, _container_command(config, [config.python, "-c", build, source / "sgl-kernel"]))
+    wheels = list((source / "sgl-kernel/dist").glob("*.whl"))
+    wheel = max(wheels, key=lambda path: path.stat().st_mtime)
+    pip = [config.python, "-m", "pip", "install", "--no-deps", "--force-reinstall"]
+    _run(config, _container_command(config, [*pip, wheel]))
+    # A normal wheel takes precedence over the image's existing editable
+    # /app/sglang entry; a second editable install does not reliably do so.
+    _run(config, _container_command(config, [*pip, source / "python"]))
 
 
 def _server_args(config, extra=()):
@@ -244,7 +360,18 @@ os.execv(sys.executable, args)
 
 
 def _serve(config, extra, dry_run):
-    command = _container_command(config, [config.python, "-c", _SERVE_CODE, config.root, config.repo, config.model_type, json.dumps(_server_args(config, extra))])
+    command = _container_command(
+        config,
+        [
+            config.python,
+            "-c",
+            _SERVE_CODE,
+            config.root,
+            config.repo,
+            config.model_type,
+            json.dumps(_server_args(config, extra)),
+        ],
+    )
     if dry_run:
         print(shlex.join(command))
         return
@@ -253,23 +380,89 @@ def _serve(config, extra, dry_run):
             raise RuntimeError(f"Port {config.port} is already occupied; reuse or explicitly stop that backend")
     except OSError:
         pass
+    if config.modal_relay:
+        _serve_with_modal(config, command)
+        return
     os.execvpe(command[0], command, _host_env(config))
 
 
+def _handle_serve_sigterm(signum, _frame):
+    # Unwind through the supervisor's finally block instead of exiting directly.
+    raise SystemExit(128 + signum)
+
+
+def _serve_with_modal(config, command):
+    python = config.root / "modal-venv/bin/python"
+    if not python.exists():
+        _run(config, [sys.executable, "-m", "venv", python.parent.parent])
+        _run(config, [python, "-m", "pip", "install", "modal==1.2.6"])
+    relay = None
+    server = None
+    previous_sigterm = signal.signal(signal.SIGTERM, _handle_serve_sigterm)
+    try:
+        relay = subprocess.Popen(
+            [
+                str(python),
+                str(config.repo / "tools/amd_tinker_modal.py"),
+                "--root",
+                str(config.root),
+                "--port",
+                str(config.port),
+            ],
+            env=_host_env(config),
+        )
+        server = subprocess.Popen(command, env=_host_env(config))
+        while True:
+            try:
+                result = server.wait(timeout=1)
+                if result:
+                    raise subprocess.CalledProcessError(result, command)
+                return
+            except subprocess.TimeoutExpired:
+                if relay.poll() is not None:
+                    raise RuntimeError("Modal relay exited; stopping the server. Check the relay output.") from None
+    finally:
+        # Repeated stop requests must not interrupt relay/sandbox cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            try:
+                if server is not None and server.poll() is None:
+                    _stop(config)
+            finally:
+                if relay is not None and relay.poll() is None:
+                    relay.terminate()
+                    try:
+                        relay.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        relay.kill()
+                        relay.wait()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+
 def _doctor(config):
-    code = """import json, math, sys, torch, miles
+    code = """import importlib.util, json, math, sys, torch, miles
 from pathlib import Path
 from miles.backends.megatron_utils.tinker_perf import perf_metrics
 from miles.utils.device_flops import local_peak_bf16_tflops
 assert Path(miles.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
 assert torch.version.hip and torch.cuda.is_available()
+gpu_arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+te_spec = importlib.util.find_spec('transformer_engine')
+te_build = Path(te_spec.origin).parent / 'build_info.txt'
+te_targets = None
+if te_build.exists():
+    for line in te_build.read_text().splitlines():
+        if line.startswith('GPU_TARGETS:'):
+            te_targets = line.split(':', 1)[1].strip()
+            assert gpu_arch in te_targets, f'Transformer Engine targets {te_targets}, but GPU is {gpu_arch}; select the matching image'
 x = torch.ones((64, 64), device='cuda', dtype=torch.bfloat16)
 assert (x @ x).float().mean().item() == 64
 peak = float(sys.argv[2])
 m = perf_metrics(actor_train_time=1, total_fwd_tflops=peak/6, num_tokens=128, peak_tflops=peak)
 assert math.isclose(m['actor_train_mfu'], .5)
 print(json.dumps(dict(miles_import=miles.__file__, torch=torch.__version__, hip=torch.version.hip,
-    gpu_count=torch.cuda.device_count(), device=torch.cuda.get_device_name(),
+    gpu_count=torch.cuda.device_count(), device=torch.cuda.get_device_name(), gpu_arch=gpu_arch, te_targets=te_targets,
     detected_peak=local_peak_bf16_tflops(), configured_peak=peak, gpu_matmul='passed', mfu_formula='passed'), indent=2))
 """
     _run(config, _container_command(config, [config.python, "-c", code, config.repo, config.peak_tflops]))
@@ -279,7 +472,9 @@ def _prune(config, keep, once):
     if keep < 1:
         raise ValueError("Keep at least one completed checkpoint")
     while True:
-        completed = sorted((config.root / "checkpoints").glob("*/weights/*/tinker_meta.json"), key=lambda p: p.stat().st_mtime)
+        completed = sorted(
+            (config.root / "checkpoints").glob("*/weights/*/tinker_meta.json"), key=lambda p: p.stat().st_mtime
+        )
         for sidecar in completed[:-keep]:
             print(f"Removing superseded completed checkpoint {sidecar.parent}", flush=True)
             shutil.rmtree(sidecar.parent)
@@ -312,7 +507,9 @@ def _stop(config):
     try:
         driver = int((config.root / "runtime/server.pid").read_text())
         entry = Path("/proc") / str(driver)
-        if (entry / "cwd").resolve() == config.repo.resolve() and b"serve_tinker.py" in (entry / "cmdline").read_bytes():
+        if (entry / "cwd").resolve() == config.repo.resolve() and b"serve_tinker.py" in (
+            entry / "cmdline"
+        ).read_bytes():
             os.kill(driver, signal.SIGTERM)
     except (FileNotFoundError, ProcessLookupError):
         pass
@@ -322,10 +519,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("setup", "serve", "doctor", "stop", "prune", "tunnel"))
     parser.add_argument("--root", type=Path, default=Path("/tmp/miles-tinker-work"))
+    parser.add_argument(
+        "--image-uri", default=IMAGE_URI, help="Architecture-matched Docker URI, preferably pinned by digest"
+    )
+    parser.add_argument(
+        "--image-workspace",
+        default="/sgl-workspace",
+        help="Dependency source directory inside the image (/app for older MI300 images)",
+    )
+    parser.add_argument(
+        "--modal-relay",
+        action="store_true",
+        help="Expose the server through an authenticated ephemeral Modal HTTPS relay",
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL)
-    parser.add_argument("--revision", default=DEFAULT_REVISION)
+    parser.add_argument(
+        "--revision",
+        default=DEFAULT_REVISION,
+        help="Optional HF branch, tag, or commit to download during setup (default: main)",
+    )
     parser.add_argument("--model-type", default="qwen3-4B-Instruct-2507")
-    for name, default in (("port", 10613), ("train-gpus", 4), ("rollout-gpus", 4), ("rollout-gpus-per-engine", 1), ("tp", 1), ("pp", 1), ("cp", 1), ("max-tokens-per-gpu", 16384), ("context-length", 32768)):
+    for name, default in (
+        ("port", 10613),
+        ("train-gpus", 4),
+        ("rollout-gpus", 4),
+        ("rollout-gpus-per-engine", 1),
+        ("tp", 1),
+        ("pp", 1),
+        ("cp", 1),
+        ("max-tokens-per-gpu", 16384),
+        ("context-length", 32768),
+    ):
         parser.add_argument(f"--{name}", type=int, default=default)
     parser.add_argument("--peak-tflops", type=float, default=2309.6)
     parser.add_argument("--mem-fraction", type=float, default=0.70)
@@ -348,7 +572,25 @@ def main():
     elif args.action == "tunnel":
         if not args.remote_host:
             parser.error("tunnel requires --remote-host")
-        _run(config, ["ssh", "-M", "-S", config.root / "runtime/tinker-tunnel.sock", "-fNT", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3", "-R", f"127.0.0.1:{args.remote_port or config.port}:127.0.0.1:{config.port}", args.remote_host])
+        _run(
+            config,
+            [
+                "ssh",
+                "-M",
+                "-S",
+                config.root / "runtime/tinker-tunnel.sock",
+                "-fNT",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-R",
+                f"127.0.0.1:{args.remote_port or config.port}:127.0.0.1:{config.port}",
+                args.remote_host,
+            ],
+        )
     else:
         {"setup": _setup, "doctor": _doctor, "stop": _stop}[args.action](config)
 
