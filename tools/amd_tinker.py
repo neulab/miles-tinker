@@ -110,6 +110,9 @@ def _host_env(config):
 
 def _runtime_env(config):
     root = config.root
+    # Ray appends its own timestamp/PID session name. Keep the base short enough
+    # for Unix socket paths even with long deployment roots and large PIDs.
+    runtime_id = hashlib.sha256(str(root).encode()).hexdigest()[:12]
     megatron_path = "/root/Megatron-LM"
     if config.image_uri != IMAGE_URI:
         megatron_path = f"{config.image_workspace}/Megatron-LM:{megatron_path}"
@@ -120,7 +123,7 @@ def _runtime_env(config):
         "PYTHONUNBUFFERED": "1",
         "PYTHONPATH": f"{config.repo}:{megatron_path}",
         "PATH": f"{root}/server-venv/bin:/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin",
-        "RAY_TMPDIR": str(root / "runtime/ray"),
+        "RAY_TMPDIR": f"/tmp/miles-ray-{runtime_id}",
         "RAY_DEDUP_LOGS": "0",
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",

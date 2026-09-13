@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import socket
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,29 @@ def test_external_checkpoint_root_is_passed_and_bound(tmp_path):
     assert args[args.index("--tinker-checkpoint-root") + 1] == str(checkpoint_root)
     command = _container_command(config, [config.python, "-c", "pass"])
     assert f"{checkpoint_root}:{checkpoint_root}" in command
+
+
+def test_ray_socket_path_fits_with_long_runtime_root_and_large_pid(tmp_path):
+    config = BackendConfig(root=tmp_path / ("long-runtime-" * 12))
+    ray_root = Path(_runtime_env(config)["RAY_TMPDIR"])
+    socket_path = ray_root / "ray/session_2026-09-13_15-03-09_747001_2147483647/sockets/dash_MetricsHead"
+    assert len(os.fsencode(socket_path)) <= 107
+    ray_root.mkdir(exist_ok=False)
+    try:
+        socket_path.parent.mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(socket_path))
+    finally:
+        shutil.rmtree(ray_root)
+
+
+def test_ray_temp_directory_is_stable_and_scoped_to_runtime(tmp_path, monkeypatch):
+    config = BackendConfig(root=tmp_path / "runtime")
+    before = _runtime_env(config)["RAY_TMPDIR"]
+    monkeypatch.setattr(os, "getpid", lambda: 2147483647)
+    assert _runtime_env(config)["RAY_TMPDIR"] == before
+    other = BackendConfig(root=tmp_path / "other-runtime")
+    assert _runtime_env(other)["RAY_TMPDIR"] != before
 
 
 @pytest.mark.parametrize(

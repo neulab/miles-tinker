@@ -78,6 +78,10 @@ the launcher's initial learning rate is only a startup default.
 | `--checkpoint-root` | `<root>/checkpoints` | Checkpoint and performance-log directory; external paths are bound into Apptainer |
 | `--model-id`, `--revision`, `--model-type` | Qwen3-4B, revision `main` | HF model, optional revision for setup, and Miles Python architecture definition |
 
+Ray's temporary base is `/tmp/miles-ray-<runtime-hash>`, derived from the resolved
+`--root` independently of the PID. This keeps its generated Unix socket paths
+short; Ray session logs live under `<ray-base>/ray/session_latest/logs`.
+
 For another model, supply its model ID, architecture definition, and appropriate
 parallelism. The revision is optional and defaults to `main` during setup.
 Other models and multi-node configurations have not been validated by this

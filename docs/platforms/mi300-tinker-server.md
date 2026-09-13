@@ -10,6 +10,11 @@ Keep images, model downloads, environments, and server logs under `/tmp`.
 Choose persistent checkpoint storage with `--checkpoint-root`; the command
 below uses `/work1/grahamneubig/adityabs/miles-tinker/checkpoints`.
 The launcher binds the checkout and external checkpoint directory into Apptainer.
+Ray uses `/tmp/miles-ray-<runtime-hash>` as its temporary base, with a stable
+hash of the resolved runtime root rather than a PID. Its session logs are at
+`/tmp/miles-ray-<runtime-hash>/ray/session_latest/logs`. Ray still appends its
+own timestamp/PID session name; the short base keeps Unix socket paths within
+Linux's 107-byte limit.
 
 ## 1. Provision the architecture-matched image
 
