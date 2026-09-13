@@ -6,8 +6,10 @@ GPUs for SGLang inference. It is independent of the client plugin. The concrete
 model below is `Qwen/Qwen3-4B-Instruct-2507`.
 
 Run commands from `/home1/adityabs/miles-tinker` on branch `miles-tinker-amd`.
-Keep images, model downloads, environments, logs, and checkpoints under `/tmp`.
-The launcher binds the checkout into the container explicitly.
+Keep images, model downloads, environments, and server logs under `/tmp`.
+Choose persistent checkpoint storage with `--checkpoint-root`; the command
+below uses `/work1/grahamneubig/adityabs/miles-tinker/checkpoints`.
+The launcher binds the checkout and external checkpoint directory into Apptainer.
 
 ## 1. Provision the architecture-matched image
 
@@ -51,6 +53,7 @@ mkdir -p /tmp/miles-mi300-runtime/logs
 
 MODAL_PROFILE=neulab python3 tools/amd_tinker.py serve \
   --root /tmp/miles-mi300-runtime \
+  --checkpoint-root /work1/grahamneubig/adityabs/miles-tinker/checkpoints \
   --image-uri "$MILES_AMD_IMAGE" --image-workspace /app \
   --model-id Qwen/Qwen3-4B-Instruct-2507 \
   --model-type qwen3-4B-Instruct-2507 \
@@ -227,8 +230,14 @@ Keep the forwarding connection alive for the run.
 Client-requested full checkpoints are written to:
 
 ```text
-/tmp/miles-mi300-runtime/checkpoints/<model-id>/weights/<checkpoint-name>/
+/work1/grahamneubig/adityabs/miles-tinker/checkpoints/<model-id>/weights/<checkpoint-name>/
 ```
+
+Change `--checkpoint-root` before the `--` separator to select another
+directory. The launcher creates it on startup and binds it into Apptainer.
+Without this option, storage defaults to `<root>/checkpoints`. This option
+does not move existing checkpoints. If using the launcher's `prune` command,
+pass the same `--checkpoint-root` to select the correct storage directory.
 
 Set the **client** checkpoint cadence to 25 steps. The server does not schedule
 these saves autonomously. Each full trained 4B checkpoint uses roughly 53 GiB;
@@ -252,7 +261,8 @@ tail -f /tmp/miles-mi300-runtime/logs/server.log
 ```
 
 Optimizer performance records are in
-`/tmp/miles-mi300-runtime/checkpoints/perf.jsonl`. To stop this runtime:
+`/work1/grahamneubig/adityabs/miles-tinker/checkpoints/perf.jsonl` with the
+startup command above. To stop this runtime:
 
 ```bash
 python3 tools/amd_tinker.py stop --root /tmp/miles-mi300-runtime

@@ -63,10 +63,12 @@ class BackendConfig:
     image_uri: str = IMAGE_URI
     image_workspace: str = "/sgl-workspace"
     modal_relay: bool = False
+    checkpoint_root: Path | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "root", self.root.resolve())
         object.__setattr__(self, "repo", self.repo.resolve())
+        object.__setattr__(self, "checkpoint_root", (self.checkpoint_root or self.root / "checkpoints").resolve())
         if not self.root.is_relative_to(Path("/tmp")):
             raise ValueError("Keep the deployment directory under /tmp")
         sizes = (self.train_gpus, self.rollout_gpus, self.rollout_gpus_per_engine, self.tp, self.pp, self.cp)
@@ -133,6 +135,11 @@ def _runtime_env(config):
 
 
 def _container_command(config, command):
+    checkpoint_bind = (
+        ["--bind", f"{config.checkpoint_root}:{config.checkpoint_root}"]
+        if not config.checkpoint_root.is_relative_to(Path("/tmp"))
+        else []
+    )
     return [
         "apptainer",
         "exec",
@@ -148,6 +155,7 @@ def _container_command(config, command):
         f"{config.repo}:{config.repo}",
         "--bind",
         f"{config.root}/deps/aiter:{config.image_workspace}/aiter",
+        *checkpoint_bind,
         "--env",
         ",".join(f"{k}={v}" for k, v in _runtime_env(config).items()),
         "--pwd",
@@ -164,6 +172,7 @@ def _run(config, command):
 def _setup(config):
     for name in ("apptainer-cache", "apptainer-tmp", "container-home", "deps", "images", "logs", "runtime", "models"):
         (config.root / name).mkdir(parents=True, exist_ok=True)
+    config.checkpoint_root.mkdir(parents=True, exist_ok=True)
     if not config.image.exists():
         _run(config, ["apptainer", "pull", config.image, config.image_uri])
         _run(config, ["apptainer", "cache", "clean", "--force"])
@@ -295,7 +304,7 @@ def _server_args(config, extra=()):
                 "--tinker-server-port",
                 config.port,
                 "--tinker-checkpoint-root",
-                config.root / "checkpoints",
+                config.checkpoint_root,
                 "--tinker-base-model",
                 config.model_id,
                 "--optimizer",
@@ -380,6 +389,7 @@ def _serve(config, extra, dry_run):
             raise RuntimeError(f"Port {config.port} is already occupied; reuse or explicitly stop that backend")
     except OSError:
         pass
+    config.checkpoint_root.mkdir(parents=True, exist_ok=True)
     if config.modal_relay:
         _serve_with_modal(config, command)
         return
@@ -473,7 +483,7 @@ def _prune(config, keep, once):
         raise ValueError("Keep at least one completed checkpoint")
     while True:
         completed = sorted(
-            (config.root / "checkpoints").glob("*/weights/*/tinker_meta.json"), key=lambda p: p.stat().st_mtime
+            config.checkpoint_root.glob("*/weights/*/tinker_meta.json"), key=lambda p: p.stat().st_mtime
         )
         for sidecar in completed[:-keep]:
             print(f"Removing superseded completed checkpoint {sidecar.parent}", flush=True)
@@ -519,6 +529,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("setup", "serve", "doctor", "stop", "prune", "tunnel"))
     parser.add_argument("--root", type=Path, default=Path("/tmp/miles-tinker-work"))
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        help="Checkpoint and performance-log directory, bound into Apptainer (default: <root>/checkpoints)",
+    )
     parser.add_argument(
         "--image-uri", default=IMAGE_URI, help="Architecture-matched Docker URI, preferably pinned by digest"
     )

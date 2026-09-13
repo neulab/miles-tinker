@@ -17,7 +17,8 @@ does not prescribe a client training loop or a task plugin.
 
 Prerequisites: an allocated MI350X node, access to its GPU devices, Apptainer,
 Git, and Python 3.9+ on the host. Docker is unnecessary. Keep images, caches,
-temporary files, virtual environments, and checkpoints on local `/tmp`.
+temporary files, and virtual environments on local `/tmp`. Checkpoints default
+to local `/tmp`; use `--checkpoint-root` to choose persistent storage.
 The checkout can remain elsewhere and is explicitly bound into Apptainer.
 The host tool uses only the standard library unless the optional Modal relay is enabled; GPU dependencies run in
 the container. `/tmp` is temporary storage and must be copied elsewhere if
@@ -74,6 +75,7 @@ the launcher's initial learning rate is only a startup default.
 | `--max-tokens-per-gpu` | `16384` | Dynamic training batch token budget |
 | `--context-length` | `32768` | SGLang context limit |
 | `--mem-fraction` | `0.70` | SGLang memory allocation setting |
+| `--checkpoint-root` | `<root>/checkpoints` | Checkpoint and performance-log directory; external paths are bound into Apptainer |
 | `--model-id`, `--revision`, `--model-type` | Qwen3-4B, revision `main` | HF model, optional revision for setup, and Miles Python architecture definition |
 
 For another model, supply its model ID, architecture definition, and appropriate
@@ -106,6 +108,11 @@ Full model-and-optimizer checkpoints are saved at:
 ```text
 <root>/checkpoints/<model-id>/weights/<checkpoint-name>/
 ```
+
+To change this location, pass `--checkpoint-root /path/to/checkpoints` to
+`serve` before the `--` separator. The directory is created and bound into
+Apptainer. Pass the same option to `prune` when using custom storage. Existing
+checkpoints are not moved automatically.
 
 A trained 4B checkpoint is approximately 53 GiB. To retain only the newest
 completed checkpoint, run one cleanup process in another persistent shell:

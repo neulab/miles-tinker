@@ -31,6 +31,15 @@ def test_custom_architecture_image_and_external_checkout(tmp_path):
     assert _runtime_env(config)["PYTHONPATH"].startswith("/work/miles:")
 
 
+def test_external_checkpoint_root_is_passed_and_bound(tmp_path):
+    checkpoint_root = Path("/work1/checkpoints with spaces")
+    config = BackendConfig(root=tmp_path, checkpoint_root=checkpoint_root)
+    args = _server_args(config)
+    assert args[args.index("--tinker-checkpoint-root") + 1] == str(checkpoint_root)
+    command = _container_command(config, [config.python, "-c", "pass"])
+    assert f"{checkpoint_root}:{checkpoint_root}" in command
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -45,9 +54,11 @@ def test_invalid_configuration_fails_before_launch(overrides):
         BackendConfig(**overrides)
 
 
-def test_pruner_preserves_newest_complete_and_incomplete_saves(tmp_path):
-    config = BackendConfig(root=tmp_path)
-    base = tmp_path / "checkpoints/model/weights"
+@pytest.mark.parametrize("external_checkpoints", [False, True])
+def test_pruner_preserves_newest_complete_and_incomplete_saves(tmp_path, external_checkpoints):
+    checkpoint_root = tmp_path / "persistent-checkpoints" if external_checkpoints else None
+    config = BackendConfig(root=tmp_path / "runtime", checkpoint_root=checkpoint_root)
+    base = config.checkpoint_root / "model/weights"
     for name, timestamp in (("old", 1), ("new", 2)):
         path = base / name
         path.mkdir(parents=True)
