@@ -154,7 +154,8 @@ def _run_relay(root, port, timeout):
             "api_key_file": str(runtime / "public-api-key"),
         }
         _private_file(runtime / "modal-relay.json", json.dumps(metadata, indent=2) + "\n")
-        print(f"Modal Tinker URL: {metadata['url']}", flush=True)
+        print(f"TINKER_BASE_URL={metadata['url']}", flush=True)
+        print(f"TINKER_API_KEY={api_key}", flush=True)
         print(f"Client TINKER_API_KEY file: {runtime / 'public-api-key'}", flush=True)
         code = ssh.wait()
         if code:

@@ -203,6 +203,12 @@ authenticate with `<root>/modal-venv/bin/modal setup` after that environment
 exists. Modal credentials normally live in `~/.modal.toml` on the server host;
 remote training clients need only the endpoint URL and Tinker key.
 
+At relay startup, the server stdout prints `TINKER_BASE_URL=...` and
+`TINKER_API_KEY=...` for copying into the client environment. Prefix each line
+with `export` in the client shell. With the command above, stdout is redirected
+to `server.log`, so that log contains the relay API key. The files below remain
+available for automated client configuration.
+
 - Read the public URL from `/tmp/miles-mi300-runtime/runtime/modal-relay.json`.
 - Read the Tinker key from `/tmp/miles-mi300-runtime/runtime/public-api-key`;
   transfer it privately and set the client's `TINKER_API_KEY`.
