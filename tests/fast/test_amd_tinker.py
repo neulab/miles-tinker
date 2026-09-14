@@ -33,6 +33,20 @@ def test_custom_architecture_image_and_external_checkout(tmp_path):
     assert _runtime_env(config)["PYTHONPATH"].startswith("/work/miles:")
 
 
+def test_optional_aiter_environment_survives_cleanenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT", raising=False)
+    monkeypatch.delenv("AITER_JIT_DIR", raising=False)
+    default = BackendConfig(root=tmp_path)
+    assert "CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT" not in _runtime_env(default)
+    assert "AITER_JIT_DIR" not in _runtime_env(default)
+    monkeypatch.setenv("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT", "0")
+    monkeypatch.setenv("AITER_JIT_DIR", str(tmp_path / "aiter-jit-bf16-rne"))
+    command = _container_command(default, [default.python, "-c", "pass"])
+    environment = command[command.index("--env") + 1]
+    assert "CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0" in environment.split(",")
+    assert f"AITER_JIT_DIR={tmp_path}/aiter-jit-bf16-rne" in environment.split(",")
+
+
 def test_external_checkpoint_root_is_passed_and_bound(tmp_path):
     checkpoint_root = Path("/work1/checkpoints with spaces")
     config = BackendConfig(root=tmp_path, checkpoint_root=checkpoint_root)

@@ -1,5 +1,9 @@
 # MI300X Tinker server: startup and training configuration
 
+For a fresh machine, follow the [complete setup and number-search commands](mi300-fresh-machine.md).
+That guide pins the model/client revisions and reproduces the completed
+100-step MI350-matched run, including `max_staleness: 3`.
+
 This recipe runs a Tinker-compatible endpoint on one node with eight AMD
 MI300X GPUs using Apptainer: four GPUs for Megatron full fine-tuning and four
 GPUs for SGLang inference. It is independent of the client plugin. The concrete
@@ -24,6 +28,8 @@ The launcher's original default image targets MI350 (`gfx950`). On MI300
 ```bash
 cd /home1/adityabs/miles-tinker
 export MILES_AMD_IMAGE=docker://rlsys/miles@sha256:545241a0dbbf8543ef9a6c6d14313b45ba2e78b49ce1ff8370f2c7ab354180e3
+export CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
+export AITER_JIT_DIR=/tmp/miles-mi300-runtime/aiter-jit-bf16-rne
 
 python3 tools/amd_tinker.py setup \
   --root /tmp/miles-mi300-runtime \
@@ -50,10 +56,14 @@ Run in a persistent shell after setup. The command includes the agreed
 optimizer initialization and recomputation settings explicitly. SGLang's
 chunked prefill, request limit, radix caching, and attention backend selection
 retain the launcher's defaults; no manual overrides are needed for these.
+Set the two AITER environment variables below for training/inference logprob
+consistency on MI300; they apply independently of the model.
 
 ```bash
 cd /home1/adityabs/miles-tinker
 export MILES_AMD_IMAGE=docker://rlsys/miles@sha256:545241a0dbbf8543ef9a6c6d14313b45ba2e78b49ce1ff8370f2c7ab354180e3
+export CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
+export AITER_JIT_DIR=/tmp/miles-mi300-runtime/aiter-jit-bf16-rne
 mkdir -p /tmp/miles-mi300-runtime/logs
 
 MODAL_PROFILE=neulab python3 tools/amd_tinker.py serve \
@@ -133,6 +143,48 @@ activation recomputation do not prove that an individual 65000-token training
 sequence fits in memory.
 
 ## 4. SGLang knobs and token limits
+
+### BF16 rounding for MI300 RL
+
+The pinned AITER RMSNorm build defaults to BF16 truncation on `gfx942`.
+Its `gfx950` conversion takes a different hardware path. In the fused
+add+RMSNorm operator, truncation also affects the residual passed to the next
+layer, so its bias accumulates even before the first optimizer update.
+This is an AITER numerical issue, not a reason to switch attention backends.
+See [AITER issue #5151](https://github.com/ROCm/aiter/issues/5151) for a report
+of the same behavior in a newer stack; that newer version uses an OPUS flag
+name rather than the CK flag used by this pinned image.
+
+Export these settings in the MI300 launch shell. The launcher forwards them
+through Apptainer's `--cleanenv`:
+
+```text
+CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
+AITER_JIT_DIR=<runtime-root>/aiter-jit-bf16-rne
+```
+
+Mode 0 requests round-to-nearest-even. AITER checks for an existing `.so`
+without including compiler flags in its cache key: **the rounding variable
+alone can silently reuse a truncating kernel**. Keep the RNE cache separate;
+do not copy an old `module_rmsnorm_quant.so` into it. First use compiles the
+required kernels. The launcher explicitly forwards these optional host environment variables;
+older versions of this launcher discarded them with `--cleanenv`.
+
+These settings do not change `SGLANG_USE_AITER`, attention, optimizer settings,
+or the default MI350 launch. Existing processes need a restart to load the
+new kernel; apply it only to the MI300 runtime being changed.
+
+On 2026-09-14, a frozen Qwen3-4B probe using identical tokens and weights
+reduced mean inference-prefill/trainer `0.5 * mean(delta_logprob**2)` from
+0.01060 to 0.00156 with these settings. Changing only attention to Triton
+gave 0.01068; replacing only AITER normalization gave 0.00187. These are
+controlled diagnostic measurements, not the number-search run's metrics.
+The subsequent [matched number-search run](https://wandb.ai/9998_team/number-search-platoon-tinker/runs/zsr75q6r)
+measured first-batch v2 0.0010036, versus the MI350 reference's 0.0010306.
+See the [investigation](mi300-logprob-investigation.md) for the run comparison,
+backend checks, and validation scope.
+
+### Other inference settings
 
 | Setting | Flag / chosen behavior | Meaning |
 | --- | --- | --- |

@@ -134,6 +134,13 @@ def _runtime_env(config):
         "MAX_JOBS": "16",
         "SGLANG_SET_CPU_AFFINITY": "0",
         "MILES_SGLANG_LEGACY_WEIGHT_UPDATE": "1",
+        # Forward optional AITER settings through Apptainer's --cleanenv.
+        # Rounding changes require a separate cache: AITER does not key on flags.
+        **{
+            key: os.environ[key]
+            for key in ("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT", "AITER_JIT_DIR")
+            if key in os.environ
+        },
     }
 
 
