@@ -1,4 +1,11 @@
-# Gateway flags and the Qwen3.6-35B-A3B launcher
+# Gateway flags and the Qwen3.6 launcher
+
+The existing `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` also accepts
+`serve --model-variant 27b` for Qwen3.6-27B. This selects the dense architecture,
+TP4/EP1 training, TP8/EP1 inference, and no routing replay. Pass a custom
+preserve-thinking checkpoint with `--hf-checkpoint`, and advertise its tokenizer
+path or model identifier with `--model-name`. The default `35b-a3b` variant keeps
+the existing MoE recipe. Node counts remain explicit launcher arguments.
 
 The `--tinker-*` flags of `serve_tinker.py`, the two fused-head flags, the
 serve-time validation they trigger, and the launcher that emits them for the

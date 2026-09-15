@@ -1,4 +1,10 @@
-"""Tinker gateway launcher for Qwen3.6-35B-A3B (hybrid GDN/attention MoE, MTP block unused).
+"""Tinker gateway launcher for Qwen3.6 hybrid GDN/attention models, MTP block unused.
+
+The default ``--model-variant 35b-a3b`` retains the existing MoE recipe.
+``--model-variant 27b`` selects the dense model definition, TP4/EP1 training,
+TP8/EP1 inference, and disables routing replay. A custom preserve-thinking HF
+snapshot can be passed through ``--hf-checkpoint`` and ``--model-name``.
+The launcher filename is retained for compatibility with existing deployments.
 
 Serves ``serve_tinker.py`` disaggregated: ``actor_num_nodes`` x 8 GPUs train
 (Megatron, TP1 / EP8 / ETP1, distributed optimizer, full uniform recompute) and
@@ -38,6 +44,8 @@ Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
+  --model-variant: ``35b-a3b`` (default) or ``27b``; sets architecture,
+    model-name, parallelism and routing defaults. Explicit overrides still win.
   --mode: ``full`` (full fine-tuning, emits ``--tinker-train-mode full``); ``lora``
     is not supported by this recipe yet.
   --model-name: HuggingFace id the gateway advertises.
@@ -80,9 +88,14 @@ Example:
   MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
     python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --mode full \\
       --actor-num-nodes 4 --rollout-num-gpus 8 --tinker-port 20613 --check-weight-update-equal
+
+  MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
+    python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --model-variant 27b \\
+      --actor-num-nodes 2 --rollout-num-gpus 96 --tinker-port 20613
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import typer
 
@@ -90,7 +103,20 @@ import miles.utils.external_utils.command_utils as U
 
 app = typer.Typer()
 
-_MEGATRON_MODEL_TYPE = "qwen3.6-35B-A3B"
+@dataclass(frozen=True)
+class _Recipe:
+    model_name: str
+    megatron_model_type: str
+    tp: int
+    ep: int
+    sglang_ep_size: int
+    routing_replay: bool
+
+
+_RECIPES = {
+    "35b-a3b": _Recipe("apurvaga/Qwen3.6-35B-A3B-preserve-thinking", "qwen3.6-35B-A3B", 1, 8, 8, True),
+    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False),
+}
 
 
 @dataclass
@@ -98,7 +124,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     mode: str = "full"
-    model_name: str = "apurvaga/Qwen3.6-35B-A3B-preserve-thinking"
+    model_variant: Literal["35b-a3b", "27b"] = "35b-a3b"
+    model_name: str | None = None
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"
     checkpoint_root: str | None = None
@@ -112,8 +139,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_num_gpus_per_engine: int = 8
 
     # Megatron parallelism: TP1 (num_query_groups=2 caps TP at 2), experts spread over 8 ranks.
-    tp: int = 1
-    ep: int = 8
+    tp: int | None = None
+    ep: int | None = None
     etp: int = 1
 
     # Training performance knobs: one 64k row (65536 model_input + 1 target token) per DP rank per microbatch.
@@ -132,7 +159,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lease_timeout_s: float = 600.0
 
     # R3: replay the engines' routing in training; the cache lives on the gateway host.
-    routing_replay: bool = True
+    routing_replay: bool | None = None
     routing_policy: str = "natural"
     routing_cache_max_bytes: int = 128 * 1024**3
     routing_cache_ttl_s: float = 21600.0
@@ -174,7 +201,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_health_check_first_wait: float = 600.0
 
     # Sampling engines.
-    sglang_ep_size: int = 8
+    sglang_ep_size: int | None = None
     sglang_mem_fraction_static: float = 0.75
     sglang_chunked_prefill_size: int = 16384
     sglang_max_running_requests: int = 128
@@ -186,6 +213,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        recipe = _RECIPES[self.model_variant]
+        for name in ("model_name", "tp", "ep", "sglang_ep_size", "routing_replay"):
+            if getattr(self, name) is None:
+                setattr(self, name, getattr(recipe, name))
+        if self.model_variant == "27b":
+            assert not self.routing_replay, "The dense 27B model has no expert routes to replay"
+            assert self.ep == self.etp == self.sglang_ep_size == 1, "The dense model requires expert parallelism 1"
+            assert self.tp in (1, 2, 4), "The dense model has four KV heads"
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name.rsplit('/', 1)[-1]}"
         if self.checkpoint_root is None:
@@ -345,7 +380,7 @@ def serve(args: ScriptArgs):
         train_args=train_args,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
-        megatron_model_type=_MEGATRON_MODEL_TYPE,
+        megatron_model_type=_RECIPES[args.model_variant].megatron_model_type,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
         extra_env_vars=args.deterministic_env_vars,
