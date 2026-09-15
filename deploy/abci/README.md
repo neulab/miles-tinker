@@ -235,8 +235,11 @@ test-pass rewards.
 
 `swe_rebench_service.sh` supervises the existing Platoon
 `pbs-scripts/openreward-swe-singularity-server.sh` and the node memory guard.
-The pinned SWE backend retains its private writable overlays and exact UUID
-session cleanup. `swe_rebench.env` contains only dataset, image-cache, source,
+The pinned SWE backend extracts a private writable directory for each episode
+and retains exact UUID session cleanup. Directory containers avoid the nodes'
+ten-loop-device limit and make root-owned task build caches writable by the
+service UID. They use more node-local scratch space than sparse overlays.
+`swe_rebench.env` contains only dataset, image-cache, source,
 and job-local directory settings; `SWE_ENV` can select another credential-free
 file. The environment server runs on the host so it can start Singularity task
 instances.
