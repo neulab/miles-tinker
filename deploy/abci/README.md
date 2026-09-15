@@ -225,6 +225,28 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 
 ## 7. Memory guard and node telemetry
 
+### SWE-rebench V2 services
+
+Set `SERVICES=1,SERVICE_ENVIRONMENT=swe_rebench` to run one SWE server on each
+inference node. The launcher probes port 8084 and forwards the same IPoIB URL
+pool as `OPENREWARD_SESSION_URLS_SWE_REBENCH` to Platoon. Toolathlon remains the
+default service environment. Set `OPENREWARD_REWARD_MODE=binary` for strict
+test-pass rewards.
+
+`swe_rebench_service.sh` supervises the existing Platoon
+`pbs-scripts/openreward-swe-singularity-server.sh` and the node memory guard.
+The pinned SWE backend retains its private writable overlays and exact UUID
+session cleanup. `swe_rebench.env` contains only dataset, image-cache, source,
+and job-local directory settings; `SWE_ENV` can select another credential-free
+file. The environment server runs on the host so it can start Singularity task
+instances.
+
+The existing `clients/platoon_toolathlon.sh` also runs SWE configs; its filename
+is retained for existing submissions. `CONFIG` accepts an absolute path or a
+path relative to the OpenReward plugin. The config's environment must be
+`nebius/SWE-rebench-V2`, with session URL port 8084 and
+`session_urls_env_var: OPENREWARD_SESSION_URLS_SWE_REBENCH`.
+
 Each service node runs `deploy/abci/openreward-node-memory-guard.py` (verbatim release copy) with exactly
 `--node-limit-bytes 2061584302080 --trigger-percent 85 --fallback-available-bytes 274877906944 --poll-seconds 2
 --telemetry-seconds 60`: it watches the job cgroup that carries the 1920 GiB `memory.max` (falling back to

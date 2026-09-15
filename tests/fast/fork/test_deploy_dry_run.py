@@ -35,7 +35,7 @@ SIF_SHA = "11d158f7c1a76486f1338f8cf90ce8a0280962792c0e5c95559f19cc391cda14"
 
 SHELL_SCRIPTS = sorted(
     list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("*.pbs")) + list(DEPLOY.glob("clients/*.sh"))
-    + [DEPLOY / "toolathlon.env"] + list((REPO / "deploy" / "clients").glob("*.sh"))
+    + list(DEPLOY.glob("*.env")) + list((REPO / "deploy" / "clients").glob("*.sh"))
 )
 
 
@@ -59,7 +59,7 @@ def run_pbs_dry(tmp_path: Path, hosts: list[str], ips: list[str], **env) -> tupl
     run_env.update(env)
     proc = subprocess.run(["bash", str(PBS)], env=run_env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    return proc.stdout + proc.stderr, project / "jobs" / "dry"
+    return proc.stdout + proc.stderr, project / "jobs" / "dry" / "2245678"
 
 
 FIFTEEN_HOSTS = [f"hnode{n:03d}" for n in (31, 48, 200, 12, 55, 7, 99, 100, 101, 102, 103, 104, 105, 106, 107)]
@@ -181,11 +181,11 @@ def test_toolathlon_service_dry_run(tmp_path):
     guard = next(line for line in out.splitlines() if line.startswith("DRY_RUN guard:"))
     assert guard.endswith("--node-limit-bytes 2061584302080 --trigger-percent 85 --fallback-available-bytes 274877906944 --poll-seconds 2 --telemetry-seconds 60")
     container = next(line for line in out.splitlines() if line.startswith("DRY_RUN container:"))
-    for token in ("/usr/bin/singularity exec --cleanenv --no-home --overlay", "rootfs-overlay.img", ":/mnt/state",
+    for token in ("/usr/bin/singularity exec --cleanenv --no-home --pid --overlay", "rootfs-overlay.img", ":/mnt/state",
                   "openreward-toolathlon-resilient-entrypoint.sh:ro", "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright",
                   "UV_PYTHON_DOWNLOADS=never", "OPENREWARD_RUNTIME_MODE=user", "OPENREWARD_REWARD_MODE=partial",
                   "OPENREWARD_PG_PORT=5432", "OPENREWARD_PG_MAX_CONNECTIONS=512", "OPENREWARD_PORT=8082",
-                  "OPENREWARD_WORKER_BASE_PORT=28100", "OPENREWARD_WORKERS=8", "OPENREWARD_WORKER_PID_ISOLATION=0"):
+                  "OPENREWARD_WORKER_BASE_PORT=28100", "OPENREWARD_WORKERS=8", "OPENREWARD_WORKER_PID_ISOLATION=1"):
         assert token in container, token
     assert "DRY_RUN stage_pgdata: /usr/bin/singularity exec --fakeroot --cleanenv --no-home" in out
     assert "DRY_RUN mkfs: /usr/sbin/mkfs.ext3 -q -F -d" in out

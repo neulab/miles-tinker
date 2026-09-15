@@ -13,13 +13,13 @@
 #   PBS node 0 (this batch shell): ray head + miles driver (serve_tinker.py) + gateway HTTP (one container)
 #   every other node:              ray worker (one container each, held by pbsdsh)
 #   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs (miles/ray/placement_group.py sorts bundles by IP)
-#   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one Toolathlon
-#                                  service per engine node (deploy/abci/toolathlon_service.sh), started before Ray
+#   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one OpenReward
+#                                  service per engine node, started before Ray
 # Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for presets):
 #   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
 #   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
 #   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
-#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
+#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE  SERVICE_ENVIRONMENT=toolathlon|swe_rebench  SWE_ENV
 # Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
 # DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
 # and every pbsdsh / singularity command line without executing anything.
@@ -48,6 +48,22 @@ GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-${LAUNCHER:-examples/tinker/run_qwen3_4b_ga
 PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon-tinker}
 TOOLATHLON_ENV=${TOOLATHLON_ENV:-$MILES_SRC/deploy/abci/toolathlon.env}
 SERVICES=${SERVICES:-0}
+SERVICE_ENVIRONMENT=${SERVICE_ENVIRONMENT:-toolathlon}
+case "$SERVICE_ENVIRONMENT" in
+  toolathlon)
+    SERVICE_PORT=8082; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_TOOLATHLON
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/toolathlon_service.sh
+    SERVICE_ENV_FILE=$TOOLATHLON_ENV
+    SERVICE_EXTRA_ENV=("TOOLATHLON_ENV=$TOOLATHLON_ENV" OPENREWARD_ENVIRONMENT_SET=toolathlon_only)
+    ;;
+  swe_rebench)
+    SERVICE_PORT=8084; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_SWE_REBENCH
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/swe_rebench_service.sh
+    SERVICE_ENV_FILE=${SWE_ENV:-$MILES_SRC/deploy/abci/swe_rebench.env}
+    SERVICE_EXTRA_ENV=("SWE_ENV=$SERVICE_ENV_FILE")
+    ;;
+  *) echo "Unsupported SERVICE_ENVIRONMENT=$SERVICE_ENVIRONMENT" >&2; exit 2 ;;
+esac
 WORKERS=${WORKERS:-3}
 LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
@@ -161,9 +177,9 @@ done < <(for i in "${!HOSTS[@]}"; do printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i
          | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
 echo "roles (host vidx ip role):"; cat "$JOBDIR/roles.tsv"
 SERVICE_NODES=; SERVICE_URLS=; ENGINE_IP_LIST=
-if [[ $SERVICES == 1 ]]; then  # one Toolathlon service per engine node; URLs by IPoIB ip in IP order (C10)
+if [[ $SERVICES == 1 ]]; then  # one service per engine node; URLs by IPoIB ip in IP order (C10)
   SERVICE_NODES=$(IFS=,; echo "${ENGINE_HOSTS[*]}")
-  SERVICE_URLS=$(printf 'http://%s:8082,' "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
+  SERVICE_URLS=$(printf "http://%s:$SERVICE_PORT," "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
   ENGINE_IP_LIST=$(IFS=,; echo "${ENGINE_IPS[*]}")
 fi
 
@@ -282,15 +298,15 @@ cleanup() { local st=$?; trap - EXIT TERM INT; echo "cleanup status=$st $(date)"
   echo "teardown done $(date)"; exit "$st"; }
 trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
 
-# ---------------------------------------------------------------- Toolathlon services (before Ray: miles' dynamic ports start at 20000 and skip bound ones)
+# ---------------------------------------------------------------- environment services (before Ray: dynamic ports start at 20000)
 if [[ $SERVICES == 1 ]]; then
-  [[ -r $TOOLATHLON_ENV ]] || { echo "TOOLATHLON_ENV not readable: $TOOLATHLON_ENV" >&2; exit 2; }
+  [[ -r $SERVICE_ENV_FILE ]] || { echo "Service environment not readable: $SERVICE_ENV_FILE" >&2; exit 2; }
   for i in "${!ENGINE_HOSTS[@]}"; do
     launch_bg "$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
       pbsdsh -n "${ENGINE_VIDX[$i]}" -- "${PBSDSH_ENV[@]}" "PBS_JOBID=$PBS_JOBID" "PBS_LOCALDIR=$PBS_LOCALDIR" "SERVICE_LOG=$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
-        "PLATOON_ROOT=$PLATOON_ROOT" "TOOLATHLON_ENV=$TOOLATHLON_ENV" "MILES_SRC=$MILES_SRC" \
-        "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}" OPENREWARD_ENVIRONMENT_SET=toolathlon_only \
-        /bin/bash "$MILES_SRC/deploy/abci/toolathlon_service.sh"
+        "PLATOON_ROOT=$PLATOON_ROOT" "MILES_SRC=$MILES_SRC" "${SERVICE_EXTRA_ENV[@]}" \
+        "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}" \
+        /bin/bash "$SERVICE_HELPER"
     SERVICE_PIDS+=("$LAST_PID")
   done
   echo "services: ${#ENGINE_HOSTS[@]} helper(s) started on $SERVICE_NODES ($(date))"
@@ -316,12 +332,16 @@ HEAD_PID=$LAST_PID
 dry && show "serve (inside the head container)" python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
   --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" --actor-num-nodes "$TRAIN_NODES" --rollout-num-gpus "$ROLLOUT_GPUS" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
 
-# ---------------------------------------------------------------- service health (release quorum: >= 1/4 on :8082 with X-Session-ID, >= 5/8 workers)
+# ---------------------------------------------------------------- service health (Toolathlon quorum or SWE's single server)
 probe() { [[ $(curl --silent --output /dev/null --connect-timeout 3 --max-time 15 --noproxy '*' --write-out '%{http_code}' "$@" 2>/dev/null) == 200 ]]; }
 SWEEP_REPORT=
 sweep_services() {  # 0 when every service host meets the quorum and its helper is alive; SWEEP_REPORT lists the rest
   local pids=() kinds=() hosts=() i w host ip; local -A pub=() wrk=()
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}; ip=${ENGINE_IPS[$i]}
+    if [[ $SERVICE_ENVIRONMENT == swe_rebench ]]; then
+      probe "http://$ip:$SERVICE_PORT/health" & pids+=($!); kinds+=(pub); hosts+=("$host")
+      continue
+    fi
     for w in 0 1 2 3; do probe -H "X-Session-ID: gw-health-$JOB-$host-$w" "http://$ip:8082/health" & pids+=($!); kinds+=(pub); hosts+=("$host"); done
     for w in 0 1 2 3 4 5 6 7; do probe "http://$ip:$((28100 + w))/health" & pids+=($!); kinds+=(wrk); hosts+=("$host"); done
   done
@@ -333,7 +353,11 @@ sweep_services() {  # 0 when every service host meets the quorum and its helper 
   SWEEP_REPORT=
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}
     kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null || SWEEP_REPORT+=" $host(helper dead)"
-    (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
+    if [[ $SERVICE_ENVIRONMENT == swe_rebench ]]; then
+      (( ${pub[$host]:-0} >= 1 )) || SWEEP_REPORT+=" $host(swe unhealthy)"
+    else
+      (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
+    fi
   done
   [[ -z $SWEEP_REPORT ]]
 }
@@ -394,7 +418,7 @@ CLIENT_ENV=(
   "JOBDIR=$JOBDIR" "RUN_NAME=$RUN_NAME" "HF_HOME=$HF_HOME"
   "no_proxy=$HEAD_HOST,$HEAD_IP${SERVICE_NODES:+,$SERVICE_NODES,$ENGINE_IP_LIST}${no_proxy:+,$no_proxy}"
   "MILES_SRC=$MILES_SRC" "PLATOON_ROOT=$PLATOON_ROOT" "SERVICE_NODES=$SERVICE_NODES"
-  "OPENREWARD_SESSION_URLS_TOOLATHLON=$SERVICE_URLS" "OPENREWARD_SESSION_URLS=$SERVICE_URLS"
+  "$SERVICE_URLS_VARIABLE=$SERVICE_URLS" "OPENREWARD_SESSION_URLS=$SERVICE_URLS" "SERVICE_ENVIRONMENT=$SERVICE_ENVIRONMENT"
   "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}"
   "PBS_LOCALDIR=$PBS_LOCALDIR" "WORKERS=$WORKERS"
 )
