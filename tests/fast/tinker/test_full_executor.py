@@ -127,13 +127,11 @@ def rig(monkeypatch):
             "miles.backends.training_utils.data",
             get_data_iterator=lambda args, model, rollout_data: ([SimpleNamespace(reset=lambda: None)], [1]),
         ),
-        "miles.backends.training_utils.log_utils": _module(
-            "miles.backends.training_utils.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}
-        ),
+        "miles.backends.training_utils.log_utils": _module("miles.backends.training_utils.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}),
         "miles.backends.training_utils.loss_hub.tinker_losses": _module(
             "miles.backends.training_utils.loss_hub.tinker_losses",
             start_per_datum_outputs=lambda: None,
-            drain_per_datum_outputs=lambda: [{"sample_index": 0}],
+            drain_per_datum_outputs=lambda: [{"sample_index": 0, "loss": torch.tensor(1.0), "logprobs": torch.tensor([-1.0])}],
         ),
         "miles.backends.training_utils.parallel": _module(
             "miles.backends.training_utils.parallel",
@@ -169,7 +167,9 @@ def test_units_defer_finalize_and_optim_step_runs_it_once(rig):
     optimizer = FakeOptimizer()
     for unit_id in (1, 2):
         out = rig.executor.forward_backward(rig.args, unit_id, rig.model, optimizer, {})
-        assert out == {"metrics": {"loss": 1.0}, "per_datum": [{"sample_index": 0}]}
+        assert out["metrics"] == {"loss": 1.0}
+        assert out["per_datum"][0]["sample_index"] == 0
+        assert out["per_datum"][0]["loss"].item() == 1.0
     assert rig.log == ["reset_grad_metadata", "fwd_bwd", "reset_grad_metadata", "fwd_bwd"], "no collective per unit"
     assert rig.executor._state["pending_finalize"] is True
 
@@ -222,6 +222,42 @@ def test_failed_unit_poisons_the_window(rig):
     assert metrics["skipped"] == 1 and optimizer.calls == []
     assert rig.log[-1] == "zero_grads" and "finalize" not in rig.log
     assert rig.executor._state["dirty"] is False
+
+
+def test_nonfinite_reporting_vetoes_the_whole_window_and_next_window_recovers(rig, monkeypatch):
+    optimizer = FakeOptimizer()
+    bad = [{"sample_index": 0, "loss": torch.tensor(float("nan")), "logprobs": torch.tensor([-1.0])}]
+    monkeypatch.setattr(rig.executor, "drain_per_datum_outputs", lambda: bad)
+    out = rig.executor.forward_backward(rig.args, 1, rig.model, optimizer, {})
+    assert out["per_datum"][0]["loss"].item() == 0.0
+    assert out["per_datum"][0]["nonfinite_loss"] == 1
+    metrics = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert metrics["skipped"] == 1 and metrics["nonfinite_output"] == 1
+    assert metrics["num_updates"] == 0 and optimizer.calls == []
+    assert "finalize" not in rig.log
+    assert not rig.executor._state["nonfinite_output"]
+    monkeypatch.setattr(rig.executor, "drain_per_datum_outputs", lambda: [])
+    rig.executor.forward_backward(rig.args, 2, rig.model, optimizer, {})
+    recovered = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert recovered["skipped"] == 0 and recovered["num_updates"] == 1
+    assert optimizer.calls.count("step") == 1
+
+
+def test_nonfinite_on_a_remote_rank_vetoes_local_optimizer_without_finalize(rig, monkeypatch):
+    def remote_failure(flag, op, group):
+        assert group == "all-trainer-ranks" and op == rig.executor.dist.ReduceOp.MAX
+        assert flag.item() == 0
+        flag.fill_(1)
+
+    with monkeypatch.context() as distributed:
+        distributed.setattr(rig.executor.dist, "is_initialized", lambda: True)
+        distributed.setattr(rig.executor, "get_gloo_group", lambda: "all-trainer-ranks")
+        distributed.setattr(rig.executor.dist, "all_reduce", remote_failure)
+        rig.executor._check_per_datum_outputs(1, [], {})
+    optimizer = FakeOptimizer()
+    metrics = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert metrics["skipped"] == 1 and metrics["nonfinite_output"] == 1
+    assert optimizer.calls == [] and "finalize" not in rig.log
 
 
 def test_discard_grads_clears_pending_finalize(rig):

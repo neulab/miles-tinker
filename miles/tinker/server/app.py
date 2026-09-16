@@ -189,15 +189,19 @@ def build_app(service: TinkerService) -> FastAPI:
                 return JSONResponse(
                     status_code=408, content={"type": "try_again", "request_id": request_id, "queue_state": "active"}
                 )
-        service.promises.delivered(promise)
         if promise.state == FAILED:
-            return JSONResponse({"error": promise.error, "category": promise.error_category})
-        encoder = PROTO_ENCODERS.get(promise.result["kind"])
-        if encoder is not None and PROTO_CONTENT_TYPE in request.headers.get("accept", ""):
-            return Response(content=encoder(promise.result), media_type=PROTO_CONTENT_TYPE)
-        # an explicit JSONResponse: returning the dict would first send every token and
-        # logprob through FastAPI's jsonable_encoder
-        return JSONResponse(render_result(promise.result))
+            response = JSONResponse({"error": promise.error, "category": promise.error_category})
+        else:
+            encoder = PROTO_ENCODERS.get(promise.result["kind"])
+            if encoder is not None and PROTO_CONTENT_TYPE in request.headers.get("accept", ""):
+                response = Response(content=encoder(promise.result), media_type=PROTO_CONTENT_TYPE)
+            else:
+                # Avoid FastAPI's recursive jsonable_encoder on every token.
+                response = JSONResponse(render_result(promise.result))
+        # A serialization failure has not delivered the result. Do not shorten
+        # its TTL and replace the real error with a misleading promise-expired.
+        service.promises.delivered(promise)
+        return response
 
     @app.post("/api/v1/cancel_future")
     async def cancel_future(request: Request):

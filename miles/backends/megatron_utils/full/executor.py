@@ -66,6 +66,7 @@ from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.backends.training_utils.loss_hub.tinker_losses import drain_per_datum_outputs, start_per_datum_outputs
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.replay_data import rollout_replay_stage
+from miles.backends.training_utils.tinker_numerics import finite_per_datum_reports
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 SAVE_ITERATION = 1
 
 # Single tenant: one accumulation window per process.
-_state = {"pending_finalize": False, "dirty": False, "num_updates": 0}
+_state = {"pending_finalize": False, "dirty": False, "nonfinite_output": False, "num_updates": 0}
 
 
 def _deferred_finalize(*_args, **_kwargs) -> None:
@@ -135,6 +136,7 @@ def forward_backward(
         raise
     finally:
         per_datum_outputs = drain_per_datum_outputs()
+    per_datum_outputs = _check_per_datum_outputs(unit_id, per_datum_outputs, rollout_data)
     dumper_phase_util.finalize(model)
     tinker_perf.note_unit(Timer().seq_lens, tinker_perf.unit_shape(args, rollout_data, data_iterator))
 
@@ -144,6 +146,7 @@ def forward_backward(
 
 
 def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, adam_params: dict) -> dict:
+    nonfinite_output = _state["nonfinite_output"]
     with timer(tinker_perf.ACTOR_TRAIN_TIMER), tinker_perf.stage(tinker_perf.STAGE_OPTIM):
         grad_norm, skipped = _step_accumulated_grads(model, optimizer, adam_params)
     if not skipped:
@@ -154,13 +157,39 @@ def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimiz
         "lr": adam_params["learning_rate"],
         "num_updates": _state["num_updates"],
     }
+    if nonfinite_output:
+        metrics["nonfinite_output"] = 1
     return {**metrics, **tinker_perf.pop_optim_window_metrics(args)}
+
+
+def _check_per_datum_outputs(unit_id: int, outputs: list[dict], rollout_data: RolloutBatch) -> list[dict]:
+    reports, diagnostics = finite_per_datum_reports(outputs)
+    invalid = torch.tensor(bool(diagnostics), dtype=torch.int32)
+    # Every rank must take the same branch at optim_step, including ranks with
+    # no bad local rows. Otherwise some would enter finalize's collectives alone.
+    if dist.is_initialized():
+        dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=get_gloo_group())
+    if invalid.item():
+        _state["dirty"] = True
+        _state["nonfinite_output"] = True
+    if diagnostics:
+        indices = {int(index): i for i, index in enumerate(rollout_data.get("sample_indices", []))}
+        for diagnostic in diagnostics:
+            local_index = indices.get(int(diagnostic["sample_index"]))
+            if local_index is not None:
+                diagnostic["tokens"] = rollout_data["total_lengths"][local_index]
+                for field in ("rollout_log_probs", "advantages"):
+                    if field in rollout_data:
+                        values = torch.as_tensor(rollout_data[field][local_index])
+                        diagnostic[f"nonfinite_{field}"] = int((~torch.isfinite(values)).sum().item())
+        logger.error("tinker nonfinite output: unit=%s; optimizer window vetoed; datums=%s", unit_id, diagnostics)
+    return reports
 
 
 def _step_accumulated_grads(model, optimizer, adam_params: dict) -> tuple[float, int]:
     """Finalize once, apply this step's AdamParams, veto non-finite grads, step. Returns (grad_norm, skipped)."""
     if _state["dirty"]:
-        logger.warning("optim_step: discarding a window with a failed forward_backward")
+        logger.warning("optim_step: discarding a window with a failed or non-finite forward_backward")
         discard_grads(model, optimizer)
         return float("nan"), 1
     if _state["pending_finalize"]:
@@ -188,6 +217,7 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
     """Drop the accumulated window: zero DDP grad buffers and optimizer grads."""
     _zero_grads(model, optimizer, False)
     _state["pending_finalize"] = False
+    _state["nonfinite_output"] = False
     _state["dirty"] = False
 
 

@@ -72,6 +72,19 @@ async def _create_model(client, tenant: str = "tml-tenant-a", **extra) -> str:
     return created["model_id"]
 
 
+async def test_response_is_not_marked_delivered_when_serialization_fails(client):
+    promise = client.service.promises.create("model", "tml-tenant-a")
+    result = {"kind": "forward_backward", "outputs": [{"loss": float("nan"), "logprobs": [-1.0]}]}
+    client.service.promises.resolve(promise.request_id, result)
+    with pytest.raises(ValueError, match="not JSON compliant"):
+        await client.post("/api/v1/retrieve_future", json={"request_id": promise.request_id}, headers=_headers())
+    assert promise.delivered_at is None
+    result["outputs"][0].update(loss=0.0, nonfinite_loss=1)
+    response = await _poll(client, promise.request_id)
+    assert response["metrics"]["nonfinite_loss:sum"] == 1
+    assert promise.delivered_at is not None
+
+
 async def test_the_training_conversation(client):
     session = await client.post("/api/v1/create_session", json={"sdk_version": "0.27.1"}, headers=_headers())
     session_id = session.json()["session_id"]
