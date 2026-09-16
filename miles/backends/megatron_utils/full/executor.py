@@ -223,6 +223,7 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
 
 def save_state(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str) -> None:
     """Megatron torch_dist checkpoint (model + optimizer) under ``path``; complete on return."""
+    _initialize_optimizer_state(optimizer)
     with inplace_modify_args(args, {"save": path, "async_save": False}):
         save(SAVE_ITERATION, model, optimizer, None)
     _barrier()
@@ -249,6 +250,8 @@ def load_state(
     if not load_optimizer:
         optimizer.reload_model_params()
         reset_optimizer_state(optimizer)
+    else:
+        _reset_unstepped_optimizer_state(optimizer)
     discard_grads(model, optimizer)
     _barrier()
 
@@ -268,8 +271,11 @@ def reset_to_base(args: Namespace, model: Sequence[DDP], optimizer: MegatronOpti
 
 def reset_optimizer_state(optimizer: MegatronOptimizer) -> None:
     """Zero Adam moments and step clocks in place (group-level FusedAdam or per-param torch Adam)."""
+    _initialize_optimizer_state(optimizer)
     for child in getattr(optimizer, "chained_optimizers", [optimizer]):
         inner = child.optimizer
+        if inner is None:
+            continue
         for group in inner.param_groups:
             if "step" in group:
                 group["step"] = _zeroed_step(group["step"])
@@ -279,6 +285,29 @@ def reset_optimizer_state(optimizer: MegatronOptimizer) -> None:
                     state[key].zero_()
             if "step" in state:
                 state["step"] = _zeroed_step(state["step"])
+
+
+def _initialize_optimizer_state(optimizer: MegatronOptimizer) -> None:
+    # FusedAdam allocates moments lazily. A checkpoint saved before its first
+    # step must contain real zero moments, not leave load-time empty buffers.
+    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
+        initialize = getattr(child, "init_state_fn", None)
+        if child.optimizer is not None and initialize is not None:
+            initialize(child.optimizer, child.config)
+
+
+def _reset_unstepped_optimizer_state(optimizer: MegatronOptimizer) -> None:
+    # Older pre-step checkpoints can restore uninitialized Adam moments. No
+    # step means there is no history to preserve. Trained optimizers retain it.
+    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
+        inner = child.optimizer
+        if inner is None:
+            continue
+        clocks = [group.get("step", 0) for group in inner.param_groups]
+        clocks.extend(state.get("step", 0) for state in inner.state.values())
+        if all(float(step) == 0 for step in clocks):
+            logger.info("Resetting unstepped Adam state after checkpoint load")
+            reset_optimizer_state(child)
 
 
 def _zeroed_step(step):

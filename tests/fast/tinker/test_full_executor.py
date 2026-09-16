@@ -277,6 +277,53 @@ def test_reset_optimizer_state_zeroes_moments_and_clocks(rig):
     assert optimizer.inner.param_groups[0]["step"] == 0
 
 
+def test_save_before_first_step_initializes_lazy_adam_moments(rig):
+    from collections import defaultdict
+
+    param = torch.ones(3)
+    optimizer = FakeOptimizer()
+    optimizer.inner.param_groups = [{"params": [param]}]
+    optimizer.inner.state = defaultdict(dict)
+    child = optimizer.chained_optimizers[0]
+
+    def initialize(inner, config):
+        for group in inner.param_groups:
+            for value in group["params"]:
+                if not inner.state[value]:
+                    inner.state[value] = {key: torch.zeros_like(value) for key in ("exp_avg", "exp_avg_sq")}
+
+    child.init_state_fn = initialize
+
+    def save(*args):
+        assert set(optimizer.inner.state[param]) == {"exp_avg", "exp_avg_sq"}
+        assert all(torch.count_nonzero(value) == 0 for value in optimizer.inner.state[param].values())
+        assert torch.equal(param, torch.ones(3))
+
+    rig.executor.save = save
+    rig.args.save, rig.args.async_save = "/native", True
+    rig.executor.save_state(rig.args, rig.model, optimizer, "/untrained")
+    assert optimizer.calls == [], "initialization must not run an optimizer step"
+
+
+@pytest.mark.parametrize("step", [None, 0, 7])
+def test_optimizer_restore_clears_only_unstepped_history(rig, step):
+    optimizer = FakeOptimizer()
+    if step is None:
+        optimizer.inner.param_groups[0].pop("step")
+        optimizer.inner.state["p"].pop("step")
+    else:
+        optimizer.inner.param_groups[0]["step"] = step
+        optimizer.inner.state["p"]["step"].fill_(step)
+    optimizer.inner.state["p"]["exp_avg_sq"].fill_(-1)
+    rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng, rig.args.ckpt_step = False, False, True, None
+    rig.executor.load_state(rig.args, rig.model, optimizer, "/checkpoint", load_optimizer=True)
+    state = optimizer.inner.state["p"]
+    if step in (None, 0):
+        assert state["exp_avg"].sum() == 0 and state["exp_avg_sq"].sum() == 0
+    else:
+        assert state["exp_avg"].sum() == 2 and state["exp_avg_sq"].sum() == -2
+
+
 def test_save_state_uses_a_temporary_synchronous_save_dir(rig):
     rig.args.save = "/native"
     rig.args.async_save = True
