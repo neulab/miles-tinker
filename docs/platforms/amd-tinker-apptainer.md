@@ -3,8 +3,8 @@
 For the MI350X startup command with explicit training, SGLang, checkpoint,
 and remote-access settings, use the [MI350X server configuration guide](mi350-tinker-server.md).
 For MI300X, use the [MI300X server configuration guide](mi300-tinker-server.md).
-For a fresh MI300 machine and the matched number-search client, use the
-[complete reproduction guide](mi300-fresh-machine.md).
+For MI300 number-search training from an existing `~/miles-tinker` checkout,
+use the [complete training guide](mi300-fresh-machine.md).
 The MI350 image pinned on this page contains architecture-specific gfx950
 kernels and must not be treated as a universal MI300/MI350 image.
 

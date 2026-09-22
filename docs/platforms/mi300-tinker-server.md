@@ -1,6 +1,7 @@
 # MI300X Tinker server: startup and training configuration
 
-For a fresh machine, follow the [complete setup and number-search commands](mi300-fresh-machine.md).
+To launch from an existing `~/miles-tinker` checkout, follow the
+[complete number-search training commands](mi300-fresh-machine.md).
 That guide pins the model/client revisions and reproduces the completed
 100-step MI350-matched run, including `max_staleness: 3`.
 
@@ -9,7 +10,7 @@ MI300X GPUs using Apptainer: four GPUs for Megatron full fine-tuning and four
 GPUs for SGLang inference. It is independent of the client plugin. The concrete
 model below is `Qwen/Qwen3-4B-Instruct-2507`.
 
-Run commands from `/home1/adityabs/miles-tinker` on branch `miles-tinker-amd`.
+Run commands from the existing `~/miles-tinker` checkout.
 Keep images, model downloads, environments, and server logs under `/tmp`.
 Choose persistent checkpoint storage with `--checkpoint-root`; the command
 below uses `/work1/grahamneubig/adityabs/miles-tinker/checkpoints`.
@@ -26,7 +27,7 @@ The launcher's original default image targets MI350 (`gfx950`). On MI300
 (`gfx942`), explicitly select the following image on **both setup and serve**:
 
 ```bash
-cd /home1/adityabs/miles-tinker
+cd ~/miles-tinker
 export MILES_AMD_IMAGE=docker://rlsys/miles@sha256:545241a0dbbf8543ef9a6c6d14313b45ba2e78b49ce1ff8370f2c7ab354180e3
 export CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
 export AITER_JIT_DIR=/tmp/miles-mi300-runtime/aiter-jit-bf16-rne
@@ -60,7 +61,7 @@ Set the two AITER environment variables below for training/inference logprob
 consistency on MI300; they apply independently of the model.
 
 ```bash
-cd /home1/adityabs/miles-tinker
+cd ~/miles-tinker
 export MILES_AMD_IMAGE=docker://rlsys/miles@sha256:545241a0dbbf8543ef9a6c6d14313b45ba2e78b49ce1ff8370f2c7ab354180e3
 export CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
 export AITER_JIT_DIR=/tmp/miles-mi300-runtime/aiter-jit-bf16-rne

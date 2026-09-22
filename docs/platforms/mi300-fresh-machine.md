@@ -1,103 +1,69 @@
-# Fresh-machine MI300 number-search reproduction
+# Launch MI300 number-search training from ~/miles-tinker
 
-This is the complete recipe for the MI300 run
+This guide assumes the Miles code is already set up at `~/miles-tinker` on
+an allocated eight-GPU MI300X host, with Python 3.9+ and Apptainer available.
+Start from that existing checkout; no clone, branch switch, or code transfer
+is needed. If the MI300 runtime is already provisioned, skip section 3.
+
+The commands reproduce the MI300 run
 [zsr75q6r](https://wandb.ai/9998_team/number-search-platoon-tinker/runs/zsr75q6r):
 100 optimizer updates, zero skipped updates, first-batch logprob mismatch
 0.0010036 and mean mismatch 0.0038031. The MI350 reference mean was 0.0041416.
 The training configuration matches the historical MI350 run; the two AITER
 variables below correct MI300's BF16 rounding. No model-specific patch is needed.
 
-## 1. Prepare the GPU host
+## 1. Use the existing checkout
 
-Use an allocated Linux x86-64 host with eight MI300X GPUs, a working AMD GPU
-driver, access to `/dev/kfd` and `/dev/dri`, Git, ripgrep, Python 3.9+ and Apptainer.
-The validated host used Rocky Linux 9 and Apptainer 1.4.5. The container
-provides the GPU Python libraries and ROCm userspace; do not install the
-trainer's Torch, SGLang, or Transformer Engine into the host Python.
-Allow at least 100 GiB free on local `/tmp` for setup and build caches, plus
-roughly 300 GiB on the checkpoint filesystem for this run's saved states.
-The Platoon client can run on a separate Linux x86-64 machine without a GPU.
-
-If Apptainer is already installed, skip installation. On Rocky/RHEL with
-administrator access:
+Run the server commands on the GPU host:
 
 ```bash
-sudo dnf install -y epel-release
-sudo dnf install -y apptainer git ripgrep python3 tmux
+cd ~/miles-tinker
 ```
 
-On Ubuntu with administrator access:
+The container provides the GPU Python libraries and ROCm userspace. Allow
+at least 100 GiB free on local `/tmp` for runtime assets and build caches,
+plus roughly 300 GiB on the checkpoint filesystem for this run's saved states.
+The Platoon client can run on a separate Linux x86-64 machine without a GPU;
+sections 5–8 cover that client and its training command.
 
-```bash
-sudo apt update
-sudo apt install -y software-properties-common git ripgrep python3 python3-venv tmux
-sudo add-apt-repository -y ppa:apptainer/ppa
-sudo apt update
-sudo apt install -y apptainer
-```
-
-These package commands follow the [Apptainer installation guide](https://apptainer.org/docs/admin/main/installation.html).
-On a managed cluster, use its installed Apptainer/module and GPU allocation.
-The host must permit Apptainer's user namespaces; see its installation guide
-if the container fails before Python starts.
-
-```bash
-apptainer --version
-python3 --version
-ls -l /dev/kfd /dev/dri
-```
-
-## 2. Get this Miles revision
-
-The checkout must include the commit containing this guide: it forwards the
-optional AITER variables through Apptainer's `--cleanenv`. Once that commit
-is available on the remote branch:
-
-```bash
-git clone --branch miles-tinker-amd https://github.com/neulab/miles-tinker.git /tmp/miles-tinker-amd
-cd /tmp/miles-tinker-amd
-git rev-parse HEAD
-```
-
-A local commit is not automatically published. To reproduce an unpublished
-commit, create a bundle in the original checkout and transfer it to the new
-GPU host instead:
-
-```bash
-# Original machine; replace MI300_HOST with the new allocated host.
-git -C /home1/adityabs/miles-tinker bundle create /tmp/miles-mi300-repro.bundle miles-tinker-amd
-scp /tmp/miles-mi300-repro.bundle MI300_HOST:/tmp/
-```
-
-Then use this clone command on the new host in place of the GitHub clone:
-
-```bash
-git clone --branch miles-tinker-amd /tmp/miles-mi300-repro.bundle /tmp/miles-tinker-amd
-cd /tmp/miles-tinker-amd
-```
-
-Use an unused checkout/runtime directory for a fresh trial. Do not copy the
-old `/tmp/miles-mi300-runtime` tree or its compiled kernels to the new host.
-
-## 3. Set the MI300 environment and provision
+## 2. Set the MI300 environment
 
 Run on the GPU host. Keep this environment file and source it again in every
-new server shell. Change `MILES_CHECKPOINT_ROOT` to a writable filesystem with
-the capacity described above; the default below is persistent under your home
-and may need changing if your home quota is small.
+new server shell. Checkpoints use the existing `/work1` location below.
+Check available quota before launching: this run needs roughly 300 GiB.
+The home-directory quota on this host is only 24 GiB; keep checkpoints out
+of `$HOME`. If `/work1` lacks capacity, select another checkpoint filesystem
+with enough space before launching.
 
 ```bash
-mkdir -p /tmp/miles-mi300-runtime
+mkdir -p /tmp/miles-mi300-runtime/logs
 cat > /tmp/miles-mi300-runtime/mi300.env <<'ENV'
 export MILES_AMD_IMAGE=docker://rlsys/miles@sha256:545241a0dbbf8543ef9a6c6d14313b45ba2e78b49ce1ff8370f2c7ab354180e3
 export CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
 export AITER_JIT_DIR=/tmp/miles-mi300-runtime/aiter-jit-bf16-rne
-export MILES_CHECKPOINT_ROOT="$HOME/miles-mi300-checkpoints"
+export MILES_CHECKPOINT_ROOT=/work1/grahamneubig/adityabs/miles-tinker/checkpoints
 ENV
 source /tmp/miles-mi300-runtime/mi300.env
 mkdir -p "$MILES_CHECKPOINT_ROOT"
-cd /tmp/miles-tinker-amd
+df -h "$MILES_CHECKPOINT_ROOT"
+```
 
+`CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0` requests round-to-nearest-even instead
+of the pinned build's default truncation. The separate `AITER_JIT_DIR` makes
+the first invocation compile the kernels with that setting. AITER does not
+invalidate an existing binary when compiler flags change. Use a fresh cache
+directory when first enabling this fix; subsequent launches can reuse that
+corrected cache.
+
+## 3. Provision the runtime, if needed
+
+Skip this section if `/tmp/miles-mi300-runtime` is already provisioned with
+the image and model snapshot below for `~/miles-tinker`. This step prepares
+container dependencies and model weights for the existing checkout.
+
+```bash
+cd ~/miles-tinker
+source /tmp/miles-mi300-runtime/mi300.env
 python3 tools/amd_tinker.py setup \
   --root /tmp/miles-mi300-runtime \
   --image-uri "$MILES_AMD_IMAGE" --image-workspace /app \
@@ -116,23 +82,18 @@ Do not substitute the default MI350 image: some of its compiled libraries
 target only `gfx950`. The doctor should report eight GPUs, `gfx942`, and
 successful matmul/MFU checks.
 
-`CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0` requests round-to-nearest-even instead
-of the pinned build's default truncation. The separate `AITER_JIT_DIR` makes
-the first invocation compile the kernels with that setting. AITER does not
-invalidate an existing binary when compiler flags change. This fresh cache
-also handles images that already contain precompiled kernels; no cache
-removal or kernel source edits are required.
-
 ## 4. Start the MI300 server
 
 Run in a persistent shell, for example `tmux new -s miles-mi300`. This uses
 four training GPUs and four TP1 inference engines, matching the historical
-MI350 run rather than the different topology of its later job.
+MI350 run. `--modal-relay` exposes the backend through a public Modal HTTPS
+endpoint. The launch uses the existing `neulab` Modal profile; select your
+authenticated profile if different.
 
 ```bash
-cd /tmp/miles-tinker-amd
+cd ~/miles-tinker
 source /tmp/miles-mi300-runtime/mi300.env
-python3 tools/amd_tinker.py serve \
+MODAL_PROFILE=neulab python3 tools/amd_tinker.py serve \
   --root /tmp/miles-mi300-runtime \
   --checkpoint-root "$MILES_CHECKPOINT_ROOT" \
   --image-uri "$MILES_AMD_IMAGE" --image-workspace /app \
@@ -140,6 +101,7 @@ python3 tools/amd_tinker.py serve \
   --tp 1 --pp 1 --cp 1 \
   --context-length 65000 --max-tokens-per-gpu 65000 \
   --mem-fraction 0.9 --peak-tflops 1307.4 --port 10613 \
+  --modal-relay \
   -- \
   --seed 42 --bf16 \
   --optimizer adam --lr 1e-6 --lr-decay-style constant \
@@ -168,30 +130,27 @@ The initial weight comparison should report no mismatches. SGLang still uses
 AITER attention; the trainer uses TE FlashAttention. No additional attention,
 KV-cache, graph, or sampling-backend override is part of this recipe.
 
-## 5. Connect the client
+## 5. Get the Modal URL and API key
 
-For a separate client such as `babel-compute-node`, run this in another
-persistent shell on the GPU host. Replace that SSH alias with your client
-host if necessary:
+After the relay starts, run this in another shell on the GPU host:
 
 ```bash
-ssh -NT -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -R 127.0.0.1:11613:127.0.0.1:10613 babel-compute-node
-```
-
-Keep that SSH connection alive. On the client host:
-
-```bash
-export TINKER_BASE_URL=http://127.0.0.1:11613
-export TINKER_API_KEY=tml-local-mi300-diagnostic
+export TINKER_BASE_URL="$(python3 -c 'import json; print(json.load(open("/tmp/miles-mi300-runtime/runtime/modal-relay.json"))["url"])')"
+export TINKER_API_KEY="$(cat /tmp/miles-mi300-runtime/runtime/public-api-key)"
 export TINKER_TELEMETRY=0
-curl --fail "$TINKER_BASE_URL/health"
+curl --fail -H "X-API-Key: $TINKER_API_KEY" "$TINKER_BASE_URL/health"
 ```
 
-The key above is a local tenant identifier for this direct gateway, not a
-hosted Tinker credential. This recipe uses an SSH tunnel without Modal.
-If the client runs on the GPU host itself, omit the tunnel, use port 10613
-in `TINKER_BASE_URL`, and change the YAML's `tinker_base_url` accordingly.
+For a remote client, copy these two values privately into its shell as
+`TINKER_BASE_URL` and `TINKER_API_KEY`. The launcher also prints both assignments
+in `/tmp/miles-mi300-runtime/logs/server.log`. The API key is the generated
+relay credential; use that value for the Modal endpoint. No separate SSH
+tunnel from the GPU host to the client is needed.
+
+The URL is generated at launch and changes when the relay is recreated.
+`modal-relay.json` is removed when the relay shuts down. The key file persists
+across relay restarts. Set both client variables before generating the YAML
+in section 7; that step writes the same URL into `tinker_base_url`.
 
 ## 6. Install the pinned number-search client
 
@@ -254,7 +213,8 @@ from the reference; training settings are the same, including
 
 ```bash
 cd /tmp/platoon-mi300-match
-cat > mi350-matched.yaml <<'YAML'
+: "${TINKER_BASE_URL:?Set the Modal URL from section 5 first}"
+cat > mi350-matched.yaml <<YAML
 eval:
   every: 100000
   strategy: step
@@ -364,21 +324,22 @@ environments:
   eval_dataset_loader: null
   eval_workflow_kwargs: {}
   discover_entry_points: false
-tinker_base_url: http://127.0.0.1:11613
+tinker_base_url: ${TINKER_BASE_URL}
 YAML
 ```
 
 ## 8. Run and check the result
 
-Keep the client in a persistent shell as well. Log in to your own W&B account
+Use the client shell with the Modal URL and API key from section 5, and keep
+it in a persistent session. Log in to your own W&B account
 or provide its existing `WANDB_API_KEY`. Adjust `WANDB_ENTITY` if you are
 using a different team.
 
 ```bash
 cd /tmp/platoon-mi300-match
 source .venv/bin/activate
-export TINKER_BASE_URL=http://127.0.0.1:11613
-export TINKER_API_KEY=tml-local-mi300-diagnostic
+: "${TINKER_BASE_URL:?Set the Modal URL from section 5 first}"
+: "${TINKER_API_KEY:?Set the Modal API key from section 5 first}"
 export TINKER_TELEMETRY=0
 export WANDB_ENTITY=9998_team
 export PYTHONUNBUFFERED=1
@@ -414,15 +375,14 @@ individual maximum-length sequence.
 After the client finishes, run on the MI300 host:
 
 ```bash
-cd /tmp/miles-tinker-amd
+cd ~/miles-tinker
 python3 tools/amd_tinker.py stop --root /tmp/miles-mi300-runtime
 ```
 
-Stop the dedicated SSH tunnel with Ctrl-C in its shell. This retains the
-runtime files and checkpoints. Run these commands only on the MI300 host;
-there is no step that starts, stops, or modifies the MI350 job.
+The launcher cleans up its Modal relay when it exits. Runtime files and
+checkpoints are retained.
 
 The full numerical investigation is in
 [MI300 logprob investigation](mi300-logprob-investigation.md). This guide
-records the validated stack and checks its commands/configuration; the user
-will perform the independent clean-machine reproduction.
+records the validated stack and commands for launching a new run from the
+existing checkout.

@@ -156,7 +156,7 @@ run after excluding the rollout artifact directory.
 
 The MI300 server and its dedicated SSH tunnel were subsequently stopped at
 the user's request. Checkpoints and evidence were retained. The
-[fresh-machine guide](mi300-fresh-machine.md) contains the complete commands
+[training guide](mi300-fresh-machine.md) contains the complete commands
 for an independent reproduction.
 
 - MI300 setup: `/tmp/miles-mi300-runtime`, image digest
