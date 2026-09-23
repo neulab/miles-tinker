@@ -10,7 +10,7 @@ validation; see [implementation notes](mi350-tinker-changes.md).
 ```bash
 cd ~/miles-tinker
 export MILES_AMD_ROOT=/tmp/miles-tinker-rocm720
-export MILES_AMD_CHECKPOINTS="$HOME/miles-tinker-checkpoints/qwen3-4b-instruct"
+export MILES_AMD_CHECKPOINTS="${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints/qwen3-4b-instruct"
 unset APPTAINER_BINDPATH APPTAINER_BIND
 
 python3 tools/amd_tinker.py setup \
@@ -23,8 +23,9 @@ python3 -m venv "$MILES_AMD_ROOT/modal-venv"
 "$MILES_AMD_ROOT/modal-venv/bin/modal" setup
 ```
 
-Choose your Modal workspace during authentication. Keep checkpoints on persistent
-storage; edit `MILES_AMD_CHECKPOINTS` above if needed.
+Choose your Modal workspace during authentication. `WORK` should point to your
+persistent work directory, for example `/work1/grahamneubig/adityabs`. Checkpoints
+then go under `/work1/grahamneubig/adityabs/miles-tinker/checkpoints/`.
 
 ## Start
 
@@ -80,6 +81,6 @@ checkpoint across this checkpoint root:
 
 ```bash
 python3 tools/amd_tinker.py prune \
-  --checkpoint-root "$HOME/miles-tinker-checkpoints/qwen3-4b-instruct" \
+  --checkpoint-root "${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints/qwen3-4b-instruct" \
   --keep 1 --once
 ```
