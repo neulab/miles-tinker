@@ -43,11 +43,11 @@ use the latest pushed weights; they are not immutable evaluation snapshots.
 ## Qwen3.5: small additional setup
 
 The existing text-only `Qwen/Qwen3.5-4B` path needs a one-time conversion from HF
-weights to a Megatron checkpoint. Use a separate runtime/checkpoint directory,
-select `--model-id Qwen/Qwen3.5-4B --model-type qwen3.5-4B` for setup, conversion,
-and serving, and run the launcher's `convert` action after `setup`.
-The validated HF revision is `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`;
-pass it with `--revision` during setup.
+weights to a Megatron checkpoint. Select
+`--model-id Qwen/Qwen3.5-4B --model-type qwen3.5-4B` for setup, conversion,
+and serving, and run the launcher's `convert` action after `setup`. The
+[Qwen3.5 commands](mi350-tinker-server.md#qwen35-4b) cover a fresh deployment
+without pinning a model revision.
 
 The launcher automatically selects the existing raw text-only model definition
 and converted checkpoint for that model type. No extra FLA, Triton, AITER, or
@@ -68,9 +68,8 @@ logprob error, and a separate completed five-update workload. That workload
 also recorded one context-limit error. These results do not establish long-run
 stability or larger context windows.
 
-Qwen3-4B-Instruct worked on the older image; the commands on this branch still
-await validation on the pinned image. The simplified launcher and the combined
-new-image/Modal path also await an eight-GPU run. Acceptance should cover
-sampling, training, inference weight refresh, checkpoint save/reload, and a
-request through the public relay. Legacy recipes and experiment notes are
-preserved in git at `847662ec`.
+Qwen3-4B-Instruct and Qwen3.5-4B have also run training on this branch with the
+pinned image and Modal relay on an eight-GPU MI350 node, using one training
+GPU and two inference GPUs. This validates the training path, not every
+checkpoint-resume scenario. Legacy recipes and experiment notes are preserved
+in git at `847662ec`.
