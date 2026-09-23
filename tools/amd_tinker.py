@@ -62,6 +62,7 @@ class BackendConfig:
     mem_fraction: float = 0.70
     image_uri: str = IMAGE_URI
     image_workspace: str = "/sgl-workspace"
+    preserve_image_packages: bool = False
     modal_relay: bool = False
     checkpoint_root: Path | None = None
 
@@ -222,11 +223,18 @@ pth.write_text(f'import site; site.addsitedir("/opt/venv/lib/python{version}/sit
     _run(config, _container_command(config, [config.python, "-c", pth_code, config.root]))
     pip = [config.python, "-m", "pip", "install"]
     _run(config, _container_command(config, [*pip, "--no-deps", "--no-build-isolation", "-e", config.repo]))
-    _run(config, _container_command(config, [*pip, *OVERLAY_PACKAGES]))
-    _run(config, _container_command(config, [*pip, "--no-deps", "nvidia-modelopt==0.44.0"]))
+    if config.preserve_image_packages:
+        # Keep the image's tested Torch/ROCm/Ray/ModelOpt stack. Unversioned
+        # requests without --upgrade retain installed packages; --no-deps
+        # prevents resolver changes to the image's native dependency stack.
+        packages = [package.split("==", 1)[0] for package in OVERLAY_PACKAGES]
+        _run(config, _container_command(config, [*pip, "--no-deps", *packages]))
+    else:
+        _run(config, _container_command(config, [*pip, *OVERLAY_PACKAGES]))
+        _run(config, _container_command(config, [*pip, "--no-deps", "nvidia-modelopt==0.44.0"]))
     _run(config, _container_command(config, [*pip, "--ignore-requires-python", "--no-deps", "tinker==0.27.1"]))
     # Preserve the tested dependency stack in the original MI350 image.
-    if config.image_uri != IMAGE_URI:
+    if config.image_uri != IMAGE_URI and not config.preserve_image_packages:
         _run(config, _container_command(config, [*pip, *IMAGE_COMPAT_PACKAGES]))
         _ensure_bridge(config)
         _ensure_sglang(config)
@@ -237,6 +245,49 @@ pth.write_text(f'import site; site.addsitedir("/opt/venv/lib/python{version}/sit
             config, [config.python, "-c", download, config.model_id, config.revision, config.model_path]
         ),
     )
+
+
+def _convert(config):
+    output = config.model_path.with_name(f"{config.model_path.name}_torch_dist")
+    marker = output / "latest_checkpointed_iteration.txt"
+    if marker.exists() and marker.read_text().strip() == "release":
+        print(f"Reusing converted checkpoint: {output}")
+        return
+    if output.exists():
+        raise ValueError(f"Incomplete conversion at {output}; move it aside before retrying")
+    code = """import runpy, shlex, sys
+from miles.utils.external_utils.model_args_utils import load_model_args
+model_type, checkpoint, output, context = sys.argv[1:]
+sys.argv = [
+    'tools/convert_hf_to_torch_dist.py', *shlex.split(load_model_args(model_type)),
+    '--hf-checkpoint', checkpoint, '--save', output,
+    '--bf16', '--seq-length', context, '--max-position-embeddings', '262144',
+    '--attention-backend', 'flash',
+]
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+    _run(
+        config,
+        _container_command(
+            config,
+            [
+                "env",
+                "HIP_VISIBLE_DEVICES=0",
+                "WORLD_SIZE=1",
+                "RANK=0",
+                "LOCAL_RANK=0",
+                config.python,
+                "-c",
+                code,
+                config.model_type,
+                config.model_path,
+                output,
+                config.context_length,
+            ],
+        ),
+    )
+    if not marker.exists() or marker.read_text().strip() != "release":
+        raise RuntimeError(f"Conversion did not finish: {output}")
 
 
 def _ensure_bridge(config):
@@ -537,7 +588,7 @@ def _stop(config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("setup", "serve", "doctor", "stop", "prune", "tunnel"))
+    parser.add_argument("action", choices=("setup", "convert", "serve", "doctor", "stop", "prune", "tunnel"))
     parser.add_argument("--root", type=Path, default=Path("/tmp/miles-tinker-work"))
     parser.add_argument(
         "--checkpoint-root",
@@ -551,6 +602,11 @@ def main():
         "--image-workspace",
         default="/sgl-workspace",
         help="Dependency source directory inside the image (/app for older MI300 images)",
+    )
+    parser.add_argument(
+        "--preserve-image-packages",
+        action="store_true",
+        help="Retain native image package versions and skip Bridge/SGLang compatibility replacements during setup",
     )
     parser.add_argument(
         "--modal-relay",
@@ -617,7 +673,7 @@ def main():
             ],
         )
     else:
-        {"setup": _setup, "doctor": _doctor, "stop": _stop}[args.action](config)
+        {"setup": _setup, "convert": _convert, "doctor": _doctor, "stop": _stop}[args.action](config)
 
 
 if __name__ == "__main__":

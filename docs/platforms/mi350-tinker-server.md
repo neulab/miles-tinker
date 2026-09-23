@@ -18,6 +18,9 @@ hash of the resolved runtime root rather than a PID. Its session logs are at
 own timestamp/PID session name; the short base keeps Unix socket paths within
 Linux's 107-byte limit.
 
+For the newer ROCm 7.2 image and Qwen3.5-4B setup, see
+[Qwen3.5 on the ROCm 7.2 Miles image](mi350-qwen35-rocm720-image.md).
+
 ## 1. Provision the architecture-matched image
 
 The launcher's default image targets MI350 (`gfx950`). The commands explicitly

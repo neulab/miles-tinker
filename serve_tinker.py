@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 async def serve(args):
     train_mode = args.tinker_train_mode
     assert train_mode == "full" or args.multi_lora, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
+    max_tokens_per_datum = args.sglang_context_length if args.sglang_context_length is not None else 32768
+    if max_tokens_per_datum <= 0:
+        raise ValueError("--sglang-context-length must be positive")
     configure_logger(args, source=MainProcessIdentity())
 
     # no RolloutExecutor here; the gateway posts /generate itself
@@ -57,7 +60,7 @@ async def serve(args):
         # full fine-tuning: one tenant, slot 0 is the base model
         n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
         checkpoint_root=checkpoint_root,
-        max_tokens_per_datum=45000,
+        max_tokens_per_datum=max_tokens_per_datum,
         lora_alpha=args.lora_alpha if train_mode == "lora" else None,
         lease_timeout_s=args.tinker_lease_timeout_s,
         unit_token_budget=args.tinker_unit_token_budget,

@@ -8,7 +8,37 @@ from pathlib import Path
 
 import pytest
 
+import tools.amd_tinker as amd_tinker
 from tools.amd_tinker import BackendConfig, _container_command, _prune, _runtime_env, _server_args
+
+
+@pytest.mark.parametrize("preserve_image_packages", [False, True])
+def test_setup_can_retain_native_image_stack(tmp_path, monkeypatch, preserve_image_packages):
+    config = BackendConfig(
+        root=tmp_path,
+        image_uri="docker://rocm/sgl-dev:native-test",
+        preserve_image_packages=preserve_image_packages,
+    )
+    config.image.parent.mkdir(parents=True)
+    config.image.touch()
+    (config.root / "deps/aiter").mkdir(parents=True)
+    commands, replacements = [], []
+    monkeypatch.setattr(amd_tinker, "_run", lambda config, command: commands.append(list(map(str, command))))
+    monkeypatch.setattr(amd_tinker, "_ensure_bridge", lambda config: replacements.append("bridge"))
+    monkeypatch.setattr(amd_tinker, "_ensure_sglang", lambda config: replacements.append("sglang"))
+
+    amd_tinker._setup(config)
+
+    installs = [command[command.index("install") + 1 :] for command in commands if "install" in command]
+    assert any("tinker==0.27.1" in args for args in installs)
+    if preserve_image_packages:
+        assert replacements == []
+        assert not any("nvidia-modelopt==0.44.0" in args or "ray[default]==2.56.0" in args for args in installs)
+        assert any("ray[default]" in args and "--no-deps" in args for args in installs)
+    else:
+        assert replacements == ["bridge", "sglang"]
+        assert any("nvidia-modelopt==0.44.0" in args for args in installs)
+        assert any("ray[default]==2.56.0" in args for args in installs)
 
 
 def test_relocated_backend_preserves_paths_and_explicit_mfu(tmp_path):
@@ -22,6 +52,31 @@ def test_relocated_backend_preserves_paths_and_explicit_mfu(tmp_path):
     assert "--rocm" in command
     assert command[-3:] == [str(config.python), "-c", "pass"]
     assert _runtime_env(config)["MILES_SGLANG_LEGACY_WEIGHT_UPDATE"] == "1"
+
+
+def test_convert_runs_in_image_and_reuses_completed_checkpoint(tmp_path, monkeypatch):
+    config = BackendConfig(root=tmp_path, model_id="Qwen/Qwen3.5-4B", model_type="qwen3.5-4B")
+    output = config.root / "models/Qwen3.5-4B_torch_dist"
+    commands = []
+
+    def run(config, command):
+        commands.append(list(map(str, command)))
+        output.mkdir(parents=True)
+        (output / "latest_checkpointed_iteration.txt").write_text("release")
+
+    monkeypatch.setattr(amd_tinker, "_run", run)
+    amd_tinker._convert(config)
+    amd_tinker._convert(config)
+    assert len(commands) == 1
+    assert commands[0][-4:] == [config.model_type, str(config.model_path), str(output), str(config.context_length)]
+    assert str(config.image) in commands[0]
+
+
+def test_convert_rejects_incomplete_output(tmp_path):
+    config = BackendConfig(root=tmp_path, model_id="Qwen/Qwen3.5-4B", model_type="qwen3.5-4B")
+    (config.root / "models/Qwen3.5-4B_torch_dist").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Incomplete conversion"):
+        amd_tinker._convert(config)
 
 
 def test_custom_architecture_image_and_external_checkout(tmp_path):

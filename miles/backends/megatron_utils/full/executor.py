@@ -196,7 +196,11 @@ def _rocm_checkpoint_writer():
         return
     from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 
-    original = FileSystemWriterAsync.write_preloaded_data_multiproc
+    original = getattr(FileSystemWriterAsync, "write_preloaded_data_multiproc", None)
+    if original is None:
+        # Newer Megatron uses threads rather than forked ROCm buffer writers.
+        yield
+        return
 
     def write_in_process(transform_list, use_msc, rank, write_buckets, global_results_queue):
         results, pending = queue.Queue(), queue.Queue()

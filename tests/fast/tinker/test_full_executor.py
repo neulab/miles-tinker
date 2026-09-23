@@ -80,6 +80,7 @@ def _module(name: str, **attrs) -> types.ModuleType:
 @pytest.fixture
 def rig(monkeypatch):
     """Import the executor against stubs and expose the calls it makes."""
+    monkeypatch.setattr(torch.version, "hip", None)
     log: list[str] = []
     config = SimpleNamespace(finalize_model_grads_func=None)
 
@@ -242,6 +243,20 @@ def test_save_state_uses_a_temporary_synchronous_save_dir(rig):
     rig.executor.save_state(rig.args, rig.model, FakeOptimizer(), "/ckpt/weights/step-1")
     assert rig.log == [f"save:{rig.executor.SAVE_ITERATION}"]
     assert (rig.args.save, rig.args.async_save) == ("/native", True), "args restored after the save"
+
+
+def test_rocm_save_retains_native_threaded_writer(rig, monkeypatch):
+    rig.args.save, rig.args.async_save = "/native", True
+    writer = SimpleNamespace(write_preloaded_data_multithread=object())
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.dist_checkpointing.strategies.filesystem_async",
+        _module("filesystem_async", FileSystemWriterAsync=writer),
+    )
+    rig.executor.save_state(rig.args, rig.model, FakeOptimizer(), "/ckpt/threaded")
+    assert rig.log == [f"save:{rig.executor.SAVE_ITERATION}"]
+    assert not hasattr(writer, "write_preloaded_data_multiproc")
 
 
 def test_load_state_without_optimizer_gives_a_fresh_optimizer(rig):
