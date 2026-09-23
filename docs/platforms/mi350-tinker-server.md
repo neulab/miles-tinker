@@ -1,4 +1,4 @@
-# Qwen3-4B-Instruct Tinker endpoint on MI350
+# Tinker endpoint on MI350
 
 Run on an eight-GPU MI350 node with Apptainer, Python 3.9+, SSH, and internet
 access. These commands use four training GPUs and four inference GPUs. The
@@ -10,7 +10,7 @@ validation; see [implementation notes](mi350-tinker-changes.md).
 ```bash
 cd ~/miles-tinker
 export MILES_AMD_ROOT=/tmp/miles-tinker-rocm720
-export MILES_AMD_CHECKPOINTS="${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints/qwen3-4b-instruct"
+export MILES_AMD_CHECKPOINTS="${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints"
 unset APPTAINER_BINDPATH APPTAINER_BIND
 
 python3 tools/amd_tinker.py setup \
@@ -81,6 +81,6 @@ checkpoint across this checkpoint root:
 
 ```bash
 python3 tools/amd_tinker.py prune \
-  --checkpoint-root "${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints/qwen3-4b-instruct" \
+  --checkpoint-root "${WORK:?Set WORK to your persistent work directory}/miles-tinker/checkpoints" \
   --keep 1 --once
 ```
