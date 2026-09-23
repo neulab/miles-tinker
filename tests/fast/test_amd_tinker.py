@@ -12,33 +12,22 @@ import tools.amd_tinker as amd_tinker
 from tools.amd_tinker import BackendConfig, _container_command, _prune, _runtime_env, _server_args
 
 
-@pytest.mark.parametrize("preserve_image_packages", [False, True])
-def test_setup_can_retain_native_image_stack(tmp_path, monkeypatch, preserve_image_packages):
-    config = BackendConfig(
-        root=tmp_path,
-        image_uri="docker://rocm/sgl-dev:native-test",
-        preserve_image_packages=preserve_image_packages,
-    )
+def test_setup_retains_native_image_stack(tmp_path, monkeypatch):
+    config = BackendConfig(root=tmp_path)
     config.image.parent.mkdir(parents=True)
     config.image.touch()
     (config.root / "deps/aiter").mkdir(parents=True)
-    commands, replacements = [], []
+    commands = []
     monkeypatch.setattr(amd_tinker, "_run", lambda config, command: commands.append(list(map(str, command))))
-    monkeypatch.setattr(amd_tinker, "_ensure_bridge", lambda config: replacements.append("bridge"))
-    monkeypatch.setattr(amd_tinker, "_ensure_sglang", lambda config: replacements.append("sglang"))
 
     amd_tinker._setup(config)
 
     installs = [command[command.index("install") + 1 :] for command in commands if "install" in command]
     assert any("tinker==0.27.1" in args for args in installs)
-    if preserve_image_packages:
-        assert replacements == []
-        assert not any("nvidia-modelopt==0.44.0" in args or "ray[default]==2.56.0" in args for args in installs)
-        assert any("ray[default]" in args and "--no-deps" in args for args in installs)
-    else:
-        assert replacements == ["bridge", "sglang"]
-        assert any("nvidia-modelopt==0.44.0" in args for args in installs)
-        assert any("ray[default]==2.56.0" in args for args in installs)
+    assert all("--no-deps" in args for args in installs)
+    assert not any("nvidia-modelopt==0.44.0" in args or "ray[default]==2.56.0" in args for args in installs)
+    assert any("ray[default]" in args for args in installs)
+    assert not any("git" in command for command in commands)
 
 
 def test_relocated_backend_preserves_paths_and_explicit_mfu(tmp_path):
@@ -51,7 +40,7 @@ def test_relocated_backend_preserves_paths_and_explicit_mfu(tmp_path):
     command = _container_command(config, [config.python, "-c", "pass"])
     assert "--rocm" in command
     assert command[-3:] == [str(config.python), "-c", "pass"]
-    assert _runtime_env(config)["MILES_SGLANG_LEGACY_WEIGHT_UPDATE"] == "1"
+    assert "MILES_SGLANG_LEGACY_WEIGHT_UPDATE" not in _runtime_env(config)
 
 
 def test_convert_runs_in_image_and_reuses_completed_checkpoint(tmp_path, monkeypatch):
@@ -79,12 +68,12 @@ def test_convert_rejects_incomplete_output(tmp_path):
         amd_tinker._convert(config)
 
 
-def test_custom_architecture_image_and_external_checkout(tmp_path):
-    config = BackendConfig(root=tmp_path, repo=Path("/work/miles"), image_uri="docker://rlsys/miles:MI300-latest")
+def test_pinned_image_and_external_checkout(tmp_path):
+    config = BackendConfig(root=tmp_path, repo=Path("/work/miles"))
     command = _container_command(config, [config.python, "-c", "pass"])
     assert "/work/miles:/work/miles" in command
     assert str(config.image) in command
-    assert config.image != BackendConfig(root=tmp_path).image
+    assert config.image == BackendConfig(root=tmp_path).image
     assert _runtime_env(config)["PYTHONPATH"].startswith("/work/miles:")
 
 
@@ -164,3 +153,18 @@ def test_pruner_preserves_newest_complete_and_incomplete_saves(tmp_path, externa
     assert not (base / "old").exists()
     assert (base / "new/tinker_meta.json").exists()
     assert (base / "incomplete").exists()
+
+
+def test_new_image_launch_defaults_and_context_override(tmp_path):
+    args = _server_args(BackendConfig(root=tmp_path, context_length=65000))
+    assert args[args.index("--sglang-context-length") + 1] == "65000"
+    assert args[args.index("--sglang-device") + 1] == "cuda"
+    assert args[args.index("--megatron-to-hf-mode") + 1] == "bridge"
+    assert "--ref-load" not in args
+
+
+def test_qwen35_selects_converted_text_model(tmp_path):
+    config = BackendConfig(root=tmp_path, model_id="Qwen/Qwen3.5-4B", model_type="qwen3.5-4B")
+    args = _server_args(config)
+    assert args[args.index("--megatron-to-hf-mode") + 1] == "raw"
+    assert args[args.index("--ref-load") + 1] == str(config.model_path.with_name("Qwen3.5-4B_torch_dist"))

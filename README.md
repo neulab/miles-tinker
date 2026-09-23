@@ -6,6 +6,8 @@
 > built on. Every fork change is listed in [FORK.md](FORK.md); sync with
 > `tools/fork/upstream_sync.py` (or the `upstream-sync` skill). Upstream's README follows.
 
+AMD MI350 Tinker endpoint: [Qwen3-4B-Instruct commands](docs/platforms/mi350-tinker-server.md) · [implementation notes](docs/platforms/mi350-tinker-changes.md)
+
 <div align="center">
 
 <img src="https://raw.githubusercontent.com/radixark/miles/main/docs/assets/images/brand/miles_logo.png" alt="Miles Logo" width="340">

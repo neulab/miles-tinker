@@ -22,21 +22,12 @@ versions of SGLang, Megatron-LM, and a few CUDA kernels.
     ```
 
   </Tab>
-  <Tab title="AMD MI300X / MI350X">
+  <Tab title="AMD MI350X">
 
-    For the experimental Tinker backend on MI350X without Docker, see the
-    [Apptainer setup and reproduction guide](../platforms/amd-tinker-apptainer.md).
-
-    ```bash
-    docker pull rlsys/miles:MI350-355-latest    # or MI300-latest
-
-    docker run --rm \
-      --device /dev/dri --device /dev/kfd \
-      --group-add video --ipc=host --shm-size=32g \
-      --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-      --privileged \
-      -it rlsys/miles:MI350-355-latest /bin/bash
-    ```
+    For the Tinker endpoint on this branch, follow the
+    [Qwen3-4B-Instruct commands](../platforms/mi350-tinker-server.md).
+    The launcher provisions the pinned ROCm 7.2 image with Apptainer.
+    See [implementation notes](../platforms/mi350-tinker-changes.md) for the scope.
 
   </Tab>
 

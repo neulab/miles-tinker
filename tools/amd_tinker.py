@@ -5,7 +5,7 @@ Ray lifecycle differs from execute_train's one-shot training jobs. GPU packages
 and model definitions are imported only inside the image.
 
 Example: python3 tools/amd_tinker.py serve --dry-run
-See docs/platforms/amd-tinker-apptainer.md for setup and reproduction.
+See docs/platforms/mi350-tinker-server.md for setup and client connection commands.
 """
 
 from __future__ import annotations
@@ -24,27 +24,27 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-IMAGE_URI = "docker://rlsys/miles@sha256:e60a69faa831ae2a146819290e8469cf23c81b97febeaf5d11e8baec2bfca285"
+# rocm/sgl-dev:miles-rocm720-mi35x-20260914, validated with Qwen3.5-4B.
+IMAGE_URI = "docker://rocm/sgl-dev@sha256:f37c0e4d76f64185fe61c2a4362ae96f121d299f113319098c21f2e298afe185"
+DEFAULT_ROOT = Path("/tmp/miles-tinker-rocm720")
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_REVISION = "main"
-BRIDGE_REVISION = "3fd3768045422d0aa5c97e90a4e6c659aea9acb9"
-SGLANG_REVISION = "a929eb72882a8c47478de4d1eefd4a8ebb0716ff"
+# Install missing gateway dependencies without replacing the image's native stack.
 OVERLAY_PACKAGES = (
-    "ray[default]==2.56.0",
-    "blake3==1.0.9",
-    "xxhash==3.7.1",
-    "zstandard==0.25.0",
-    "polars==1.42.1",
-    "safetensors==0.8.0",
-    "psycopg[binary]==3.3.5",
-    "backports.strenum==1.3.1",
+    "ray[default]",
+    "blake3",
+    "xxhash",
+    "zstandard",
+    "polars",
+    "safetensors",
+    "psycopg[binary]",
+    "backports.strenum",
 )
-IMAGE_COMPAT_PACKAGES = ("pylatexenc==2.10", "apache-tvm-ffi==0.1.13.post3")
 
 
 @dataclass(frozen=True)
 class BackendConfig:
-    root: Path = Path("/tmp/miles-tinker-work")
+    root: Path = DEFAULT_ROOT
     repo: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
     model_id: str = DEFAULT_MODEL
     revision: str = DEFAULT_REVISION
@@ -60,9 +60,6 @@ class BackendConfig:
     max_tokens_per_gpu: int = 16384
     context_length: int = 32768
     mem_fraction: float = 0.70
-    image_uri: str = IMAGE_URI
-    image_workspace: str = "/sgl-workspace"
-    preserve_image_packages: bool = False
     modal_relay: bool = False
     checkpoint_root: Path | None = None
 
@@ -86,9 +83,8 @@ class BackendConfig:
 
     @property
     def image(self):
-        image_id = hashlib.sha256(self.image_uri.encode()).hexdigest()[:12]
-        filename = "miles-mi350.sif" if self.image_uri == IMAGE_URI else f"miles-{image_id}.sif"
-        return self.root / "images" / filename
+        image_id = hashlib.sha256(IMAGE_URI.encode()).hexdigest()[:12]
+        return self.root / "images" / f"miles-{image_id}.sif"
 
     @property
     def python(self):
@@ -114,15 +110,12 @@ def _runtime_env(config):
     # Ray appends its own timestamp/PID session name. Keep the base short enough
     # for Unix socket paths even with long deployment roots and large PIDs.
     runtime_id = hashlib.sha256(str(root).encode()).hexdigest()[:12]
-    megatron_path = "/root/Megatron-LM"
-    if config.image_uri != IMAGE_URI:
-        megatron_path = f"{config.image_workspace}/Megatron-LM:{megatron_path}"
     return {
         "HF_HOME": str(root / "hf-cache"),
         "XDG_CACHE_HOME": str(root / "container-home/.cache"),
         "TMPDIR": str(root / "runtime"),
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": f"{config.repo}:{megatron_path}",
+        "PYTHONPATH": f"{config.repo}:/sgl-workspace/Megatron-LM:/root/Megatron-LM",
         "PATH": f"{root}/server-venv/bin:/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin",
         "RAY_TMPDIR": f"/tmp/miles-ray-{runtime_id}",
         "RAY_DEDUP_LOGS": "0",
@@ -134,13 +127,10 @@ def _runtime_env(config):
         "OPENBLAS_NUM_THREADS": "8",
         "MAX_JOBS": "16",
         "SGLANG_SET_CPU_AFFINITY": "0",
-        "MILES_SGLANG_LEGACY_WEIGHT_UPDATE": "1",
         # Forward optional AITER settings through Apptainer's --cleanenv.
         # Rounding changes require a separate cache: AITER does not key on flags.
         **{
-            key: os.environ[key]
-            for key in ("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT", "AITER_JIT_DIR")
-            if key in os.environ
+            key: os.environ[key] for key in ("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT", "AITER_JIT_DIR") if key in os.environ
         },
     }
 
@@ -165,7 +155,7 @@ def _container_command(config, command):
         "--bind",
         f"{config.repo}:{config.repo}",
         "--bind",
-        f"{config.root}/deps/aiter:{config.image_workspace}/aiter",
+        f"{config.root}/deps/aiter:/sgl-workspace/aiter",
         *checkpoint_bind,
         "--env",
         ",".join(f"{k}={v}" for k, v in _runtime_env(config).items()),
@@ -185,7 +175,7 @@ def _setup(config):
         (config.root / name).mkdir(parents=True, exist_ok=True)
     config.checkpoint_root.mkdir(parents=True, exist_ok=True)
     if not config.image.exists():
-        _run(config, ["apptainer", "pull", config.image, config.image_uri])
+        _run(config, ["apptainer", "pull", config.image, IMAGE_URI])
         _run(config, ["apptainer", "cache", "clean", "--force"])
     if not (config.root / "deps/aiter").exists():
         _run(
@@ -205,7 +195,7 @@ def _setup(config):
                 config.image,
                 "cp",
                 "-a",
-                f"{config.image_workspace}/aiter",
+                "/sgl-workspace/aiter",
                 config.root / "deps/aiter",
             ],
         )
@@ -223,21 +213,9 @@ pth.write_text(f'import site; site.addsitedir("/opt/venv/lib/python{version}/sit
     _run(config, _container_command(config, [config.python, "-c", pth_code, config.root]))
     pip = [config.python, "-m", "pip", "install"]
     _run(config, _container_command(config, [*pip, "--no-deps", "--no-build-isolation", "-e", config.repo]))
-    if config.preserve_image_packages:
-        # Keep the image's tested Torch/ROCm/Ray/ModelOpt stack. Unversioned
-        # requests without --upgrade retain installed packages; --no-deps
-        # prevents resolver changes to the image's native dependency stack.
-        packages = [package.split("==", 1)[0] for package in OVERLAY_PACKAGES]
-        _run(config, _container_command(config, [*pip, "--no-deps", *packages]))
-    else:
-        _run(config, _container_command(config, [*pip, *OVERLAY_PACKAGES]))
-        _run(config, _container_command(config, [*pip, "--no-deps", "nvidia-modelopt==0.44.0"]))
+    _run(config, _container_command(config, [*pip, "--no-deps", *OVERLAY_PACKAGES]))
+    # The image uses Python 3.10; only the SDK's generated protobuf schema is loaded.
     _run(config, _container_command(config, [*pip, "--ignore-requires-python", "--no-deps", "tinker==0.27.1"]))
-    # Preserve the tested dependency stack in the original MI350 image.
-    if config.image_uri != IMAGE_URI and not config.preserve_image_packages:
-        _run(config, _container_command(config, [*pip, *IMAGE_COMPAT_PACKAGES]))
-        _ensure_bridge(config)
-        _ensure_sglang(config)
     download = "import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3])"
     _run(
         config,
@@ -290,76 +268,24 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         raise RuntimeError(f"Conversion did not finish: {output}")
 
 
-def _ensure_bridge(config):
-    probe = "from megatron.bridge.models.conversion.model_bridge import HFWeightTuple; assert 'megatron_param_name' in HFWeightTuple._fields"
-    result = subprocess.run(_container_command(config, [config.python, "-c", probe]), env=_host_env(config))
-    if result.returncode == 0:
-        return
-    bridge = config.root / "deps/Megatron-Bridge"
-    if not bridge.exists():
-        _run(config, ["git", "clone", "--no-checkout", "https://github.com/radixark/Megatron-Bridge.git", bridge])
-        # This compatible revision predates the fork's bridge-branch rebase.
-        _run(config, ["git", "-C", bridge, "fetch", "origin", BRIDGE_REVISION])
-        _run(config, ["git", "-C", bridge, "checkout", "--detach", BRIDGE_REVISION])
-    else:
-        revision = subprocess.check_output(["git", "-C", str(bridge), "rev-parse", "HEAD"], text=True).strip()
-        if revision != BRIDGE_REVISION:
-            raise ValueError(f"Existing Bridge checkout {bridge} is not at the required {BRIDGE_REVISION}")
-    pip = [config.python, "-m", "pip", "install"]
-    _run(config, _container_command(config, [*pip, "setuptools>=77,<81", "wheel", "hydra-core==1.3.2"]))
-    _run(config, _container_command(config, [*pip, "--no-deps", "--no-build-isolation", bridge]))
-
-
-def _ensure_sglang(config):
-    # Older MI300 images predate the dumper API imported by this Miles branch.
-    probe = """import importlib.util, sys
-from pathlib import Path
-package = Path(importlib.util.find_spec('sglang').origin).parent
-sys.exit('class DumperConfig' not in (package / 'srt/debug_utils/dumper.py').read_text())
-"""
-    result = subprocess.run(_container_command(config, [config.python, "-c", probe]), env=_host_env(config))
-    if result.returncode == 0:
-        return
-    source = config.root / "deps/sglang"
-    if not source.exists():
-        _run(
-            config,
-            [
-                "git",
-                "clone",
-                "--filter=blob:none",
-                "--no-checkout",
-                "https://github.com/sgl-project/sglang.git",
-                source,
-            ],
-        )
-        _run(config, ["git", "-C", source, "checkout", "--detach", SGLANG_REVISION])
-    else:
-        revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-        if revision != SGLANG_REVISION:
-            raise ValueError(f"Existing SGLang checkout {source} is not at the required {SGLANG_REVISION}")
-    # Build against the image's Torch/HIP and detected GPU. Reusing an MI350
-    # wheel here would reintroduce the gfx950-only kernel crash on MI300X.
-    build = "import os, sys; os.chdir(sys.argv[1]); os.execv(sys.executable, [sys.executable, 'setup_rocm.py', 'bdist_wheel'])"
-    _run(config, _container_command(config, [config.python, "-c", build, source / "sgl-kernel"]))
-    wheels = list((source / "sgl-kernel/dist").glob("*.whl"))
-    wheel = max(wheels, key=lambda path: path.stat().st_mtime)
-    pip = [config.python, "-m", "pip", "install", "--no-deps", "--force-reinstall"]
-    _run(config, _container_command(config, [*pip, wheel]))
-    # A normal wheel takes precedence over the image's existing editable
-    # /app/sglang entry; a second editable install does not reliably do so.
-    _run(config, _container_command(config, [*pip, source / "python"]))
-
-
 def _server_args(config, extra=()):
+    model_args = (
+        [
+            "--megatron-to-hf-mode",
+            "raw",
+            "--ref-load",
+            config.model_path.with_name(f"{config.model_path.name}_torch_dist"),
+        ]
+        if config.model_type == "qwen3.5-4B"
+        else ["--megatron-to-hf-mode", "bridge"]
+    )
     return list(
         map(
             str,
             [
                 "--hf-checkpoint",
                 config.model_path,
-                "--megatron-to-hf-mode",
-                "bridge",
+                *model_args,
                 "--tinker-train-mode",
                 "full",
                 "--tinker-server-port",
@@ -393,6 +319,8 @@ def _server_args(config, extra=()):
                 config.rollout_gpus,
                 "--rollout-num-gpus-per-engine",
                 config.rollout_gpus_per_engine,
+                "--sglang-device",
+                "cuda",
                 "--sglang-mem-fraction-static",
                 config.mem_fraction,
                 "--sglang-context-length",
@@ -589,24 +517,11 @@ def _stop(config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("setup", "convert", "serve", "doctor", "stop", "prune", "tunnel"))
-    parser.add_argument("--root", type=Path, default=Path("/tmp/miles-tinker-work"))
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument(
         "--checkpoint-root",
         type=Path,
         help="Checkpoint and performance-log directory, bound into Apptainer (default: <root>/checkpoints)",
-    )
-    parser.add_argument(
-        "--image-uri", default=IMAGE_URI, help="Architecture-matched Docker URI, preferably pinned by digest"
-    )
-    parser.add_argument(
-        "--image-workspace",
-        default="/sgl-workspace",
-        help="Dependency source directory inside the image (/app for older MI300 images)",
-    )
-    parser.add_argument(
-        "--preserve-image-packages",
-        action="store_true",
-        help="Retain native image package versions and skip Bridge/SGLang compatibility replacements during setup",
     )
     parser.add_argument(
         "--modal-relay",
