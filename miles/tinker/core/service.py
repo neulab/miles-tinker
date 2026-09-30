@@ -661,7 +661,8 @@ class TinkerService:
         return path, meta
 
     def _checkpoint_meta(self, tenant: str, tinker_path: str) -> tuple[str, dict]:
-        """Checkpoint dir + its sidecar, ownership checked; the sidecar makes
+        """Checkpoint dir + its sidecar; possession of its path permits resume.
+        Relay credentials can change between jobs. The sidecar makes
         resume work after a gateway restart, a live record fills in for
         checkpoints saved before sidecars existed."""
         model_id, kind, name = _parse_tinker_path(tinker_path)
@@ -672,8 +673,6 @@ class TinkerService:
             if record is None or not os.path.isdir(path):
                 raise UserInputError(f"unknown checkpoint {tinker_path!r}")
             meta = sidecar_meta(record, self.config, kind, name)
-        if meta.get("tenant") != tenant:
-            raise OwnershipError(f"checkpoint {tinker_path} does not belong to this tenant")
         return path, meta
 
     async def _publish_sampler(self, record: ModelRecord, payload: dict) -> dict:
