@@ -45,10 +45,10 @@ unset PLATOON_TRIAL_REWARD_MODE PLATOON_TRIAL_SERVICE PLATOON_TRIAL_URLS
 echo "platoon reward_mode=$OPENREWARD_REWARD_MODE"
 export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
 if [[ $SERVICE_ENVIRONMENT == frontier_cs ]]; then
-  # Native final grading can evaluate both current and best artifacts, each
-  # with a three-hour budget. Let Platoon's step deadline govern cancellation.
-  export OPENREWARD_MCP_TIMEOUT=25200
-  export OPENREWARD_MCP_TOOL_TIMEOUT=25200
+  # Native final grading may drain pending work, then evaluate current and
+  # best artifacts (three hours each). Platoon's step deadline governs calls.
+  export OPENREWARD_MCP_TIMEOUT=39600
+  export OPENREWARD_MCP_TOOL_TIMEOUT=39600
 fi
 export WANDB_MODE=${WANDB_MODE:-online}
 CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client

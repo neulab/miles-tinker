@@ -74,7 +74,7 @@ def test_frontier_native_grading_and_queued_setup_deadline(environment):
         ["bash", "-eu", "-c", script], capture_output=True, text=True, check=True, timeout=10,
         env={**os.environ, "SERVICE_ENVIRONMENT": environment},
     )
-    assert result.stdout == ("25200 25200" if environment == "frontier_cs" else "1800 default")
+    assert result.stdout == ("39600 39600" if environment == "frontier_cs" else "1800 default")
 
 
 def test_frontier_helper_keeps_memory_guard_and_host_launcher(tmp_path):
