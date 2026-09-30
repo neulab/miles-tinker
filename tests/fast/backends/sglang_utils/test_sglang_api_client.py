@@ -793,3 +793,17 @@ class TestStartProfile:
 
 async def _noop_sleep(seconds):
     return None
+
+
+async def test_mi300_legacy_weight_update_is_opt_in(client, recorder, monkeypatch):
+    monkeypatch.setenv("MILES_SGLANG_LEGACY_WEIGHT_UPDATE", "1")
+    await client.begin_weight_update()
+    await client.end_weight_update()
+    assert [(verb, url) for verb, url, _ in recorder.calls] == [
+        ("post", f"{SERVER_URL}/post_process_weights"),
+        ("post", f"{SERVER_URL}/post_process_weights"),
+    ]
+    assert recorder.calls[0][2]["json"] == {"restore_weights_before_load": True}
+    assert recorder.calls[1][2]["json"] == {"post_process_quantization": True}
+    with pytest.raises(NotImplementedError):
+        await client.begin_weight_update(sync_base=False)

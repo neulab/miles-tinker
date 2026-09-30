@@ -8,6 +8,8 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 
 def _wait_for_file(path, process):
     deadline = time.monotonic() + 10
@@ -17,8 +19,9 @@ def _wait_for_file(path, process):
         time.sleep(0.02)
 
 
-def test_sigterm_cleans_up_server_and_relay_even_when_repeated(tmp_path):
-    python = tmp_path / "modal-venv/bin/python"
+@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
+def test_signals_clean_up_server_and_relay_even_when_repeated(tmp_path, stop_signal):
+    python = tmp_path / "venvs/modal/bin/python"
     python.parent.mkdir(parents=True)
     python.symlink_to(sys.executable)
     relay = tmp_path / "repo/tools/amd_tinker_modal.py"
@@ -82,7 +85,7 @@ def test_sigterm_cleans_up_server_and_relay_even_when_repeated(tmp_path):
 
             amd_tinker.subprocess.Popen = popen
             amd_tinker._stop = stop
-            config = amd_tinker.BackendConfig(root=root, repo=root / 'repo')
+            config = amd_tinker.BackendConfig(root=root, repo=root / 'repo', modal_relay=True)
             previous = signal.getsignal(signal.SIGTERM)
             try:
                 amd_tinker._serve_with_modal(
@@ -99,11 +102,11 @@ def test_sigterm_cleans_up_server_and_relay_even_when_repeated(tmp_path):
     try:
         for role in ("server", "amd_tinker_modal"):
             _wait_for_file(tmp_path / f"{role}.started", process)
-        process.send_signal(signal.SIGTERM)
+        process.send_signal(stop_signal)
         _wait_for_file(tmp_path / "cleanup.started", process)
-        process.send_signal(signal.SIGTERM)
+        process.send_signal(stop_signal)
         (tmp_path / "second-signal.sent").touch()
-        assert process.wait(timeout=10) == 128 + signal.SIGTERM
+        assert process.wait(timeout=10) in (128 + stop_signal, -stop_signal)
         for role in ("server", "amd_tinker_modal"):
             assert (tmp_path / f"{role}.stopped").exists()
         assert (tmp_path / "handler.restored").exists()

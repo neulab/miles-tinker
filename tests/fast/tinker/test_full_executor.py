@@ -4,6 +4,7 @@ discarded on failure. Megatron and the heavy miles modules are stubbed; the
 test drives the executor's own state machine."""
 
 import importlib
+import queue
 import sys
 import types
 from argparse import Namespace
@@ -285,3 +286,25 @@ def test_reset_to_base_reloads_the_startup_weights(rig):
     assert optimizer.inner.state["p"]["step"].item() == 0
     assert rig.executor._state["num_updates"] == 0
     assert (rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng) == (False, False, False)
+
+
+@pytest.mark.parametrize("write_error", [None, RuntimeError("write failed")])
+def test_mi300_checkpoint_writer_stays_in_process_and_restores_original(rig, monkeypatch, write_error):
+    monkeypatch.setattr(torch.version, "hip", "6.4")
+    original = object()
+
+    def write(transform_list, index, bucket, results, pending, **kwargs):
+        assert pending.get_nowait() == index
+        results.put((index, write_error or bucket))
+
+    writer = SimpleNamespace(write_preloaded_data_multiproc=original, write_preloaded_data=write)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.dist_checkpointing.strategies.filesystem_async",
+        _module("filesystem_async", FileSystemWriterAsync=writer),
+    )
+    result = queue.Queue()
+    with rig.executor._rocm_checkpoint_writer():
+        writer.write_preloaded_data_multiproc(None, False, 0, ["first", "second"], result)
+    assert writer.write_preloaded_data_multiproc.__func__ is original
+    assert result.get_nowait() == (write_error or {0: "first", 1: "second"})

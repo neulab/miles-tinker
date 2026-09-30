@@ -39,8 +39,10 @@ Design (see scratchpad note v2_executor_full_ft_design.md, section 4):
 """
 
 import logging
+import queue
 from argparse import Namespace
 from collections.abc import Sequence
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -180,9 +182,46 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
 
 def save_state(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str) -> None:
     """Megatron torch_dist checkpoint (model + optimizer) under ``path``; complete on return."""
-    with inplace_modify_args(args, {"save": path, "async_save": False}):
+    with inplace_modify_args(args, {"save": path, "async_save": False}), _rocm_checkpoint_writer():
         save(SAVE_ITERATION, model, optimizer, None)
     _barrier()
+
+
+@contextmanager
+def _rocm_checkpoint_writer():
+    # The image's forked checkpoint writers crash while serializing staged
+    # ROCm buffers. Keep the same file format and write in the owning process.
+    if not torch.version.hip:
+        yield
+        return
+    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+
+    original = getattr(FileSystemWriterAsync, "write_preloaded_data_multiproc", None)
+    if original is None:
+        # Newer Megatron uses threads rather than forked ROCm buffer writers.
+        yield
+        return
+
+    def write_in_process(transform_list, use_msc, rank, write_buckets, global_results_queue):
+        results, pending = queue.Queue(), queue.Queue()
+        collected = {}
+        for index, bucket in enumerate(write_buckets):
+            pending.put(index)
+            FileSystemWriterAsync.write_preloaded_data(
+                transform_list, index, bucket, results, pending, use_fsync=True, use_msc=use_msc
+            )
+            index, result = results.get()
+            if isinstance(result, Exception):
+                global_results_queue.put(result)
+                return
+            collected[index] = result
+        global_results_queue.put(collected)
+
+    FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(write_in_process)
+    try:
+        yield
+    finally:
+        FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(original)
 
 
 def load_state(

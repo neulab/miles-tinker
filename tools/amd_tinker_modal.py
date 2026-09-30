@@ -161,6 +161,10 @@ def _run_relay(root, port, timeout):
         if code:
             raise RuntimeError(f"Modal SSH relay exited with status {code}")
     finally:
+        # Ctrl+C reaches both launcher and relay; ignore its follow-up terminate
+        # while removing the remote sandbox.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if ssh is not None and ssh.poll() is None:
             ssh.terminate()
             ssh.wait()
