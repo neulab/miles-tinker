@@ -18,6 +18,7 @@ import uuid
 
 from miles.tinker.core.planner import BarrierUnit, Planner, WorkUnit
 from miles.tinker.core.promise import PENDING, Promise, PromiseStore
+from miles.tinker.core.retention import checkpoint_lock, prune_checkpoints
 from miles.tinker.core.stream import ModelStream
 from miles.tinker.core.types import Command, GatewayConfig, ModelRecord, OwnershipError, UserInputError
 
@@ -82,6 +83,9 @@ class TinkerService:
     def __init__(self, backend: ExecutorBackend, config: GatewayConfig) -> None:
         if not config.is_lora and config.n_slots != 1:
             raise ValueError(f"train_mode='full' serves exactly one slot, got n_slots={config.n_slots}")
+        if config.checkpoints_to_keep < 1:
+            raise ValueError("checkpoints_to_keep must be at least 1")
+        self._prune_lock = asyncio.Lock()
         self.backend = backend
         self.config = config
         self.promises = PromiseStore()
@@ -131,6 +135,8 @@ class TinkerService:
         session_id = payload.get("session_id") or ""
         record = ModelRecord(
             model_id=model_id,
+            checkpoint_lineage=model_id,
+            checkpoint_state=uuid.uuid4().hex,
             tenant=tenant,
             slot=slot,
             base_model=base_model,
@@ -614,6 +620,8 @@ class TinkerService:
             metrics_by_slot = await self.backend.optim_step(
                 {stream.slot: pending.command.payload["adam_params"] for stream, pending in unit.entries}
             )
+            for stream, _ in unit.entries:
+                self.models[stream.model_id].checkpoint_state = uuid.uuid4().hex
             return [
                 {"kind": "optim_step", "metrics": _plain_metrics(metrics_by_slot[stream.slot])}
                 for stream, _ in unit.entries
@@ -625,8 +633,15 @@ class TinkerService:
         if unit.kind == "save_state":
             name = payload["name"] or f"checkpoint-{pending.command.seq_id:06d}"
             path = self._checkpoint_dir(record.model_id, "weights", name)
-            await self.backend.save_slot(record.slot, path)
-            write_sidecar(path, sidecar_meta(record, self.config, "weights", name))
+            with checkpoint_lock(path):
+                # An overwritten name is incomplete until this save succeeds.
+                try:
+                    os.unlink(os.path.join(path, SIDECAR_NAME))
+                except FileNotFoundError:
+                    pass
+                await self.backend.save_slot(record.slot, path)
+                write_sidecar(path, sidecar_meta(record, self.config, "weights", name))
+            self._spawn(self._prune_checkpoints(record.checkpoint_lineage, record.legacy_checkpoint_models))
             return [{"kind": "save_state", "path": f"tinker://{record.model_id}/weights/{name}"}]
         if unit.kind == "load_state":
             # a raise here fails this promise only (_run_barrier); the backend leaves the slot freshly
@@ -638,21 +653,37 @@ class TinkerService:
             return [await self._publish_sampler(record, payload)]
         raise UserInputError(f"unknown barrier kind {unit.kind!r}")
 
+    async def _prune_checkpoints(self, lineage: str, legacy_models: tuple[str, ...]) -> None:
+        async with self._prune_lock:
+            await asyncio.to_thread(
+                prune_checkpoints, self.config.checkpoint_root, lineage, legacy_models, self.config.checkpoints_to_keep
+            )
+
     async def _load_state(self, record: ModelRecord, payload: dict) -> None:
-        path, meta = self._resolve_checkpoint(record, payload["path"])
-        if record.is_lora and (record.lora_rank, record.lora_alpha) != (
-            int(meta["lora_rank"]),
-            float(meta["lora_alpha"]),
-        ):
-            logger.info(f"{record.model_id}: taking rank/alpha {meta['lora_rank']}/{meta['lora_alpha']} from {path}")
-            record.lora_rank, record.lora_alpha = int(meta["lora_rank"]), float(meta["lora_alpha"])
-        await self.backend.load_slot(
-            record.slot,
-            record.lora_rank,
-            record.lora_alpha,
-            ckpt_path=path,
-            load_optimizer=payload["optimizer"],
-        )
+        model_id, kind, name = _parse_tinker_path(payload["path"])
+        with checkpoint_lock(self._checkpoint_dir(model_id, kind, name)):
+            path, meta = self._resolve_checkpoint(record, payload["path"])
+            if record.is_lora and (record.lora_rank, record.lora_alpha) != (
+                int(meta["lora_rank"]),
+                float(meta["lora_alpha"]),
+            ):
+                logger.info(
+                    f"{record.model_id}: taking rank/alpha {meta['lora_rank']}/{meta['lora_alpha']} from {path}"
+                )
+                record.lora_rank, record.lora_alpha = int(meta["lora_rank"]), float(meta["lora_alpha"])
+            await self.backend.load_slot(
+                record.slot,
+                record.lora_rank,
+                record.lora_alpha,
+                ckpt_path=path,
+                load_optimizer=payload["optimizer"],
+            )
+
+        # Adopt lineage only after the backend has successfully restored state.
+        record.checkpoint_lineage = meta.get("checkpoint_lineage", model_id)
+        record.legacy_checkpoint_models = tuple(set(meta.get("legacy_checkpoint_models", ())) | {model_id})
+        record.resume_started_at = time.time()
+        record.checkpoint_state = meta.get("checkpoint_state", path) if payload["optimizer"] else uuid.uuid4().hex
 
     def _resolve_checkpoint(self, record: ModelRecord, tinker_path: str) -> tuple[str, dict]:
         path, meta = self._checkpoint_meta(record.tenant, tinker_path)
@@ -796,6 +827,10 @@ def _finite_float(value) -> float:
 def sidecar_meta(record: ModelRecord, config: GatewayConfig, kind: str, name: str) -> dict:
     return {
         "model_id": record.model_id,
+        "checkpoint_lineage": record.checkpoint_lineage or record.model_id,
+        "checkpoint_state": record.checkpoint_state,
+        "resume_started_at": record.resume_started_at,
+        "legacy_checkpoint_models": record.legacy_checkpoint_models,
         "tenant": record.tenant,
         "session_id": record.session_id,
         "base_model": record.base_model,
@@ -813,8 +848,10 @@ def sidecar_meta(record: ModelRecord, config: GatewayConfig, kind: str, name: st
 
 def write_sidecar(path: str, meta: dict) -> None:
     os.makedirs(path, exist_ok=True)
-    with open(os.path.join(path, SIDECAR_NAME), "w") as handle:
+    temporary = os.path.join(path, SIDECAR_NAME + ".tmp")
+    with open(temporary, "w") as handle:
         json.dump(meta, handle, indent=2)
+    os.replace(temporary, os.path.join(path, SIDECAR_NAME))
 
 
 def read_sidecar(path: str) -> dict | None:

@@ -60,6 +60,7 @@ async def serve(args):
         # full fine-tuning: one tenant, slot 0 is the base model
         n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
         checkpoint_root=checkpoint_root,
+        checkpoints_to_keep=args.tinker_checkpoints_to_keep,
         max_tokens_per_datum=max_tokens_per_datum,
         lora_alpha=args.lora_alpha if train_mode == "lora" else None,
         lease_timeout_s=args.tinker_lease_timeout_s,

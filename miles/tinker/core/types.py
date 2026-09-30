@@ -30,6 +30,7 @@ class GatewayConfig:
     unit_token_budget: int = 262_144  # packing bound per work unit
     train_mode: str = "lora"  # "lora" | "full"
     retrieve_poll_timeout_s: float = 20.0  # long-poll cap on /retrieve_future (< the SDK's 45 s)
+    checkpoints_to_keep: int = 3
     sampler_versions_to_keep: int = 3  # LoRA: adapter versions kept loaded per model
     coalesce_wait_s: float = 0.3  # planner: wait for more chunks of an open window
     coalesce_max_wait_s: float = 2.0
@@ -61,6 +62,10 @@ class ModelRecord:
     lora_alpha: float
     session_id: str
     is_lora: bool = True
+    checkpoint_lineage: str = ""
+    checkpoint_state: str = ""
+    resume_started_at: float = field(default_factory=time.time)
+    legacy_checkpoint_models: tuple[str, ...] = ()
     sdk_version: str = ""
     sampler_version: int = 0
     user_metadata: dict = field(default_factory=dict)

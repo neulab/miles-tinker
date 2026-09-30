@@ -1858,6 +1858,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Directory for tinker:// checkpoints (default: <save>/tinker)",
             )
             parser.add_argument(
+                "--tinker-checkpoints-to-keep",
+                type=int,
+                default=3,
+                help="Completed training checkpoints retained per resume lineage (default: 3)",
+            )
+            parser.add_argument(
                 "--tinker-train-mode",
                 type=str,
                 choices=["lora", "full"],
