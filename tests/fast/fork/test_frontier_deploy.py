@@ -64,6 +64,19 @@ export SERVICE_ENVIRONMENT=""" + exports + """
     subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True, timeout=10)
 
 
+@pytest.mark.parametrize("environment", ["frontier_cs", "toolathlon", "swe_rebench"])
+def test_frontier_native_grading_and_queued_creation_deadlines(environment):
+    source = (DEPLOY / "clients/platoon_env.sh").read_text()
+    settings = source.split("export OPENHANDS_SUPPRESS_BANNER=1", 1)[1].split("export WANDB_MODE", 1)[0]
+    script = "unset OPENREWARD_SESSION_CREATION_TIMEOUT\nexport OPENHANDS_SUPPRESS_BANNER=1" + settings
+    script += '\nprintf "%s %s" "$OPENREWARD_MCP_TIMEOUT" "${OPENREWARD_SESSION_CREATION_TIMEOUT:-default}"\n'
+    result = subprocess.run(
+        ["bash", "-eu", "-c", script], capture_output=True, text=True, check=True, timeout=10,
+        env={**os.environ, "SERVICE_ENVIRONMENT": environment},
+    )
+    assert result.stdout == ("25200 25200" if environment == "frontier_cs" else "1800 default")
+
+
 def test_frontier_helper_keeps_memory_guard_and_host_launcher(tmp_path):
     platoon = tmp_path / "platoon"
     scripts = platoon / "pbs-scripts"

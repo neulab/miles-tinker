@@ -44,6 +44,13 @@ unset PLATOON_TRIAL_REWARD_MODE PLATOON_TRIAL_SERVICE PLATOON_TRIAL_URLS
 [[ $OPENREWARD_REWARD_MODE == partial || $OPENREWARD_REWARD_MODE == binary ]] || { echo "OPENREWARD_REWARD_MODE must be partial or binary" >&2; exit 2; }
 echo "platoon reward_mode=$OPENREWARD_REWARD_MODE"
 export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
+if [[ $SERVICE_ENVIRONMENT == frontier_cs ]]; then
+  # Native final grading can evaluate both current and best artifacts, each
+  # with a three-hour budget. Let Platoon's step deadline govern cancellation.
+  export OPENREWARD_MCP_TIMEOUT=25200
+  # CPU judges have bounded concurrency; session creation may queue for a slot.
+  export OPENREWARD_SESSION_CREATION_TIMEOUT=25200
+fi
 export WANDB_MODE=${WANDB_MODE:-online}
 CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client
 mkdir -p "$CLIENT_LOCAL"/{home,tmp,xdg}
