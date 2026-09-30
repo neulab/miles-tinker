@@ -6,7 +6,7 @@
 > built on. Every fork change is listed in [FORK.md](FORK.md); sync with
 > `tools/fork/upstream_sync.py` (or the `upstream-sync` skill). Upstream's README follows.
 
-AMD MI350 Tinker endpoint: [Qwen3-4B-Instruct commands](docs/platforms/mi350-tinker-server.md) · [implementation notes](docs/platforms/mi350-tinker-changes.md)
+AMD Tinker: [setup and serving on MI300 / MI350](docs/platforms/amd-tinker.md)
 
 <div align="center">
 

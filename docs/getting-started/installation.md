@@ -25,9 +25,7 @@ versions of SGLang, Megatron-LM, and a few CUDA kernels.
   <Tab title="AMD MI350X">
 
     For the Tinker endpoint on this branch, follow the
-    [Qwen3-4B-Instruct commands](../platforms/mi350-tinker-server.md).
-    The launcher provisions the pinned ROCm 7.2 image with Apptainer.
-    See [implementation notes](../platforms/mi350-tinker-changes.md) for the scope.
+    [AMD Tinker setup and serving](../platforms/amd-tinker.md).
 
   </Tab>
 
