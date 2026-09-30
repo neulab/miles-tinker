@@ -45,7 +45,7 @@ unset PLATOON_TRIAL_REWARD_MODE PLATOON_TRIAL_SERVICE PLATOON_TRIAL_URLS
 echo "platoon reward_mode=$OPENREWARD_REWARD_MODE"
 export OPENHANDS_SUPPRESS_BANNER=1 OPENREWARD_MCP_TIMEOUT=1800
 if [[ $SERVICE_ENVIRONMENT == frontier_cs ]]; then
-  # Longer thinking/tool generations need room to complete under the 32K cap.
+  # Longer thinking/tool generations need room to complete within their output cap.
   export TINKER_SAMPLE_TIMEOUT_SECONDS=${TINKER_SAMPLE_TIMEOUT_SECONDS:-1800}
   # Native final grading may drain pending work, then evaluate current and
   # best artifacts (three hours each). Platoon's step deadline governs calls.
