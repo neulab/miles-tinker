@@ -1,6 +1,6 @@
 #!/bin/bash
 # CLIENT_SCRIPT for tinker_gateway.pbs: the Platoon OpenReward RL client on the job's head node.
-# The historical filename is retained for existing Toolathlon submissions; SERVICE_ENVIRONMENT also supports SWE.
+# The historical filename is retained; SERVICE_ENVIRONMENT also supports SWE and Frontier-CS.
 # The launcher exports TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME HF_HOME no_proxy MILES_SRC
 # PLATOON_ROOT SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS (C10).
 # The client environment (C10/C11 exports + the secrets, from /home/aci18912it/rasp/config/abci.env, which chains

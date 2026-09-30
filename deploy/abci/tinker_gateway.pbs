@@ -19,7 +19,8 @@
 #   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
 #   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
 #   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
-#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE  SERVICE_ENVIRONMENT=toolathlon|swe_rebench  SWE_ENV
+#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
+#   SERVICE_ENVIRONMENT=toolathlon|swe_rebench|frontier_cs  SWE_ENV  FRONTIER_ENV
 # Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
 # DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
 # and every pbsdsh / singularity command line without executing anything.
@@ -61,6 +62,12 @@ case "$SERVICE_ENVIRONMENT" in
     SERVICE_HELPER=$MILES_SRC/deploy/abci/swe_rebench_service.sh
     SERVICE_ENV_FILE=${SWE_ENV:-$MILES_SRC/deploy/abci/swe_rebench.env}
     SERVICE_EXTRA_ENV=("SWE_ENV=$SERVICE_ENV_FILE")
+    ;;
+  frontier_cs)
+    SERVICE_PORT=8085; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_FRONTIER_CS
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/frontier_cs_service.sh
+    SERVICE_ENV_FILE=${FRONTIER_ENV:-$MILES_SRC/deploy/abci/frontier_cs.env}
+    SERVICE_EXTRA_ENV=("FRONTIER_ENV=$SERVICE_ENV_FILE")
     ;;
   *) echo "Unsupported SERVICE_ENVIRONMENT=$SERVICE_ENVIRONMENT" >&2; exit 2 ;;
 esac
@@ -332,13 +339,13 @@ HEAD_PID=$LAST_PID
 dry && show "serve (inside the head container)" python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
   --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" --actor-num-nodes "$TRAIN_NODES" --rollout-num-gpus "$ROLLOUT_GPUS" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
 
-# ---------------------------------------------------------------- service health (Toolathlon quorum or SWE's single server)
+# ---------------------------------------------------------------- service health (Toolathlon quorum or a single OpenReward server)
 probe() { [[ $(curl --silent --output /dev/null --connect-timeout 3 --max-time 15 --noproxy '*' --write-out '%{http_code}' "$@" 2>/dev/null) == 200 ]]; }
 SWEEP_REPORT=
 sweep_services() {  # 0 when every service host meets the quorum and its helper is alive; SWEEP_REPORT lists the rest
   local pids=() kinds=() hosts=() i w host ip; local -A pub=() wrk=()
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}; ip=${ENGINE_IPS[$i]}
-    if [[ $SERVICE_ENVIRONMENT == swe_rebench ]]; then
+    if [[ $SERVICE_ENVIRONMENT != toolathlon ]]; then
       probe "http://$ip:$SERVICE_PORT/health" & pids+=($!); kinds+=(pub); hosts+=("$host")
       continue
     fi
@@ -353,8 +360,8 @@ sweep_services() {  # 0 when every service host meets the quorum and its helper 
   SWEEP_REPORT=
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}
     kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null || SWEEP_REPORT+=" $host(helper dead)"
-    if [[ $SERVICE_ENVIRONMENT == swe_rebench ]]; then
-      (( ${pub[$host]:-0} >= 1 )) || SWEEP_REPORT+=" $host(swe unhealthy)"
+    if [[ $SERVICE_ENVIRONMENT != toolathlon ]]; then
+      (( ${pub[$host]:-0} >= 1 )) || SWEEP_REPORT+=" $host($SERVICE_ENVIRONMENT unhealthy)"
     else
       (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
     fi
