@@ -68,13 +68,13 @@ export SERVICE_ENVIRONMENT=""" + exports + """
 def test_frontier_native_grading_and_queued_setup_deadline(environment):
     source = (DEPLOY / "clients/platoon_env.sh").read_text()
     settings = source.split("export OPENHANDS_SUPPRESS_BANNER=1", 1)[1].split("export WANDB_MODE", 1)[0]
-    script = "export OPENHANDS_SUPPRESS_BANNER=1" + settings
-    script += '\nprintf "%s" "$OPENREWARD_MCP_TIMEOUT"\n'
+    script = "unset OPENREWARD_MCP_TOOL_TIMEOUT\nexport OPENHANDS_SUPPRESS_BANNER=1" + settings
+    script += '\nprintf "%s %s" "$OPENREWARD_MCP_TIMEOUT" "${OPENREWARD_MCP_TOOL_TIMEOUT:-default}"\n'
     result = subprocess.run(
         ["bash", "-eu", "-c", script], capture_output=True, text=True, check=True, timeout=10,
         env={**os.environ, "SERVICE_ENVIRONMENT": environment},
     )
-    assert result.stdout == ("25200" if environment == "frontier_cs" else "1800")
+    assert result.stdout == ("25200 25200" if environment == "frontier_cs" else "1800 default")
 
 
 def test_frontier_helper_keeps_memory_guard_and_host_launcher(tmp_path):

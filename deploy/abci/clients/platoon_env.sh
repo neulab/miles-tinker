@@ -48,6 +48,7 @@ if [[ $SERVICE_ENVIRONMENT == frontier_cs ]]; then
   # Native final grading can evaluate both current and best artifacts, each
   # with a three-hour budget. Let Platoon's step deadline govern cancellation.
   export OPENREWARD_MCP_TIMEOUT=25200
+  export OPENREWARD_MCP_TOOL_TIMEOUT=25200
 fi
 export WANDB_MODE=${WANDB_MODE:-online}
 CLIENT_LOCAL=${PBS_LOCALDIR:?}/platoon-client
