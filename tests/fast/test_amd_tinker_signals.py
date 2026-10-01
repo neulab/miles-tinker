@@ -10,6 +10,88 @@ from pathlib import Path
 
 import pytest
 
+import tools.amd_tinker as amd_tinker
+
+
+@pytest.mark.parametrize("modal_relay", [False, True])
+def test_logs_preserve_server_and_relay_output_across_launches(tmp_path, monkeypatch, capfd, modal_relay):
+    config = amd_tinker.BackendConfig(
+        root=tmp_path / "root",
+        checkpoint_root=tmp_path / "checkpoints",
+        repo=tmp_path / "repo",
+        modal_relay=modal_relay,
+    )
+    config.root.mkdir()
+    ready = config.root / "relay.ready"
+    if modal_relay:
+        python = config.venv_dir / "modal/bin/python"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        relay = config.repo / "tools/amd_tinker_modal.py"
+        relay.parent.mkdir(parents=True)
+        relay.write_text(textwrap.dedent("""\
+            import signal
+            import sys
+            import time
+            from pathlib import Path
+
+            def stop(*args):
+                print('relay cleanup', flush=True)
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, stop)
+            print('relay stdout', flush=True)
+            print('relay stderr', file=sys.stderr, flush=True)
+            Path(sys.argv[sys.argv.index('--root') + 1], 'relay.ready').touch()
+            while True:
+                time.sleep(1)
+            """))
+    # Never inspect or stop real server processes in this test.
+    monkeypatch.setattr(amd_tinker, "_stop", lambda config: None)
+    saved_logs = {}
+    for index in range(2):
+        ready.unlink(missing_ok=True)
+        code = textwrap.dedent("""\
+            import sys
+            import time
+            from pathlib import Path
+            if sys.argv[1] == 'True':
+                deadline = time.monotonic() + 5
+                while not Path(sys.argv[2]).exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.02)
+            print('server stdout ' + sys.argv[3], flush=True)
+            print('server stderr ' + sys.argv[3], file=sys.stderr, flush=True)
+            """)
+        amd_tinker._serve_with_modal(config, [sys.executable, "-c", code, str(modal_relay), str(ready), str(index)])
+        logs = list((config.checkpoint_root / "logs").glob("server-*.log"))
+        assert len(logs) == index + 1
+        for path, contents in saved_logs.items():
+            assert path.read_text() == contents
+        path = next(path for path in logs if path not in saved_logs)
+        contents = path.read_text()
+        console = capfd.readouterr().out
+        expected = [f"server stdout {index}", f"server stderr {index}"]
+        if modal_relay:
+            expected += ["relay stdout", "relay stderr", "relay cleanup"]
+        for message in expected:
+            assert message in contents
+            assert message in console
+        assert path.stat().st_mode & 0o077 == 0
+        saved_logs[path] = contents
+
+
+def test_failed_server_keeps_error_output_and_exit_status(tmp_path, monkeypatch, capfd):
+    config = amd_tinker.BackendConfig(root=tmp_path)
+    monkeypatch.setattr(amd_tinker, "_stop", lambda config: None)
+    command = [sys.executable, "-c", "import sys; print('startup failed', file=sys.stderr); sys.exit(7)"]
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        amd_tinker._serve_with_modal(config, command)
+    assert error.value.returncode == 7
+    (path,) = (config.checkpoint_root / "logs").glob("server-*.log")
+    assert "startup failed" in path.read_text()
+    assert "startup failed" in capfd.readouterr().out
+
 
 def _wait_for_file(path, process):
     deadline = time.monotonic() + 10
@@ -56,6 +138,7 @@ def test_signals_clean_up_server_and_relay_even_when_repeated(tmp_path, stop_sig
     wrapper.write_text(
         textwrap.dedent(
             """\
+            import os
             import signal
             import sys
             import time
@@ -65,14 +148,6 @@ def test_signals_clean_up_server_and_relay_even_when_repeated(tmp_path, stop_sig
             from tools import amd_tinker
 
             root = Path(sys.argv[2])
-            children = []
-            original_popen = amd_tinker.subprocess.Popen
-
-            def popen(*args, **kwargs):
-                child = original_popen(*args, **kwargs)
-                children.append(child)
-                return child
-
             def stop(config):
                 # Only stop our dummy server; never inspect real GPU processes.
                 (root / 'cleanup.started').touch()
@@ -80,10 +155,8 @@ def test_signals_clean_up_server_and_relay_even_when_repeated(tmp_path, stop_sig
                 while not (root / 'second-signal.sent').exists():
                     assert time.monotonic() < deadline
                     time.sleep(0.02)
-                children[1].terminate()
-                children[1].wait(timeout=5)
+                os.kill(int((root / 'server.started').read_text()), signal.SIGTERM)
 
-            amd_tinker.subprocess.Popen = popen
             amd_tinker._stop = stop
             config = amd_tinker.BackendConfig(root=root, repo=root / 'repo', modal_relay=True)
             previous = signal.getsignal(signal.SIGTERM)

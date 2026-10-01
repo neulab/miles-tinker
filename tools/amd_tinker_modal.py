@@ -135,6 +135,8 @@ def _run_relay(root, port, timeout):
                 "-o",
                 "ExitOnForwardFailure=yes",
                 "-o",
+                "ChannelTimeout=forwarded-tcpip=6m",
+                "-o",
                 "ServerAliveInterval=30",
                 "-o",
                 "ServerAliveCountMax=3",

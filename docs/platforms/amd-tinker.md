@@ -54,12 +54,14 @@ python3 tools/amd_tinker.py serve \
   --bf16 --optimizer adam --lr 1e-6 --lr-decay-style constant \
   --adam-beta1 0.9 --adam-beta2 0.95 --adam-eps 1e-8 \
   --weight-decay 0.017 --clip-grad 1.0 \
-  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --balance-data \
-  > "$MILES_AMD_ROOT/logs/server.log" 2>&1
+  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --balance-data
 ```
 
 This example needs eight GPUs on one node. Adjust the two GPU counts for
-your allocation. Model weights download on first use and are reused. For
+your single-node allocation. For separate single-GPU nodes, follow the
+[multinode guide](amd-tinker-cluster.md), which starts Ray and Tinker across
+the allocated nodes using SSH and tmux.
+Model weights download on first use and are reused. For
 Qwen3.5, change `MODEL_ID` and `MODEL_TYPE` to the converted model.
 
 | Flag | Meaning |
@@ -89,10 +91,16 @@ Qwen3.5, change `MODEL_ID` and `MODEL_TYPE` to the converted model.
 | `--recompute-num-layers 1` | One layer per recomputation group. |
 | `--balance-data` | Balance training token workload across data-parallel GPUs; also enabled by the launcher. |
 
-The final redirection writes output to `logs/server.log`. Client optimizer
-parameters take precedence where the Tinker API supplies them.
+Each serve launch automatically copies server and relay output to a unique
+`server-*.log` under `$MILES_AMD_CHECKPOINTS/logs/`, as well as the terminal.
+The launcher prints the log path; use `tail -f` on that file to follow it from
+another terminal. Logs have owner-only permissions because they include relay
+credentials. Checkpoint retention does not delete these logs. Worker output
+forwarded through the server is included; separate Ray startup sessions still
+have their own output. Client optimizer parameters take precedence where the
+Tinker API supplies them.
 
-Watch startup with `tail -f "$MILES_AMD_ROOT/logs/server.log"`. The log prints
+The log prints
 `TINKER_BASE_URL` and `TINKER_API_KEY`; set those in your GRPO client's environment
 and use the same model ID. Treat the API key and log as private. Ctrl+C on the
 serve command shuts down the server and its Modal relay.

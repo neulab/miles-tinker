@@ -19,7 +19,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 # rocm/sgl-dev:miles-rocm720-mi35x-20260914, validated with Qwen3.5-4B.
@@ -577,6 +580,40 @@ def _handle_serve_sigterm(signum, _frame):
 
 
 def _serve_with_modal(config, command):
+    with _server_log(config) as output:
+        _supervise_server(config, command, output)
+
+
+@contextmanager
+def _server_log(config):
+    directory = config.checkpoint_root / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # mkstemp creates a unique 0600 file: relay output includes the API key.
+    descriptor, path = tempfile.mkstemp(prefix=f"server-{stamp}-{socket.gethostname()}-", suffix=".log", dir=directory)
+    os.close(descriptor)
+    print(f"Server and relay log: {path}", flush=True)
+    # A separate session lets tee drain output after Ctrl+C reaches the server.
+    # Continue writing the file if the terminal's output pipe closes.
+    copier = subprocess.Popen(
+        ["tee", "--output-error=warn-nopipe", "--append", path],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        yield copier.stdin
+    finally:
+        copier.stdin.close()
+        try:
+            result = copier.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            copier.kill()
+            result = copier.wait()
+        if result:
+            print(f"Server log copier exited with status {result}: {path}", file=sys.stderr, flush=True)
+
+
+def _supervise_server(config, command, output):
     python = config.venv_dir / "modal/bin/python"
     if config.modal_relay and not python.exists():
         raise ValueError("Run setup first to install Modal")
@@ -595,8 +632,10 @@ def _serve_with_modal(config, command):
                     str(config.port),
                 ],
                 env=_host_env(config),
+                stdout=output,
+                stderr=subprocess.STDOUT,
             )
-        server = subprocess.Popen(command, env=_host_env(config))
+        server = subprocess.Popen(command, env=_host_env(config), stdout=output, stderr=subprocess.STDOUT)
         while True:
             try:
                 result = server.wait(timeout=1)
