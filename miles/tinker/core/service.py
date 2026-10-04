@@ -17,7 +17,7 @@ import time
 import uuid
 
 from miles.tinker.core.planner import BarrierUnit, Planner, WorkUnit
-from miles.tinker.core.promise import PENDING, Promise, PromiseStore
+from miles.tinker.core.promise import PENDING, Promise, PromiseStore, ResultWindow
 from miles.tinker.core.stream import ModelStream
 from miles.tinker.core.types import Command, GatewayConfig, ModelRecord, OwnershipError, UserInputError
 
@@ -100,11 +100,16 @@ class TinkerService:
         self.free_slots = set(range(config.n_slots))
         self._wake = asyncio.Event()
         self._backend_lock = asyncio.Lock()
+        self._lease_lock = asyncio.Lock()
         self._sample_slots = asyncio.Semaphore(config.max_concurrent_samples)
-        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
+        self._sample_tasks: dict[str, tuple] = (
+            {}
+        )  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
         self._sample_by_seq: dict[tuple, tuple[str, list[str]]] = {}  # (sampling_session_id, seq_id) -> reply
         self._model_by_seq: dict[tuple, tuple[str, str]] = {}  # (session_id, model_seq_id) -> reply
         self._background_tasks: set = set()
+        self._background_owners: dict[asyncio.Task, str] = {}
+        self._result_windows: dict[str, ResultWindow] = {}
         self._last_submit_at: dict[str, float] = {}  # model_id -> monotonic time of the last window submit
         self._arrival_counter = 0
         self._unit_counter = 0
@@ -118,7 +123,7 @@ class TinkerService:
 
     def heartbeat(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
-        if session is not None:
+        if session is not None and not session.get("ending"):
             session["last_heartbeat"] = time.monotonic()
 
     def create_model(self, tenant: str, payload: dict) -> tuple[str, str]:
@@ -151,20 +156,27 @@ class TinkerService:
         )
         self.models[model_id] = record
         self.planner.add_stream(ModelStream(model_id, tenant, slot))
-        promise = self.promises.create(model_id, tenant)
+        promise = self.promises.create(model_id, tenant, session_id=session_id)
         if None not in dedup_key:
             self._model_by_seq[dedup_key] = (promise.request_id, model_id)
-        self._spawn(self._run_create_model(promise.request_id, record))
+        self._spawn(self._run_create_model(promise.request_id, record), session_id=session_id)
         return promise.request_id, model_id
 
     async def _run_create_model(self, request_id: str, record: ModelRecord) -> None:
         try:
             async with self._backend_lock:
+                if self.models.get(record.model_id) is not record:
+                    self.promises.fail(request_id, "model released before initialization", "user")
+                    return
                 await self.backend.load_slot(record.slot, record.lora_rank, record.lora_alpha)
         except Exception as error:  # noqa: BLE001
-            self._forget_model(record)
-            self.free_slots.add(record.slot)
+            if self.models.get(record.model_id) is record:
+                self._forget_model(record)
+                self.free_slots.add(record.slot)
             self.promises.fail(request_id, str(error), "server")
+            return
+        if self.models.get(record.model_id) is not record:
+            self.promises.fail(request_id, "model released during initialization", "user")
             return
         self.promises.resolve(request_id, {"kind": "create_model", "model_id": record.model_id})
 
@@ -179,7 +191,7 @@ class TinkerService:
     def unload_model(self, tenant: str, model_id: str) -> str:
         """Free the slot behind a promise; queued commands fail typed."""
         record = self.get_model(tenant, model_id)
-        promise = self.promises.create(model_id, tenant)
+        promise = self.promises.create(model_id, tenant, session_id=record.session_id)
 
         async def _unload() -> None:
             try:
@@ -190,7 +202,7 @@ class TinkerService:
                 return
             self.promises.resolve(promise.request_id, {"kind": "unload_model", "model_id": model_id})
 
-        self._spawn(_unload())
+        self._spawn(_unload(), session_id=record.session_id)
         return promise.request_id
 
     def training_run(self, tenant: str, model_id: str) -> dict:
@@ -207,10 +219,16 @@ class TinkerService:
             "corrupted": False,
         }
 
-    def _spawn(self, coroutine) -> None:
+    def _spawn(self, coroutine, *, session_id: str = "") -> None:
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._background_owners[task] = session_id
+
+        def done(task: asyncio.Task) -> None:
+            self._background_tasks.discard(task)
+            self.heartbeat(self._background_owners.pop(task, ""))
+
+        task.add_done_callback(done)
 
     # -------- command plane --------
 
@@ -219,6 +237,7 @@ class TinkerService:
         rejections and fail the promise (the SDK sees RequestFailedError)."""
         model_id = payload["model_id"]
         record = self.get_model(tenant, model_id)
+        self.heartbeat(record.session_id)
         record.last_request_at = time.time()
         seq_id = payload["seq_id"]
         stream = self.planner.stream(model_id)
@@ -228,7 +247,8 @@ class TinkerService:
         if seq_id in stream.request_id_by_seq:
             return stream.request_id_by_seq[seq_id]
 
-        promise = self.promises.create(model_id, tenant)
+        window = self._result_windows.setdefault(model_id, ResultWindow())
+        promise = self.promises.create(model_id, tenant, session_id=record.session_id, window=window)
         stream.request_id_by_seq[seq_id] = promise.request_id
         try:
             self._admit(kind, payload)
@@ -249,6 +269,7 @@ class TinkerService:
                 arrival=self._arrival_counter,
             )
         )
+        self._close_drained_window(stream)
         if kind in ("forward_backward", "forward_only"):
             self._last_submit_at[model_id] = time.monotonic()
         self._wake.set()
@@ -280,7 +301,23 @@ class TinkerService:
 
     def retrieve(self, tenant: str, request_id: str) -> Promise | None:
         """None -> the HTTP layer answers 410."""
-        return self.promises.get(request_id, tenant)
+        promise = self.promises.get(request_id, tenant)
+        if promise is not None:
+            self.heartbeat(promise.session_id)
+        return promise
+
+    def _finish_request(self, stream: ModelStream, pending) -> None:
+        stream.finish(pending)
+        record = self.models.get(stream.model_id)
+        if record is not None:
+            self.heartbeat(record.session_id)
+        self._close_drained_window(stream)
+
+    def _close_drained_window(self, stream: ModelStream) -> None:
+        if not stream.queue and not stream.arrivals:
+            window = self._result_windows.pop(stream.model_id, None)
+            if window is not None:
+                window.close()
 
     # -------- sampling plane (promise-based but never queues) --------
 
@@ -321,11 +358,16 @@ class TinkerService:
         if None not in dedup_key and dedup_key in self._sample_by_seq:
             return self._sample_by_seq[dedup_key]  # a 429/timeout retry of the same seq
         model_path = payload.get("model_path")
+        session_id = ""
         if sampling_session_id:
             session = self.get_sampler(tenant, sampling_session_id)
             model_path = model_path or session["model_path"]
+            session_id = self.sampling_sessions[sampling_session_id]["session_id"]
         lora_name = self._resolve_sampler(tenant, model_path) if model_path else None
-        promise = self.promises.create(model_path or "base", tenant)
+        if not session_id and model_path:
+            session_id = self.get_model(tenant, _path_model_id(model_path)).session_id
+        self.heartbeat(session_id)
+        promise = self.promises.create(model_path or "base", tenant, session_id=session_id, sampling=True)
         sequence_ids = [f"seq-{uuid.uuid4().hex}" for _ in range(payload.get("num_samples", 1))]
         payload = {**payload, "tenant": tenant}  # R3 caches routing per tenant
         task = asyncio.create_task(self._run_sample(promise.request_id, payload, lora_name))
@@ -343,6 +385,8 @@ class TinkerService:
         if self._sample_by_seq.get(entry[4], (None,))[0] == request_id:
             del self._sample_by_seq[entry[4]]  # a later resubmit of this seq samples afresh (harmless)
         promise = self.promises.get(request_id, entry[1])
+        if promise is not None:
+            self.heartbeat(promise.session_id)
         if promise is not None and promise.state == PENDING:
             self.promises.fail(request_id, "cancelled", "user")  # cancelled before the task ever ran
 
@@ -404,6 +448,7 @@ class TinkerService:
         if session is None:
             return
         session["last_heartbeat"] = float("-inf")
+        session["ending"] = True
         await self._sweep_once()
 
     async def sweep_leases(self) -> None:
@@ -415,40 +460,71 @@ class TinkerService:
             self._sweep_backend()
 
     def _sweep_backend(self) -> None:
+        self.promises.sweep()
         try:
             self.backend.sweep()
         except Exception as error:  # noqa: BLE001  housekeeping never stops the lease sweep
             logger.warning(f"backend sweep failed: {type(error).__name__}: {error}")
 
     async def _sweep_once(self) -> None:
-        now = time.monotonic()
-        stale_sessions = {
-            session_id
-            for session_id, session in self.sessions.items()
-            if now - session["last_heartbeat"] >= self.config.lease_timeout_s
-        }
-        fresh_tenants = {s["tenant"] for sid, s in self.sessions.items() if sid not in stale_sessions}
+        # SESSION_END and the periodic sweep may overlap while unloading waits
+        # for a training unit. A single owner performs reclamation.
+        async with self._lease_lock:
+            await self._reclaim_stale_sessions()
+
+    def _active_sessions(self) -> set[str]:
+        # Ownership ends in the done callback, which also starts the idle grace;
+        # task.done() can become true one event-loop turn before that callback.
+        active = set(self._background_owners.values())
+        active.update(
+            record.session_id for record in self.models.values() if self.planner.stream(record.model_id).queue
+        )
+        for request_id, (_task, tenant, _sid, _lora, _key) in self._sample_tasks.items():
+            promise = self.promises.get(request_id, tenant)
+            if promise is not None:
+                active.add(promise.session_id)
+        return active
+
+    async def _reclaim_stale_sessions(self) -> None:
+        # A missing SDK heartbeat is not abandonment while the server still owes
+        # work. Gapped arrivals alone are not runnable and cannot hold a lease forever.
+        for session_id in self._active_sessions():
+            self.heartbeat(session_id)
+
+        def expired(session: dict) -> bool:
+            return time.monotonic() - session["last_heartbeat"] >= self.config.lease_timeout_s
+
+        stale_sessions = {sid for sid, session in self.sessions.items() if expired(session)}
 
         def is_stale(session_id: str, tenant: str) -> bool:
             if session_id in self.sessions:
-                return session_id in stale_sessions
+                return expired(self.sessions[session_id])
             # no session of its own: falls back to the tenant's freshest session
-            return bool(self.sessions) and tenant not in fresh_tenants
+            return bool(self.sessions) and not any(
+                session["tenant"] == tenant and not expired(session) for session in self.sessions.values()
+            )
 
         for sampling_session_id, session in list(self.sampling_sessions.items()):
             if is_stale(session["session_id"], session["tenant"]):
                 del self.sampling_sessions[sampling_session_id]
         for request_id, (task, tenant, sampling_session_id, _lora, _key) in list(self._sample_tasks.items()):
             orphaned = sampling_session_id is not None and sampling_session_id not in self.sampling_sessions
-            if orphaned or is_stale("", tenant):
+            promise = self.promises.get(request_id, tenant)
+            if orphaned or is_stale(promise.session_id if promise else "", tenant):
                 logger.warning(f"lease expired for sample {request_id}; cancelling")
                 task.cancel()
         for record in list(self.models.values()):
+            # Unloading an earlier model can await the backend lock. Work admitted
+            # meanwhile, or a fresh heartbeat, must not inherit that stale snapshot.
+            for session_id in self._active_sessions():
+                self.heartbeat(session_id)
             if is_stale(record.session_id, record.tenant):
                 logger.warning(f"lease expired for {record.model_id}; freeing slot {record.slot}")
                 await self._release_model(record, "lease expired")
         for session_id in stale_sessions:
-            del self.sessions[session_id]
+            session = self.sessions.get(session_id)
+            if session is not None and expired(session):
+                self.sessions.pop(session_id, None)
 
     async def _release_model(self, record: ModelRecord, reason: str) -> None:
         """Forget the model, fail what it still owes, and give the slot and
@@ -477,6 +553,9 @@ class TinkerService:
             self.free_slots.add(record.slot)
 
     def _forget_model(self, record: ModelRecord) -> None:
+        window = self._result_windows.pop(record.model_id, None)
+        if window is not None:
+            window.close()
         self.models.pop(record.model_id, None)
         self.planner.remove_stream(record.model_id)
         self._last_submit_at.pop(record.model_id, None)
@@ -577,7 +656,7 @@ class TinkerService:
                 self.promises.resolve(
                     request.command.request_id, {"kind": request.command.kind, "outputs": request.outputs}
                 )
-                ref.stream.finish(request)
+                self._finish_request(ref.stream, request)
 
     def _fail_riders(self, refs, error: str, category: str, poison: bool) -> None:
         seen: set[int] = set()
@@ -588,7 +667,7 @@ class TinkerService:
                 continue
             seen.add(id(ref.request))
             self.promises.fail(ref.request.command.request_id, error, category)
-            ref.stream.finish(ref.request)
+            self._finish_request(ref.stream, ref.request)
 
     async def _run_barrier(self, unit: BarrierUnit) -> None:
         if unit.kind == "optim_step":
@@ -606,7 +685,7 @@ class TinkerService:
             return
         for (stream, pending), result in zip(unit.entries, results, strict=True):
             self.promises.resolve(pending.command.request_id, result)
-            stream.finish(pending)
+            self._finish_request(stream, pending)
 
     async def _discard_dirty(self, unit: BarrierUnit) -> BarrierUnit:
         """A poisoned window must not step: drop its gradients and fail the
@@ -626,13 +705,13 @@ class TinkerService:
                 "user",
             )
             stream.dirty = None
-            stream.finish(pending)
+            self._finish_request(stream, pending)
         return BarrierUnit(kind=unit.kind, entries=clean)
 
     def _fail_barrier(self, unit: BarrierUnit, error: str, category: str) -> None:
         for stream, pending in unit.entries:
             self.promises.fail(pending.command.request_id, error, category)
-            stream.finish(pending)
+            self._finish_request(stream, pending)
 
     async def _execute_barrier(self, unit: BarrierUnit) -> list[dict]:
         if unit.kind == "optim_step":

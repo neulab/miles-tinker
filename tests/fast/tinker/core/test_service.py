@@ -550,7 +550,7 @@ async def test_leases_are_per_session_not_per_tenant(service):
     assert live_model in service.models
 
 
-async def test_a_stale_sampling_session_cancels_its_samples(service):
+async def test_an_explicit_session_end_cancels_its_samples(service):
     session_id = service.create_session("tenant", {})
     sid = service.create_sampling_session("tenant", {"session_id": session_id, "base_model": "base"})
     gate = asyncio.Event()
@@ -561,8 +561,7 @@ async def test_a_stale_sampling_session_cancels_its_samples(service):
 
     service.backend.sample = slow_sample
     request_id, _ = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid))
-    service.sessions[session_id]["last_heartbeat"] -= service.config.lease_timeout_s + 1
-    await service._sweep_once()
+    await service.end_session(session_id)
 
     promise = await await_settled(service, "tenant", request_id)
     assert (promise.state, promise.error) == (FAILED, "cancelled")
