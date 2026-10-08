@@ -8,6 +8,7 @@ import queue
 import sys
 import types
 from argparse import Namespace
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -238,10 +239,18 @@ def test_reset_optimizer_state_zeroes_moments_and_clocks(rig):
     assert optimizer.inner.param_groups[0]["step"] == 0
 
 
-def test_save_state_uses_a_temporary_synchronous_save_dir(rig):
+def test_save_state_uses_a_temporary_synchronous_save_dir(rig, monkeypatch):
     rig.args.save = "/native"
     rig.args.async_save = True
-    rig.executor.save_state(rig.args, rig.model, FakeOptimizer(), "/ckpt/weights/step-1")
+    optimizer = FakeOptimizer()
+
+    def save(iteration, model, supplied_optimizer, scheduler):
+        assert rig.args.save == "/ckpt/weights/step-1" and rig.args.async_save is False
+        assert model is rig.model and supplied_optimizer is optimizer
+        rig.log.append(f"save:{iteration}")
+
+    monkeypatch.setattr(rig.executor, "save", save)
+    rig.executor.save_state(rig.args, rig.model, optimizer, "/ckpt/weights/step-1")
     assert rig.log == [f"save:{rig.executor.SAVE_ITERATION}"]
     assert (rig.args.save, rig.args.async_save) == ("/native", True), "args restored after the save"
 
@@ -274,6 +283,95 @@ def test_load_state_without_optimizer_gives_a_fresh_optimizer(rig):
     assert optimizer.calls == ["reload_model_params"], "masters refreshed from the loaded weights"
     assert optimizer.inner.state["p"]["step"].item() == 0, "weights-only load means a fresh optimizer"
     assert rig.args.load == "/base", "args restored after the load"
+
+
+@pytest.mark.parametrize("output_size", [1, 3], ids=["critic", "policy"])
+@pytest.mark.parametrize("load_optimizer", [True, False], ids=["resume", "weights_only"])
+def test_checkpoint_load_preserves_the_expected_next_adam_update(rig, monkeypatch, output_size, load_optimizer):
+    """Exercise load orchestration with real CPU weights/Adam; Megatron decoding is stubbed."""
+    torch.manual_seed(42)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 4), torch.nn.Tanh(), torch.nn.Linear(4, output_size))
+    adam = torch.optim.Adam(model.parameters(), lr=0.01)
+    inputs = torch.tensor([[0.2, -0.4], [0.7, 0.3]])
+
+    def update(model, optimizer):
+        optimizer.zero_grad()
+        model(inputs).square().mean().backward()
+        optimizer.step()
+
+    for _ in range(3):
+        update(model, adam)
+    saved_weights, saved_optimizer = deepcopy(model.state_dict()), deepcopy(adam.state_dict())
+    # Every backbone/head parameter must have initialized moments, including head bias.
+    assert len(saved_optimizer["state"]) == len(list(model.parameters()))
+    expected = deepcopy(model)
+    expected_adam = torch.optim.Adam(expected.parameters(), lr=0.01)
+    if load_optimizer:
+        expected_adam.load_state_dict(deepcopy(saved_optimizer))
+    update(expected, expected_adam)
+
+    for _ in range(2):
+        update(model, adam)
+    reloads = []
+    optimizer = SimpleNamespace(optimizer=adam, reload_model_params=lambda: reloads.append(True))
+    rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng, rig.args.ckpt_step = True, True, False, 77
+    original_args = vars(rig.args).copy()
+
+    def load_checkpoint(models, restored_optimizer, scheduler, **kwargs):
+        assert models == [model]
+        assert rig.args.load == "/saved" and rig.args.ckpt_step is None
+        assert rig.args.finetune is False and rig.args.no_load_optim is not load_optimizer
+        model.load_state_dict(saved_weights)
+        if load_optimizer:
+            assert restored_optimizer is optimizer
+            adam.load_state_dict(deepcopy(saved_optimizer))
+        else:
+            assert restored_optimizer is None
+
+    monkeypatch.setattr(rig.executor, "load_checkpoint", load_checkpoint)
+    monkeypatch.setattr(rig.executor, "_zero_grads", lambda *args: adam.zero_grad(set_to_none=True))
+    rig.executor._state.update(pending_finalize=True, dirty=True)
+    rig.executor.load_state(rig.args, [model], optimizer, "/saved", load_optimizer)
+
+    assert vars(rig.args) == original_args
+    assert reloads == ([] if load_optimizer else [True])
+    assert not rig.executor._state["pending_finalize"] and not rig.executor._state["dirty"]
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, saved_weights[name], rtol=0, atol=0)
+    assert all(param.grad is None for param in model.parameters())
+    for state in adam.state.values():
+        assert state["step"].item() == (3 if load_optimizer else 0)
+        if not load_optimizer:
+            assert torch.count_nonzero(state["exp_avg"]) == 0
+            assert torch.count_nonzero(state["exp_avg_sq"]) == 0
+
+    update(model, adam)
+    for actual, reference in zip(model.parameters(), expected.parameters(), strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        for field in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                adam.state[actual][field], expected_adam.state[reference][field], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_checkpoint_failure_restores_temporary_args(rig, monkeypatch, operation):
+    rig.args.save, rig.args.async_save = "/native-save", True
+    rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng, rig.args.ckpt_step = True, True, False, 77
+    original_args = vars(rig.args).copy()
+    optimizer = FakeOptimizer()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("checkpoint I/O failed")
+
+    monkeypatch.setattr(rig.executor, "save" if operation == "save" else "load_checkpoint", fail)
+    with pytest.raises(RuntimeError, match="checkpoint I/O failed"):
+        if operation == "save":
+            rig.executor.save_state(rig.args, rig.model, optimizer, "/saved")
+        else:
+            rig.executor.load_state(rig.args, rig.model, optimizer, "/saved", True)
+    assert vars(rig.args) == original_args
+    assert "zero_grads" not in rig.log, "a failed load must not be reported as a completed reset"
 
 
 def test_reset_to_base_reloads_the_startup_weights(rig):

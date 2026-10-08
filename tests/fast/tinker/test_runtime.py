@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from miles.ray.rollout.train_data_conversion import split_train_data_by_dp_raw
 from miles.tinker.core.types import UserInputError
 from miles.tinker.runtime import (
     PAD_ROW,
@@ -121,6 +122,50 @@ def test_dp_size_derives_from_the_actor_topology():
     assert _backend(actor_num_gpus_per_node=8, tensor_model_parallel_size=1).dp_size == 8
 
 
+def test_critic_targets_weights_and_role_survive_padding_and_dp_partitioning():
+    rows = [
+        (0, _row([10, 20, 30], values=[1.0, 2.0], returns=[3.0, 4.0], weights=[0.0, 0.5])),
+        (0, _row([40, 50], values=[5.0], returns=[6.0], weights=[1.0])),
+        (0, _row([60, 70], values=[7.0], returns=[8.0], weights=[2.0])),
+    ]
+    data = _build_train_data(rows, dp_size=2, with_adapter_slots=False)
+    data.update(model_role="critic", loss_fn="ppo", loss_fn_config={"value_clip": 0.3})
+    shards = split_train_data_by_dp_raw(Namespace(balance_data=False), data, dp_size=2)
+    assert shards[0]["values"] == [[1.0, 2.0], [7.0]]
+    assert shards[0]["returns"] == [[3.0, 4.0], [8.0]]
+    assert shards[1]["values"] == [[5.0], [0.0]]
+    assert shards[1]["returns"] == [[6.0], [0.0]]
+    assert shards[1]["loss_weights"] == [[1.0], [0.0]]
+    assert shards[1]["loss_masks"] == [[1], [0]]
+    for shard in shards:
+        assert shard["model_role"] == "critic" and shard["loss_fn"] == "ppo"
+        assert shard["loss_fn_config"] == {"value_clip": 0.3}
+
+
+async def test_critic_backward_returns_values_and_preserves_client_loss_inputs(monkeypatch):
+    backend = MilesBackend(_args(tinker_train_mode="full"), None, "http://router", role="critic")
+    row = _row([10, 20, 30], values=[0.0, 0.1], returns=[1.0, 2.0], weights=[0.0, 0.5])
+
+    async def run_unit(method, unit_id, data):
+        assert method == "forward_backward" and unit_id == 3
+        assert data["model_role"] == "critic" and data["loss_fn"] == "ppo"
+        assert data["values"] == [row["values"], [0.0]]
+        assert data["returns"] == [row["returns"], [0.0]]
+        assert data["loss_weights"] == [row["weights"], [0.0]]
+        assert data["loss_fn_config"] == {"value_clip": 0.3}
+        assert "adapter_slots" not in data
+        outputs = [
+            dict(sample_index=1, loss=0.0, values=torch.tensor([0.0])),
+            dict(sample_index=0, loss=1.0, values=torch.tensor([0.1, 0.2])),
+        ]
+        return [{"per_datum": []}, {"per_datum": outputs}, {"per_datum": outputs}]
+
+    monkeypatch.setattr(backend, "_run_unit", run_unit)
+    result = await backend.forward_backward(3, [(0, row)], "ppo", {"value_clip": 0.3})
+    assert result == [{"loss": 1.0, "values": pytest.approx([0.1, 0.2])}]
+    assert backend._window_counts == {0: {"num_units": 1, "num_datums": 1, "num_tokens": 3}}
+
+
 async def test_forward_backward_merges_worker_replicas_and_strips_padding():
     backend = _backend(actor_num_gpus_per_node=8, tensor_model_parallel_size=2)  # dp 4
     per_datum = [
@@ -156,6 +201,28 @@ async def test_full_mode_units_carry_no_adapter_slots():
     backend._run_unit = fake_run_unit
     await backend.forward_backward(1, [(0, _row([1, 2]))], "cross_entropy", {})
     assert "adapter_slots" not in seen[0] and seen[0]["dynamic_global_batch_size"] == 2
+
+
+@pytest.mark.parametrize("role, output_key", [("policy", "logprobs"), ("critic", "values")])
+async def test_forward_dispatch_merges_replicas_and_strips_padding(monkeypatch, role, output_key):
+    backend = MilesBackend(_args(tinker_train_mode="full"), None, "http://router", role=role)
+    outputs = {"sample_indices": [1, 0], output_key: [torch.tensor([999.0]), torch.tensor([0.1, 0.2])]}
+    seen = []
+
+    async def run_unit(method, unit_id, train_data):
+        seen.append((method, unit_id, train_data))
+        return [None, outputs, outputs]
+
+    monkeypatch.setattr(backend, "_run_unit", run_unit)
+    monkeypatch.setattr("miles.tinker.runtime._box_get", lambda box: box)
+    result = await backend.forward_only(7, [(0, _row([10, 20, 30]))], "ppo", {})
+    assert result == [{"loss": 0.0, output_key: pytest.approx([0.1, 0.2])}]
+    method, unit_id, batch = seen[0]
+    assert (method, unit_id) == (f"forward_only_{output_key}", 7)
+    assert batch["tokens"] == [[10, 20, 30], PAD_ROW["tokens"]]
+    assert batch["response_lengths"] == [2, 1]
+    assert "adapter_slots" not in batch
+    assert backend._window_counts == {}, "forward must not open an optimizer window"
 
 
 class TestOptimStep:
@@ -222,6 +289,13 @@ class TestOptimStep:
 
 
 class TestControlCommands:
+    async def test_onload_initializes_discarded_grad_buffers_before_use(self):
+        trainer = FakeTrainer()
+        backend = _backend(trainer, tinker_train_mode="full")
+        await backend.onload()
+        await backend.offload()
+        assert trainer.calls == [("onload", {}), ("discard_grads", {"slot": 0}), ("offload", {})]
+
     async def test_warmup_lora_runs_an_empty_update_weights_round(self):
         controller = FakeInferenceController()
         trainer = FakeTrainer()

@@ -112,7 +112,16 @@ def build_app(service: TinkerService) -> FastAPI:
     @app.post("/api/v1/get_server_capabilities")
     @app.get("/api/v1/get_server_capabilities")
     async def get_server_capabilities():
-        return {"supported_models": [{"model_name": service.config.base_model, "trainable": True, "sampleable": True}]}
+        return {
+            "supported_models": [{"model_name": service.config.base_model, "trainable": True, "sampleable": True}],
+            "extensions": {
+                "critic": service.config.enable_critic,
+                "value_loss": "ppo",
+                "critic_ppo_reduction": "weighted_sum",
+                "value_alignment": "before_target",
+                "offload_pending_gradients": False,
+            },
+        }
 
     @app.post("/api/v1/create_model")
     async def create_model(request: Request):
@@ -128,6 +137,7 @@ def build_app(service: TinkerService) -> FastAPI:
         return {
             "type": "get_info",
             "model_id": record.model_id,
+            "model_role": record.model_role,
             "is_lora": record.is_lora,
             "lora_rank": lora_rank,
             "model_name": record.base_model,

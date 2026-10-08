@@ -25,17 +25,22 @@ BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 class _Gateway:
     """The app + service loop in a daemon thread; the sync SDK runs in the test thread."""
 
-    def __init__(self) -> None:
+    def __init__(self, service_factory=None) -> None:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
         self.service = None
+        self._service_factory = service_factory
         self._server = None
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
     def _serve(self) -> None:
         async def main():
-            self.service = make_service(base_model=BASE_MODEL, n_slots=2, retrieve_poll_timeout_s=1.0)
+            self.service = (
+                self._service_factory()
+                if self._service_factory is not None
+                else make_service(base_model=BASE_MODEL, n_slots=2, retrieve_poll_timeout_s=1.0)
+            )
             run_task = asyncio.create_task(self.service.run())
             self._server = uvicorn.Server(
                 uvicorn.Config(build_app(self.service), host="127.0.0.1", port=self.port, log_level="warning")

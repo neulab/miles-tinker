@@ -32,6 +32,7 @@ def _sandbox_main():
         "Port 2222\nListenAddress 0.0.0.0\nPermitRootLogin prohibit-password\n"
         "PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n"
         "AllowTcpForwarding remote\nGatewayPorts no\n"
+        "ChannelTimeout forwarded-tcpip=6m\n"
         f"PermitListen 127.0.0.1:{port}\n"
     )
     Path("/tmp/relay_nginx.conf").write_text(
@@ -134,8 +135,6 @@ def _run_relay(root, port, timeout):
                 f"UserKnownHostsFile={runtime / 'modal-known-hosts'}",
                 "-o",
                 "ExitOnForwardFailure=yes",
-                "-o",
-                "ChannelTimeout=forwarded-tcpip=6m",
                 "-o",
                 "ServerAliveInterval=30",
                 "-o",

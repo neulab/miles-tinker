@@ -26,8 +26,10 @@ is too small for setup, prefix the command with `MILES_AMD_TMPDIR=/dev/shm`.
 Modal credentials stay in your home directory. To select an existing Modal
 profile, export `MODAL_PROFILE` before setup and serve.
 
-**Qwen3.5 only:** convert each model once before serving. Qwen3 loads directly
-and does not need this step. Choose a matching definition from
+**Model conversion:** Qwen3.5 requires conversion before serving. The Qwen3
+policy-only example below loads directly through HF bridge; the
+[PPO example](#ppo-example) uses converted Qwen3 weights as well.
+Choose a matching definition from
 [`scripts/models`](../../scripts/models).
 
 ```bash
@@ -114,3 +116,35 @@ unlinked historical model IDs are left alone.
 
 Full-training Tinker currently requires separate training and inference GPUs;
 colocated GRPO with inference offload is not supported by this serving path.
+
+## PPO example
+
+After the MI350 setup above, convert Qwen3-4B once, then start a PPO server.
+Actor and critic share four training GPUs with offloading; four dedicated
+GPUs serve inference. Use a fresh run name for each experiment.
+
+```bash
+PPO_RUN=tinker-ppo-dapo
+python3 tools/amd_tinker.py convert --root "$MILES_AMD_ROOT" \
+  --gpu mi350 --model-family qwen3 \
+  --model-id Qwen/Qwen3-4B --model-type qwen3-4B
+
+python3 tools/amd_tinker.py serve --root "$MILES_AMD_ROOT" --gpu mi350 \
+  --model-id Qwen/Qwen3-4B --model-type qwen3-4B \
+  --train-gpus 4 --rollout-gpus 4 --tp 1 --pp 1 --cp 1 \
+  --mem-fraction 0.9 --keep-checkpoints 3 \
+  --checkpoint-root "$MILES_AMD_ROOT/runs/$PPO_RUN/checkpoints" -- \
+  --bf16 --megatron-to-hf-mode raw \
+  --load "$MILES_AMD_ROOT/models/Qwen3-4B_torch_dist" \
+  --critic-load "$MILES_AMD_ROOT/models/Qwen3-4B_torch_dist" \
+  --tinker-enable-critic --offload-train --balance-data \
+  --rollout-temperature 0.8 --seed 1234 \
+  --sglang-max-running-requests 512 \
+  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+```
+
+In a second terminal, follow the [DAPO-Math-17K client instructions](../fork/tinker-ppo-client.md#client--terminal-2),
+setting `PPO_ROOT` to the same directory as `MILES_AMD_ROOT` and using the same
+`PPO_RUN`. That page includes client environment and dataset preparation,
+PPO flag descriptions, and async/resume options. For the API and supported
+GPU layouts, see [PPO through Tinker](../fork/tinker-ppo.md).

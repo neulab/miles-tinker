@@ -13,6 +13,7 @@ from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_funct
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
+    compute_clipped_value_loss,
     compute_ess_ratio_contribution,
     compute_gspo_kl,
     compute_opsm_mask,
@@ -434,10 +435,7 @@ def value_loss_function(
     returns = torch.cat(batch["returns"], dim=0)
 
     values_clipfrac = torch.abs(values - old_values) > args.value_clip
-    values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
-    surr1 = (values_clipped - returns) ** 2
-    surr2 = (values - returns) ** 2
-    loss = torch.max(surr1, surr2)
+    loss = compute_clipped_value_loss(values, old_values, returns, args.value_clip)
 
     loss = sum_of_sample_mean(loss)
     values_clipfrac = sum_of_sample_mean(values_clipfrac.float())

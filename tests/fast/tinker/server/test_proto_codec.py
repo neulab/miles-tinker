@@ -6,7 +6,7 @@ import pytest
 
 tinker = pytest.importorskip("tinker")
 
-from miles.tinker.server.encoding import decode_command  # noqa: E402
+from miles.tinker.server.encoding import decode_command, render_result  # noqa: E402
 from miles.tinker.server.proto_codec import (  # noqa: E402
     decode_forward_backward_request,
     encode_forward_backward_output,
@@ -14,6 +14,7 @@ from miles.tinker.server.proto_codec import (  # noqa: E402
     maybe_decompress,
 )
 from tinker import types  # noqa: E402
+from tinker.lib.chunked_fwdbwd_helpers import combine_fwd_bwd_output_results  # noqa: E402
 from tinker.proto.request_conv import forward_backward_request_to_proto  # noqa: E402
 from tinker.proto.response_conv import deserialize_forward_backward_output, deserialize_sample_response  # noqa: E402
 
@@ -136,3 +137,18 @@ def test_our_forward_backward_metrics_carry_token_and_datum_counts():
     )
     parsed = deserialize_forward_backward_output(encoded)
     assert parsed.metrics == {"loss:sum": 2.0, "num_tokens:sum": 3.0, "num_datums:sum": 2.0}
+
+
+def test_sdk_chunk_reduction_preserves_value_outputs_and_counts():
+    chunks = []
+    for _ in range(2):
+        result = {
+            "kind": "forward_only",
+            "outputs": [{"loss": 0.0, "values": [0.25, -0.5]}],
+        }
+        parsed = deserialize_forward_backward_output(encode_forward_backward_output(result))
+        assert parsed.metrics == render_result(result)["metrics"]
+        chunks.append(parsed)
+    combined = combine_fwd_bwd_output_results(chunks)
+    assert combined.metrics == {"loss:sum": 0.0, "num_tokens:sum": 4.0, "num_datums:sum": 2.0}
+    assert [row["values"].data for row in combined.loss_fn_outputs] == [[0.25, -0.5], [0.25, -0.5]]

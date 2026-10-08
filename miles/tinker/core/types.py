@@ -7,6 +7,9 @@ miles (trainer batches). Each foreign language lives only at its boundary.
 
 import time
 from dataclasses import dataclass, field
+from typing import Literal
+
+ModelRole = Literal["policy", "critic"]
 
 
 class UserInputError(Exception):
@@ -26,9 +29,12 @@ class GatewayConfig:
     max_tokens_per_datum: int = 32768
     max_tokens_per_request: int = 4_000_000
     lora_alpha: float | None = None  # None: 2 * rank
-    lease_timeout_s: float = 600.0  # SDK heartbeats every 10 s from a background thread; silence means the client is gone
+    lease_timeout_s: float = (
+        600.0  # SDK heartbeats every 10 s from a background thread; silence means the client is gone
+    )
     unit_token_budget: int = 262_144  # packing bound per work unit
     train_mode: str = "lora"  # "lora" | "full"
+    enable_critic: bool = False  # full mode: slot 0 policy, slot 1 critic
     retrieve_poll_timeout_s: float = 20.0  # long-poll cap on /retrieve_future (< the SDK's 45 s)
     checkpoints_to_keep: int = 3
     sampler_versions_to_keep: int = 3  # LoRA: adapter versions kept loaded per model
@@ -62,6 +68,7 @@ class ModelRecord:
     lora_alpha: float
     session_id: str
     is_lora: bool = True
+    model_role: ModelRole = "policy"
     checkpoint_lineage: str = ""
     checkpoint_state: str = ""
     resume_started_at: float = field(default_factory=time.time)

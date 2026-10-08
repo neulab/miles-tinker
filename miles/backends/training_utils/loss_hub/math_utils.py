@@ -18,6 +18,16 @@ from miles.backends.training_utils.parallel import get_parallel_state
 _LOG_RATIO_EXP_CLAMP = 20.0
 
 
+def compute_clipped_value_loss(
+    values: torch.Tensor, old_values: torch.Tensor, returns: torch.Tensor, value_clip: float
+) -> torch.Tensor:
+    """Per-token PPO value loss, before masking or reduction."""
+    values_clipped = old_values + (values - old_values).clamp(-value_clip, value_clip)
+    surr1 = (values_clipped - returns) ** 2
+    surr2 = (values - returns) ** 2
+    return torch.max(surr1, surr2)
+
+
 def _safe_clamp_log_ratio(log_ratio: torch.Tensor) -> torch.Tensor:
     log_ratio = torch.nan_to_num(
         log_ratio.float(),

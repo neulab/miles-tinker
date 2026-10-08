@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 def validate_tinker_serve_args(args) -> None:
     """Constraints of the Tinker gateway executors (entry == "serve")."""
+    if getattr(args, "tinker_enable_critic", False):
+        assert args.tinker_train_mode == "full", "--tinker-enable-critic requires --tinker-train-mode full"
+        assert args.train_backend == "megatron", "--tinker-enable-critic requires the Megatron backend"
+        assert not getattr(args, "colocate", False), "Tinker PPO currently requires dedicated inference GPUs"
     if args.tinker_train_mode == "full":
         assert (
             args.multi_lora_n_adapters == 0
@@ -20,10 +24,13 @@ def validate_tinker_serve_args(args) -> None:
             "--tinker-train-mode full accumulates gradients across forward_backward calls by deferring "
             "finalize_model_grads to optim_step; --overlap-grad-reduce / --overlap-param-gather are not supported"
         )
-        assert not args.offload_train, (
-            "--tinker-train-mode full keeps accumulated gradients in GPU buffers between calls; "
-            "--offload-train (implied by --colocate) is not supported"
-        )
+        if args.offload_train:
+            assert getattr(
+                args, "tinker_enable_critic", False
+            ), "--tinker-train-mode full supports --offload-train only with --tinker-enable-critic"
+            # Native training may discard parameter buffers after a step.
+            # Tinker must restore weights for forward/save/load as well.
+            args.disable_param_buffers_cpu_backup = False
         assert (
             args.use_dynamic_batch_size
         ), "--tinker-train-mode full requires --use-dynamic-batch-size --max-tokens-per-gpu"
@@ -49,9 +56,14 @@ def validate_tinker_serve_args(args) -> None:
     assert (
         args.context_parallel_size == 1
     ), "the Tinker gateway returns per-datum logprobs; context parallelism is not supported"
-    assert (
-        args.rollout_temperature == 1.0
-    ), "the Tinker gateway scores logprobs at --rollout-temperature; Tinker semantics are untempered (keep 1.0)"
+    if getattr(args, "tinker_enable_critic", False):
+        # Native PPO scores the actor at the rollout temperature. The PPO client
+        # must sample at this same temperature; ordinary SDK serving stays at 1.
+        assert 0 < args.rollout_temperature < float("inf"), "PPO requires a positive finite --rollout-temperature"
+    else:
+        assert (
+            args.rollout_temperature == 1.0
+        ), "the Tinker gateway scores logprobs at --rollout-temperature; Tinker semantics are untempered (keep 1.0)"
     if getattr(args, "check_for_nan_in_loss_and_grad", False):
         # Megatron's DDP nan check raises inside the grad sync and kills the actor; the executors veto the step instead.
         logger.info("Tinker gateway: setting check_for_nan_in_loss_and_grad=False (non-finite steps are vetoed)")

@@ -16,6 +16,7 @@ import shutil
 import time
 import uuid
 
+from miles.tinker.core.critic import validate_model_pass
 from miles.tinker.core.planner import BarrierUnit, Planner, WorkUnit
 from miles.tinker.core.promise import PENDING, Promise, PromiseStore
 from miles.tinker.core.retention import checkpoint_lock, prune_checkpoints
@@ -30,6 +31,14 @@ SIDECAR_NAME = "tinker_meta.json"
 class ExecutorBackend:
     """What runtime.py implements. Speaks rows and plain lists; core stays
     torch-free and miles-free."""
+
+    async def onload(self) -> None:
+        """Restore a full-model trainer with no pending gradients."""
+        raise NotImplementedError
+
+    async def offload(self) -> None:
+        """Release a full-model trainer's GPU memory, preserving weights and optimizer."""
+        raise NotImplementedError
 
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
@@ -81,8 +90,11 @@ class ExecutorBackend:
 
 class TinkerService:
     def __init__(self, backend: ExecutorBackend, config: GatewayConfig) -> None:
-        if not config.is_lora and config.n_slots != 1:
-            raise ValueError(f"train_mode='full' serves exactly one slot, got n_slots={config.n_slots}")
+        if config.enable_critic and config.is_lora:
+            raise ValueError("critic serving requires full finetuning")
+        expected_slots = 2 if config.enable_critic else 1
+        if not config.is_lora and config.n_slots != expected_slots:
+            raise ValueError(f"train_mode='full' requires {expected_slots} slots, got n_slots={config.n_slots}")
         if config.checkpoints_to_keep < 1:
             raise ValueError("checkpoints_to_keep must be at least 1")
         self._prune_lock = asyncio.Lock()
@@ -97,7 +109,9 @@ class TinkerService:
         self._wake = asyncio.Event()
         self._backend_lock = asyncio.Lock()
         self._sample_slots = asyncio.Semaphore(config.max_concurrent_samples)
-        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
+        self._sample_tasks: dict[str, tuple] = (
+            {}
+        )  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
         self._sample_by_seq: dict[tuple, tuple[str, list[str]]] = {}  # (sampling_session_id, seq_id) -> reply
         self._model_by_seq: dict[tuple, tuple[str, str]] = {}  # (session_id, model_seq_id) -> reply
         self._background_tasks: set = set()
@@ -126,9 +140,19 @@ class TinkerService:
         if base_model != self.config.base_model:
             raise UserInputError(f"this gateway serves {self.config.base_model!r}, not {base_model!r}")
         is_lora, rank, alpha = _resolve_lora_config(self.config, payload.get("lora_config"))
-        if not self.free_slots:
+        role = payload.get("model_role", "policy")
+        if role not in ("policy", "critic"):
+            raise UserInputError("model_role must be policy or critic")
+        if role == "critic" and not self.config.enable_critic:
+            raise UserInputError("this server does not support critic models")
+        available = self.free_slots
+        if self.config.enable_critic:
+            available = available & {0 if role == "policy" else 1}
+            if any(record.tenant != tenant for record in self.models.values()):
+                raise UserInputError("the full actor/critic pair belongs to one tenant at a time")
+        if not available:
             raise UserInputError(_no_slot_message(self.config))
-        slot = min(self.free_slots)
+        slot = min(available)
         self.free_slots.remove(slot)
 
         model_id = f"model-{uuid.uuid4().hex[:12]}"
@@ -144,6 +168,7 @@ class TinkerService:
             lora_alpha=alpha,
             session_id=session_id,
             is_lora=is_lora,
+            model_role=role,
             sdk_version=str(self.sessions.get(session_id, {}).get("payload", {}).get("sdk_version") or ""),
             user_metadata=payload.get("user_metadata") or {},
         )
@@ -198,6 +223,7 @@ class TinkerService:
             "base_model": record.base_model,
             "model_owner": record.tenant,
             "is_lora": record.is_lora,
+            "model_role": record.model_role,
             "lora_rank": record.lora_rank if record.is_lora else None,
             "user_metadata": record.user_metadata,
             "created_at": record.created_at,
@@ -230,12 +256,15 @@ class TinkerService:
         stream.request_id_by_seq[seq_id] = promise.request_id
         try:
             self._admit(kind, payload)
+            if kind in ("forward_backward", "forward_only"):
+                validate_model_pass(record.model_role, kind, payload)
         except UserInputError as error:
             self.promises.fail(promise.request_id, str(error), "user")
             # the rejected command still consumes its seq position, or the
             # stream would wait for it forever
             payload = {**payload, "rows": []}
 
+        payload = {**payload, "model_role": record.model_role}
         self._arrival_counter += 1
         stream.submit(
             Command(
@@ -556,7 +585,8 @@ class TinkerService:
             request.remaining -= 1
             if request.remaining == 0:
                 self.promises.resolve(
-                    request.command.request_id, {"kind": request.command.kind, "outputs": request.outputs}
+                    request.command.request_id,
+                    {"kind": request.command.kind, "outputs": request.outputs},
                 )
                 ref.stream.finish(request)
 
@@ -687,6 +717,8 @@ class TinkerService:
 
     def _resolve_checkpoint(self, record: ModelRecord, tinker_path: str) -> tuple[str, dict]:
         path, meta = self._checkpoint_meta(record.tenant, tinker_path)
+        if meta.get("model_role", "policy") != record.model_role:
+            raise UserInputError("cannot load a checkpoint from a different model role")
         if bool(meta.get("is_lora", True)) != record.is_lora:
             raise UserInputError(f"checkpoint {tinker_path} was trained in mode {meta.get('train_mode')!r}")
         return path, meta
@@ -707,6 +739,8 @@ class TinkerService:
         return path, meta
 
     async def _publish_sampler(self, record: ModelRecord, payload: dict) -> dict:
+        if record.model_role != "policy":
+            raise UserInputError("critic models cannot publish sampler weights")
         requested_name = payload.get("name") or None
         version_hint = record.sampler_version + 1
         if record.is_lora:
@@ -806,6 +840,8 @@ def _resolve_lora_config(config: GatewayConfig, lora_config: dict | None) -> tup
 
 def _no_slot_message(config: GatewayConfig) -> str:
     if not config.is_lora:
+        if config.enable_critic:
+            return "this full fine-tuning gateway serves one policy and one critic for one tenant"
         return "this full fine-tuning gateway serves one model at a time"
     return f"no free adapter slots (capacity {config.n_slots})"
 
@@ -816,7 +852,9 @@ def _plain_metrics(metrics) -> dict:
     flag carries the meaning)."""
     if not isinstance(metrics, dict):
         metrics = {"grad_norm": metrics}
-    return {key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()}
+    return {
+        key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()
+    }
 
 
 def _finite_float(value) -> float:
@@ -826,6 +864,7 @@ def _finite_float(value) -> float:
 
 def sidecar_meta(record: ModelRecord, config: GatewayConfig, kind: str, name: str) -> dict:
     return {
+        "model_role": record.model_role,
         "model_id": record.model_id,
         "checkpoint_lineage": record.checkpoint_lineage or record.model_id,
         "checkpoint_state": record.checkpoint_state,

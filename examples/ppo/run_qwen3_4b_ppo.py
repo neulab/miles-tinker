@@ -20,12 +20,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
     model_name: str = "Qwen3-4B"
     megatron_model_type: str = "qwen3-4B"
-    # actor world size, and therefore the critic's too: must equal TP * PP * CP below.
+    # Physical GPUs available to Ray; actor and critic share the training pool.
     num_gpus_per_node: int = 4
+    train_gpus: int | None = None  # Defaults to all GPUs.
+    rollout_gpus: int = 0  # Zero keeps the original colocated inference layout.
     data_dir: str = "/root/datasets"
     model_dir: str = "/root/models"
     megatron_path: str = "/root/Megatron-LM"
     extra_args: str = ""
+
+    def __post_init__(self):
+        if self.train_gpus is None:
+            self.train_gpus = self.num_gpus_per_node
+        assert self.train_gpus > 0 and self.rollout_gpus >= 0
+        assert self.train_gpus + self.rollout_gpus <= self.num_gpus_per_node
 
 
 def prepare(args: ScriptArgs):
@@ -124,9 +132,13 @@ def execute(args: ScriptArgs):
         # need to comment this when using model with MLA
         "--attention-backend flash "
         "--actor-num-nodes 1 "
-        f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
-        "--colocate "
+        f"--actor-num-gpus-per-node {args.train_gpus} "
+        f"--num-gpus-per-node {args.num_gpus_per_node} "
     )
+    if args.rollout_gpus:
+        misc_args += f"--rollout-num-gpus {args.rollout_gpus} --offload-train --no-offload-rollout "
+    else:
+        misc_args += "--colocate "
 
     train_args = (
         f"{ckpt_args} "

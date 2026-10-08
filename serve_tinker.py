@@ -9,10 +9,12 @@ except ImportError:  # optional: the sglang image ships it, a bare miles install
     uvloop = None
 
 from miles.ray.rollout.inference_controller import InferenceController
+from miles.ray.specs.train import compute_critic_args
 from miles.ray.train.group import TrainerController
 from miles.ray.wiring import launch_worker_manager
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
+from miles.tinker.full_backend import FullModelBackend
 from miles.tinker.runtime import MilesBackend
 from miles.tinker.server.app import build_app
 from miles.utils import object_store
@@ -51,14 +53,26 @@ async def serve(args):
     )
     await trainer.init()
 
+    critic_trainer = None
+    if args.tinker_enable_critic:
+        critic_trainer = TrainerController(
+            args=compute_critic_args(args),
+            role="critic",
+            with_ref=False,
+            with_opd_teacher=False,
+            inference_controller=None,
+            rollout_executor=None,
+        )
+        await critic_trainer.init()
+
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     # the backend keeps its perf log beside the checkpoints, whichever flag named the root
     args.tinker_checkpoint_root = checkpoint_root
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
-        # full fine-tuning: one tenant, slot 0 is the base model
-        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
+        # Full-model slots are logical roles, independent of GPU placement.
+        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else (2 if args.tinker_enable_critic else 1),
         checkpoint_root=checkpoint_root,
         checkpoints_to_keep=args.tinker_checkpoints_to_keep,
         max_tokens_per_datum=max_tokens_per_datum,
@@ -66,13 +80,18 @@ async def serve(args):
         lease_timeout_s=args.tinker_lease_timeout_s,
         unit_token_budget=args.tinker_unit_token_budget,
         train_mode=train_mode,
+        enable_critic=args.tinker_enable_critic,
         retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
         sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
         coalesce_wait_s=args.tinker_coalesce_wait_s,
         max_concurrent_samples=args.tinker_max_concurrent_samples,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-    backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)
+    policy_backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)
+    backend = policy_backend
+    if critic_trainer is not None:
+        critic_backend = MilesBackend(args, critic_trainer, router_url, role="critic")
+        backend = FullModelBackend(policy_backend, critic_backend, offload=args.offload_train)
     service = TinkerService(backend, config)
 
     server = uvicorn.Server(

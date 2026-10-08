@@ -22,6 +22,7 @@ def losses(monkeypatch):
 
     stub = types.ModuleType("miles.backends.training_utils.loss_hub.logit_processors")
     stub.get_log_probs_and_entropy = get_log_probs_and_entropy
+    stub.get_values = lambda logits, **kwargs: {"values": list(logits.split(kwargs["response_lengths"]))}
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     monkeypatch.delitem(sys.modules, LOSSES, raising=False)
     module = importlib.import_module(LOSSES)
@@ -52,9 +53,7 @@ def test_cross_entropy_is_the_weighted_sum_of_datums(losses):
 def test_masked_out_datums_contribute_nothing_under_dro(losses):
     """DRO's divergence penalty does not vanish with advantage 0; the mask must remove the pad row."""
     real = _batch([[-1.0]], [[1]], rollout_log_probs=[[-1.5]], advantages=[[0.7]])
-    padded = _batch(
-        [[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]]
-    )
+    padded = _batch([[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]])
     losses.start_per_datum_outputs()
     loss_real, _ = losses.dro_loss_function(Namespace(), *real, None)
     loss_padded, _ = losses.dro_loss_function(Namespace(), *padded, None)
@@ -78,3 +77,55 @@ def test_pad_rows_are_inert_under_every_loss(losses):
         loss, _ = fn(Namespace(), batch, logits, None)
         loss.backward()
         assert logits.grad[2].item() == 0.0, f"{name}: the pad row must not reach the weights"
+
+
+def test_critic_ppo_clipping_weights_padding_and_fixed_targets(losses):
+    old = torch.zeros(4, requires_grad=True)
+    returns = torch.ones(4, requires_grad=True)
+    weights = torch.tensor([1.0, 2.0, 0.5, 0.0], requires_grad=True)
+    batch, logits = _batch(
+        [[0.8, -0.8, 0.1, 3.0], [9.0]],
+        [[1, 1, 1, 1], [0]],
+        model_role="critic",
+        values=[old, [0.0]],
+        returns=[returns, [1.0]],
+        loss_weights=[weights, [1.0]],
+        loss_fn_config={"value_clip": 0.2},
+    )
+    losses.start_per_datum_outputs()
+    loss, metrics = losses.TINKER_LOSS_FUNCTIONS["ppo"](Namespace(), batch, logits, None)
+    outputs = losses.drain_per_datum_outputs()
+    # Positive overshoot uses the clipped branch; negative overshoot uses the
+    # unclipped branch. Client weights mask and normalize without server averaging.
+    assert loss.item() == pytest.approx(0.64 + 2 * 3.24 + 0.5 * 0.81)
+    assert metrics["loss"].item() == loss.item()
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.tensor([0.0, -7.2, -0.9, 0.0, 0.0]))
+    assert old.grad is returns.grad is weights.grad is None
+    assert [output["sample_index"] for output in outputs] == [0, 1]
+    assert outputs[0]["loss"].item() == loss.item() and outputs[1]["loss"].item() == 0
+    torch.testing.assert_close(outputs[0]["values"], logits[:4].detach())
+    assert all("logprobs" not in output and not output["values"].requires_grad for output in outputs)
+
+
+@pytest.mark.parametrize("clip", [0.0, 0.2, 1.0])
+def test_sdk_critic_matches_native_value_loss_with_the_same_reduction(losses, monkeypatch, clip):
+    from miles.backends.training_utils.loss_hub import losses as native
+
+    monkeypatch.setattr(native, "get_values", losses.get_values)
+    batch, logits = _batch(
+        [[0.8, -0.8], [0.1]],
+        [[1, 1], [1]],
+        model_role="critic",
+        values=[torch.tensor([0.0, 0.0]), torch.tensor([0.0])],
+        returns=[torch.tensor([1.0, 1.0]), torch.tensor([1.0])],
+        loss_weights=[[0.5, 2.0], [0.0]],
+        loss_fn_config={"value_clip": clip},
+    )
+    args = Namespace(value_clip=clip)
+    sdk_loss, _ = losses.ppo_loss_function(args, batch, logits, None)
+    native_loss, _ = native.value_loss_function(args, batch, logits, lambda x: (x * torch.tensor([0.5, 2, 0])).sum())
+    torch.testing.assert_close(sdk_loss, native_loss)
+    sdk_grad = torch.autograd.grad(sdk_loss, logits, retain_graph=True)[0]
+    native_grad = torch.autograd.grad(native_loss, logits)[0]
+    torch.testing.assert_close(sdk_grad, native_grad)

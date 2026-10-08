@@ -10,6 +10,8 @@ repo root; this directory holds the operator-facing docs.
 |---|---|
 | `FORK.md` (repo root) | fork deltas by file, base-branch strategy, fast tests, upstream sync summary |
 | `docs/fork/full-finetuning.md` | `--tinker-train-mode full`: latest-only sampler, `weights_info` compatibility, resume, memory |
+| [PPO through Tinker](tinker-ppo.md) | critic API, GPU residency, async scheduling, checkpoints, and limitations |
+| [DAPO-Math-17K PPO](tinker-ppo-client.md) | server/client commands, PPO flags, async training, and resume |
 | `docs/fork/acceptance.md` | the two acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
 | `deploy/abci/README.md` | ABCI runbook: image pull, rootfs, gateway launch, endpoint file, clients, logs, stop |
 | `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc, kept in step by P1) |
@@ -71,6 +73,9 @@ Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gatew
 - Tenant = the `X-API-Key` header (`TINKER_API_KEY`; SDK 0.16.1 needs a `tml-`
   prefix, any value works). Sessions lease their models for `lease_timeout_s`
   after the last heartbeat.
+
+For the actor-loss overflow caveat affecting PPO and GRPO, see
+[known numerical limitations](tinker-ppo.md#known-numerical-limitation).
 
 ## Where to start
 

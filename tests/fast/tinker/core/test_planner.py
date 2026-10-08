@@ -1,6 +1,7 @@
 """The planner must pack compatible ready datums across streams, split on the
 token budget, and serve strictly by arrival."""
 
+import pytest
 from tests.fast.tinker.harness import ADAM, command, fb_payload, row
 
 from miles.tinker.core.planner import BarrierUnit, Planner, WorkUnit
@@ -37,6 +38,21 @@ def test_same_loss_class_rows_pack_across_streams():
     assert isinstance(unit, WorkUnit)
     assert len(unit.rows) == 3
     assert {ref.stream.model_id for ref in unit.rows} == {"model-0", "model-1"}
+
+
+@pytest.mark.parametrize("kind", ["forward_only", "forward_backward"])
+def test_policy_requests_pack_together_but_critic_stays_separate(kind):
+    planner, streams = _planner_with_streams(3)
+    for arrival, (stream, role) in enumerate(zip(streams, [None, "policy", "critic"], strict=True), start=1):
+        payload = fb_payload(stream.model_id, 1, [row()], "ppo")
+        if role is not None:
+            payload["model_role"] = role
+        stream.submit(command(stream.model_id, 1, kind, payload, arrival))
+
+    policy_unit = planner.next_unit()
+    critic_unit = planner.next_unit()
+    assert [ref.stream.model_id for ref in policy_unit.rows] == ["model-0", "model-1"]
+    assert [ref.stream.model_id for ref in critic_unit.rows] == ["model-2"]
 
 
 def test_different_loss_config_does_not_pack():

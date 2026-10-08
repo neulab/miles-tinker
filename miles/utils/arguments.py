@@ -1874,6 +1874,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--tinker-enable-critic",
+                action="store_true",
+                help="Serve a separate critic alongside the policy in full training mode",
+            )
+            parser.add_argument(
                 "--tinker-lease-timeout-s",
                 type=float,
                 default=3600.0,
@@ -3289,7 +3294,7 @@ def miles_validate_args(args):
             "stay alive; it cannot be combined with --load-debug-rollout-data (debug_train_only)."
         )
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    args.use_critic = args.tinker_enable_critic if args.entry == "serve" else args.advantage_estimator == "ppo"
     if args.use_critic:
         assert not args.indep_dp, (
             "Shared Actor/Critic PPO hands the critic outputs to a single trainer cell as external data; "

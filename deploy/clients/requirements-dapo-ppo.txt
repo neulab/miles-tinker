@@ -1,0 +1,7 @@
+-r ../../examples/tinker/requirements-ppo-client.txt
+numpy
+transformers
+sympy
+pylatexenc
+# Optional experiment tracking:
+wandb

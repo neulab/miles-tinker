@@ -33,6 +33,43 @@ def test_full_mode_accepts_the_recipe_and_disables_the_ddp_nan_check():
     assert args.check_for_nan_in_loss_and_grad is False, "the executors veto non-finite steps instead"
 
 
+def test_critic_requires_full_megatron_and_dedicated_inference():
+    args = _serve_args(tinker_enable_critic=True, train_backend="megatron", offload_rollout=True)
+    arguments.validate_tinker_serve_args(args)
+    for overrides, message in [
+        ({"tinker_train_mode": "lora"}, "requires --tinker-train-mode full"),
+        ({"train_backend": "fsdp"}, "requires the Megatron backend"),
+        ({"colocate": True}, "dedicated inference GPUs"),
+    ]:
+        with pytest.raises(AssertionError, match=message):
+            arguments.validate_tinker_serve_args(Namespace(**{**vars(args), **overrides}))
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_shared_critic_supports_optional_offload(offload):
+    args = _serve_args(
+        tinker_enable_critic=True,
+        train_backend="megatron",
+        offload_train=offload,
+        disable_param_buffers_cpu_backup=True,
+    )
+    arguments.validate_tinker_serve_args(args)
+    assert args.disable_param_buffers_cpu_backup is (not offload)
+
+
+def test_ppo_supports_native_training_temperature():
+    args = _serve_args(tinker_enable_critic=True, train_backend="megatron", rollout_temperature=0.8)
+    arguments.validate_tinker_serve_args(args)
+    assert args.rollout_temperature == 0.8
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
+def test_ppo_rejects_invalid_training_temperature(temperature):
+    args = _serve_args(tinker_enable_critic=True, train_backend="megatron", rollout_temperature=temperature)
+    with pytest.raises(AssertionError, match="positive finite"):
+        arguments.validate_tinker_serve_args(args)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -69,7 +106,9 @@ def test_lora_mode_warns_about_tp_ep_marked_grad_double_sum(caplog):
 def test_full_mode_overrides_in_place_pausing(caplog):
     from miles.utils.tinker_args import validate_tinker_serve_args
 
-    args = _serve_args(tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="in_place")
+    args = _serve_args(
+        tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="in_place"
+    )
     validate_tinker_serve_args(args)
     assert args.pause_generation_mode == "retract"
 

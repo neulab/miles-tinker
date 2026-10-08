@@ -17,10 +17,11 @@ from collections.abc import Callable
 
 import torch
 
-from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy
+from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss_hub.math_utils import compute_clipped_value_loss
 from miles.utils.types import RolloutBatch
 
-PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2}
+PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2, "value_clip": 0.2}
 CISPO_DEFAULTS = {"clip_low_threshold": 0.0, "clip_high_threshold": 4.0}
 DRO_DEFAULTS = {"beta": 0.05}
 
@@ -40,7 +41,12 @@ def drain_per_datum_outputs() -> list[dict]:
     return outputs or []
 
 
-def _record_per_datum(batch: RolloutBatch, log_probs: list[torch.Tensor], per_sample_loss: list[torch.Tensor]) -> None:
+def _record_per_datum(
+    batch: RolloutBatch,
+    predictions: list[torch.Tensor],
+    per_sample_loss: list[torch.Tensor],
+    output_key: str = "logprobs",
+) -> None:
     if _per_datum_outputs is None:
         return
     sample_indices = batch.get("sample_indices")
@@ -48,11 +54,11 @@ def _record_per_datum(batch: RolloutBatch, log_probs: list[torch.Tensor], per_sa
     if not per_sample_loss:
         return
     # one device sync per microbatch instead of two per datum
-    flat_log_probs = torch.cat([lp.detach() for lp in log_probs]).cpu()
+    flat_predictions = torch.cat([prediction.detach() for prediction in predictions]).cpu()
     losses = torch.stack([loss.detach() for loss in per_sample_loss]).cpu()
-    per_datum_log_probs = torch.split(flat_log_probs, [lp.numel() for lp in log_probs])
-    for index, log_prob, loss in zip(sample_indices, per_datum_log_probs, losses, strict=True):
-        _per_datum_outputs.append({"sample_index": index, "logprobs": log_prob, "loss": loss})
+    per_datum_predictions = torch.split(flat_predictions, [prediction.numel() for prediction in predictions])
+    for index, prediction, loss in zip(sample_indices, per_datum_predictions, losses, strict=True):
+        _per_datum_outputs.append({"sample_index": index, output_key: prediction, "loss": loss})
 
 
 def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
@@ -85,8 +91,10 @@ def _drop_masked_out(batch: RolloutBatch, per_sample_loss: list[torch.Tensor]) -
 def _finish(
     batch: RolloutBatch,
     logits: torch.Tensor,
-    log_probs: list[torch.Tensor],
+    predictions: list[torch.Tensor],
     per_sample_loss: list[torch.Tensor],
+    *,
+    output_key: str = "logprobs",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     per_sample_loss = _drop_masked_out(batch, per_sample_loss)
     if per_sample_loss:
@@ -94,7 +102,7 @@ def _finish(
     else:
         # a microbatch with no supervised tokens still needs the graph alive; fp32 sum avoids fp16 inf -> nan
         loss = logits.sum(dtype=torch.float32) * 0
-    _record_per_datum(batch, log_probs, per_sample_loss)
+    _record_per_datum(batch, predictions, per_sample_loss, output_key=output_key)
     return loss, {"loss": loss.clone().detach()}
 
 
@@ -131,6 +139,8 @@ def ppo_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if batch.get("model_role", "policy") == "critic":
+        return ppo_value_loss_function(args, batch, logits, sum_of_sample_mean)
     config = batch.get("loss_fn_config") or {}
     clip_low = config.get("clip_low_threshold", PPO_DEFAULTS["clip_low_threshold"])
     clip_high = config.get("clip_high_threshold", PPO_DEFAULTS["clip_high_threshold"])
@@ -142,6 +152,31 @@ def ppo_loss_function(
         objective = torch.minimum(ratio * advantages, torch.clamp(ratio, clip_low, clip_high) * advantages)
         per_sample.append(-objective.sum())
     return _finish(batch, logits, log_probs, per_sample)
+
+
+def ppo_value_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Native PPO value clipping with the SDK's client-weighted sum reduction."""
+    values = get_values(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens"),
+    )["values"]
+    clip = (batch.get("loss_fn_config") or {}).get("value_clip", PPO_DEFAULTS["value_clip"])
+    per_sample = []
+    for value, old, target, weights in zip(
+        values, batch["values"], batch["returns"], batch["loss_weights"], strict=True
+    ):
+        error = compute_clipped_value_loss(value, _like(old, value).detach(), _like(target, value).detach(), clip)
+        per_sample.append((error * _like(weights, value).detach()).sum())
+    return _finish(batch, logits, values, per_sample, output_key="values")
 
 
 def cispo_loss_function(

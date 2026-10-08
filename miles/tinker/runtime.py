@@ -19,14 +19,20 @@ import aiohttp
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.service import ExecutorBackend
-from miles.tinker.core.types import UserInputError
+from miles.tinker.core.types import ModelRole, UserInputError
 from miles.utils import object_store
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 
 logger = logging.getLogger(__name__)
 
 # internal row key -> trainer batch key
-ROW_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
+ROW_TO_BATCH_KEYS = {
+    "weights": "loss_weights",
+    "advantages": "advantages",
+    "sampling_logprobs": "rollout_log_probs",
+    "values": "values",
+    "returns": "returns",
+}
 
 # Units are padded to a multiple of dp_size with rows that contribute nothing:
 # weight/advantage 0 and an all-zero loss mask (every Tinker loss drops such a
@@ -38,6 +44,8 @@ PAD_ROW = {
     "weights": [0.0],
     "advantages": [0.0],
     "sampling_logprobs": [0.0],
+    "values": [0.0],
+    "returns": [0.0],
     "pad": True,
 }
 PERF_LOG_NAME = "perf.jsonl"
@@ -47,11 +55,14 @@ GENERATE_RETRY_PAUSE_S = 1.0
 
 
 class MilesBackend(ExecutorBackend):
-    def __init__(self, args: Namespace, trainer, router_url: str, inference_controller=None) -> None:
+    def __init__(
+        self, args: Namespace, trainer, router_url: str, inference_controller=None, *, role: ModelRole = "policy"
+    ) -> None:
         self.args = args
         self.trainer = trainer
         self.router_url = router_url
         self.inference_controller = inference_controller
+        self.role = role
         self.train_mode = getattr(args, "tinker_train_mode", "lora")
         self.dp_size = _actor_dp_size(args)
         checkpoint_root = getattr(args, "tinker_checkpoint_root", None)
@@ -60,6 +71,15 @@ class MilesBackend(ExecutorBackend):
         self._window_counts: dict[int, dict[str, int]] = {}
         # bound lazily to the serving loop; see _generate_session
         self._generate_client: aiohttp.ClientSession | None = None
+
+    async def onload(self) -> None:
+        await self.trainer.onload()
+        # Native offload discards grad buffers. Every eviction requires a clean
+        # window; initialize the restored buffers before the next backward.
+        await self.trainer.discard_grads(slot=0)
+
+    async def offload(self) -> None:
+        await self.trainer.offload()
 
     async def warmup(self) -> None:
         """Make the engines router-visible: a full base sync for full fine-tuning,
@@ -95,27 +115,30 @@ class MilesBackend(ExecutorBackend):
         train_data = self._build_train_data(slot_rows)
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
+        train_data["model_role"] = self.role
         worker_results = await self._run_unit("forward_backward", unit_id, train_data)
         self._note_window(slot_rows)
         by_index: dict[int, dict] = {}
+        output_key = "values" if self.role == "critic" else "logprobs"
         for result in worker_results:
             for item in result["per_datum"]:
                 index = int(item["sample_index"])
                 if index not in by_index:
-                    by_index[index] = {"loss": float(item["loss"]), "logprobs": item["logprobs"].tolist()}
+                    by_index[index] = {"loss": float(item["loss"]), output_key: item[output_key].tolist()}
         # padded rows sit past len(slot_rows) and are dropped here
         return [by_index[index] for index in range(len(slot_rows))]
 
     async def forward_only(self, unit_id: int, slot_rows: list, loss_fn: str, loss_fn_config: dict) -> list[dict]:
-        worker_results = await self._run_unit("forward_only_logprobs", unit_id, self._build_train_data(slot_rows))
+        output_key = "values" if self.role == "critic" else "logprobs"
+        worker_results = await self._run_unit(f"forward_only_{output_key}", unit_id, self._build_train_data(slot_rows))
         by_index: dict[int, dict] = {}
         for box in worker_results:
             if box is None:
                 continue
             value = _box_get(box)
-            for index, logprobs in zip(value["sample_indices"], value["logprobs"], strict=True):
+            for index, output in zip(value["sample_indices"], value[output_key], strict=True):
                 if index not in by_index:
-                    by_index[index] = {"loss": 0.0, "logprobs": logprobs.tolist()}
+                    by_index[index] = {"loss": 0.0, output_key: output.tolist()}
         return [by_index[index] for index in range(len(slot_rows))]
 
     async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
@@ -154,7 +177,7 @@ class MilesBackend(ExecutorBackend):
                 touched.add(slot)
 
     def _log_perf(self, slot: int, metrics: dict) -> None:
-        record = {"time": time.time(), "slot": slot, **metrics}
+        record = {"time": time.time(), "slot": slot, "model_role": self.role, **metrics}
         logger.info(f"tinker perf: {json.dumps(record)}")
         if self.perf_log_path is not None:
             _append_json_line(self.perf_log_path, record)

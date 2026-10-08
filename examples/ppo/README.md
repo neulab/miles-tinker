@@ -32,6 +32,22 @@ The script's `prepare` step downloads Qwen3-4B and the DAPO-Math-17k dataset and
 checkpoint to Megatron `torch_dist` format, so there is nothing to set up by hand. Conversion is
 skipped on reruns.
 
+## Separate training and inference GPUs
+
+For an eight-GPU node with four shared actor/critic GPUs and four dedicated
+inference GPUs, use:
+
+```bash
+python examples/ppo/run_qwen3_4b_ppo.py \
+  --num-gpus-per-node 8 --train-gpus 4 --rollout-gpus 4 \
+  --extra-args "--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --context-parallel-size 1"
+```
+
+This uses DP=4, sequential actor/critic updates with training offload, and four
+resident single-GPU inference engines. Training remains synchronous through
+`train.py`. All other recipe settings are unchanged. By default,
+`--rollout-gpus 0` retains inference colocation with the training pool.
+
 ## Turning PPO on
 
 The only flag that selects the algorithm is:

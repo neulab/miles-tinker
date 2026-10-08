@@ -30,10 +30,11 @@ class PendingRequest:
         return self.command.kind in WINDOW_KINDS
 
     def loss_class(self) -> tuple:
+        role = self.command.payload.get("model_role", "policy")
         if self.command.kind == "forward_only":
-            return ("forward_only",)
+            return ("forward_only", role)
         config = self.command.payload.get("loss_fn_config") or {}
-        return ("forward_backward", self.command.payload["loss_fn"], tuple(sorted(config.items())))
+        return ("forward_backward", role, self.command.payload["loss_fn"], tuple(sorted(config.items())))
 
 
 class ModelStream:

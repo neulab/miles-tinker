@@ -31,7 +31,15 @@ ADAM_PARAM_DEFAULTS = {
 }
 
 # wire loss_fn_inputs key -> internal row key
-INPUT_ROW_KEYS = {"weights": "weights", "advantages": "advantages", "logprobs": "sampling_logprobs"}
+INPUT_ROW_KEYS = {
+    "weights": "weights",
+    "advantages": "advantages",
+    "logprobs": "sampling_logprobs",
+    "old_values": "old_values",
+    "values": "values",
+    "returns": "returns",
+    "loss_mask": "loss_mask",
+}
 
 
 def decode_command(kind: str, payload: dict) -> tuple[str, dict]:
@@ -151,7 +159,9 @@ def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
     """Request-level metrics in the SDK's ``name:reduction`` form."""
     return {
         "loss:sum": float(sum(output["loss"] for output in outputs)),
-        "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
+        "num_tokens:sum": float(
+            sum(len(output["values"] if "values" in output else output["logprobs"]) for output in outputs)
+        ),
         "num_datums:sum": float(len(outputs)),
     }
 
@@ -164,7 +174,10 @@ def render_result(result: dict) -> dict:
             "type": "forward_backward",
             "loss_fn_output_type": "ArrayRecord",
             "loss_fn_outputs": [
-                {"loss:sum": _tensor_json([output["loss"]]), "logprobs": _tensor_json(output["logprobs"])}
+                {
+                    "loss:sum": _tensor_json([output["loss"]]),
+                    **{key: _tensor_json(output[key]) for key in ("logprobs", "values") if key in output},
+                }
                 for output in outputs
             ],
             "metrics": forward_backward_metrics(outputs),

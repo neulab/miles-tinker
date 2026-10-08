@@ -162,7 +162,7 @@ def get_batch(
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
-    for unit_key in ("loss_fn", "loss_fn_config"):
+    for unit_key in ("loss_fn", "loss_fn_config", "model_role"):
         if unit_key in data_iterator.rollout_data:
             batch[unit_key] = data_iterator.rollout_data[unit_key]
 

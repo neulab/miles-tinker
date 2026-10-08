@@ -16,6 +16,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.backends.megatron_utils.full import executor as full_executor
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
 from miles.backends.megatron_utils.lora import executor as lora_executor
+from miles.backends.megatron_utils.model_provider import LinearForLastLayer
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.specs.train import compute_trainer_pool_id
@@ -216,6 +217,15 @@ class MegatronTrainRayActor(TrainRayActor):
         self._asleep = False
 
         if role == "critic":
+            if getattr(args, "tinker_enable_critic", False):
+                # HF policy checkpoints do not contain the scalar head. New critic
+                # handles must restore its startup state as well as the backbone.
+                self._critic_initial_head = [
+                    (head, {key: value.detach().cpu().clone() for key, value in head.state_dict().items()})
+                    for chunk in self.model
+                    for head in chunk.modules()
+                    if isinstance(head, LinearForLastLayer)
+                ]
             if self.args.offload_train:
                 self.sleep()
             return start_rollout_id
@@ -455,6 +465,29 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     @with_logs
+    def forward_only_values(self, unit_id: int, rollout_data_ref: Box) -> Box | None:
+        """Return pre-action scalar values without computing targets or updating the critic."""
+        assert self.role == "critic" and self._tinker_full_mode()
+        self._heartbeat.bump()
+        with ExitStack() as stack:
+            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
+            stack.enter_context(store_get_result)
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            outputs = forward_only(
+                get_values, self.args, self.model, data_iterator, num_microbatches, rollout_id=unit_id
+            )
+        if not get_parallel_state().is_pp_last_stage:
+            return None
+        return Box(
+            ray.put(
+                {
+                    "sample_indices": rollout_data["sample_indices"],
+                    "values": [value.cpu() for value in outputs["values"]],
+                }
+            )
+        )
+
+    @with_logs
     def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> None:
@@ -464,6 +497,10 @@ class MegatronTrainRayActor(TrainRayActor):
             assert slot == 0, f"full fine-tuning serves slot 0 only, got {slot}"
             if ckpt_path is None:
                 full_executor.reset_to_base(self.args, self.model, self.optimizer)
+                if self.role == "critic":
+                    for head, state in self._critic_initial_head:
+                        head.load_state_dict(state)
+                    self.optimizer.reload_model_params()
             else:
                 full_executor.load_state(self.args, self.model, self.optimizer, ckpt_path, load_optimizer)
             return
