@@ -12,7 +12,7 @@ repo root; this directory holds the operator-facing docs.
 | `docs/fork/full-finetuning.md` | `--tinker-train-mode full`: latest-only sampler, `weights_info` compatibility, resume, memory |
 | `docs/fork/acceptance.md` | the two acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
 | `deploy/abci/README.md` | ABCI runbook: image pull, rootfs, gateway launch, endpoint file, clients, logs, stop |
-| `deploy/babel/README.md` | Babel setup and running repository training commands with Apptainer |
+| `deploy/babel/README.md` | Serving the Tinker gateway on Babel and running clients against it |
 | `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc, kept in step by P1) |
 | `.claude/skills/upstream-sync/SKILL.md` | the upstream-sync procedure and conflict policy |
 
