@@ -162,7 +162,9 @@ def _runtime_env(config):
         "OPENBLAS_NUM_THREADS": "8",
         "MAX_JOBS": "16",
         "SGLANG_SET_CPU_AFFINITY": "0",
-        "AITER_JIT_DIR": str(config.scratch / ("aiter-bf16-rne" if config.gpu == "mi300" else "aiter")),
+        "AITER_JIT_DIR": str(root / "cache" / config.gpu / ("aiter-bf16-rne" if config.gpu == "mi300" else "aiter")),
+        # AITER's ctypes kernel cache does not include the GPU architecture in its keys.
+        "AITER_ROOT_DIR": str(root / "cache" / config.gpu / "aiter-cpp"),
         **(
             {"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT": "0", "MILES_SGLANG_LEGACY_WEIGHT_UPDATE": "1"}
             if config.gpu == "mi300"
@@ -231,11 +233,13 @@ def _prepare_dirs(config):
         "pip-cache",
         "runtime",
         "cache",
-        "aiter-bf16-rne" if config.gpu == "mi300" else "aiter",
     ):
         (config.scratch / name).mkdir(parents=True, exist_ok=True)
     for path in (config.checkpoint_root, config.image_dir, config.venv_dir):
         path.mkdir(parents=True, exist_ok=True)
+    env = _runtime_env(config)
+    for key in ("AITER_JIT_DIR", "AITER_ROOT_DIR"):
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
 
 
 def _setup_modal(config):

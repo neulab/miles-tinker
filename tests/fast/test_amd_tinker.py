@@ -81,12 +81,15 @@ def test_pinned_image_and_external_checkout(tmp_path):
     assert _runtime_env(config)["PYTHONPATH"].startswith("/work/miles:")
 
 
-def test_mi300_uses_correct_rounding_and_separate_local_jit_cache(tmp_path):
+def test_mi300_uses_correct_rounding_and_separate_persistent_aiter_caches(tmp_path):
     mi300 = BackendConfig(root=tmp_path, gpu="mi300")
     mi350 = BackendConfig(root=tmp_path)
     assert _runtime_env(mi300)["CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT"] == "0"
     assert _runtime_env(mi300)["MILES_SGLANG_LEGACY_WEIGHT_UPDATE"] == "1"
-    assert _runtime_env(mi300)["AITER_JIT_DIR"] != _runtime_env(mi350)["AITER_JIT_DIR"]
+    for key in ("AITER_JIT_DIR", "AITER_ROOT_DIR"):
+        assert _runtime_env(mi300)[key] != _runtime_env(mi350)[key]
+        for config in (mi300, mi350):
+            assert Path(_runtime_env(config)[key]).is_relative_to(config.root / "cache" / config.gpu)
     assert mi300.image != mi350.image
     assert mi300.python != mi350.python
     assert mi300.peak_tflops == 1307.4

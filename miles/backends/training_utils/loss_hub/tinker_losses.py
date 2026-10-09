@@ -18,7 +18,7 @@ from collections.abc import Callable
 import torch
 
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
-from miles.backends.training_utils.loss_hub.math_utils import compute_clipped_value_loss
+from miles.backends.training_utils.loss_hub.math_utils import _safe_exp_neg_ppo_kl, compute_clipped_value_loss
 from miles.utils.types import RolloutBatch
 
 PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2, "value_clip": 0.2}
@@ -128,7 +128,7 @@ def importance_sampling_loss_function(
     log_probs = _target_logprobs(args, batch, logits)
     per_sample = []
     for lp, sampling, adv in zip(log_probs, batch["rollout_log_probs"], batch["advantages"], strict=True):
-        ratio = torch.exp(lp - _like(sampling, lp))
+        ratio = _safe_exp_neg_ppo_kl(_like(sampling, lp) - lp)
         per_sample.append(-(ratio * _like(adv, lp)).sum())
     return _finish(batch, logits, log_probs, per_sample)
 
@@ -147,7 +147,8 @@ def ppo_loss_function(
     log_probs = _target_logprobs(args, batch, logits)
     per_sample = []
     for lp, sampling, adv in zip(log_probs, batch["rollout_log_probs"], batch["advantages"], strict=True):
-        ratio = torch.exp(lp - _like(sampling, lp))
+        # Match native PPO: bound the log-ratio before exp to keep losses and gradients finite.
+        ratio = _safe_exp_neg_ppo_kl(_like(sampling, lp) - lp)
         advantages = _like(adv, lp)
         objective = torch.minimum(ratio * advantages, torch.clamp(ratio, clip_low, clip_high) * advantages)
         per_sample.append(-objective.sum())

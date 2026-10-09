@@ -79,6 +79,46 @@ def test_pad_rows_are_inert_under_every_loss(losses):
         assert logits.grad[2].item() == 0.0, f"{name}: the pad row must not reach the weights"
 
 
+@pytest.mark.parametrize("loss_fn", ["ppo", "importance_sampling"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("advantage", [0.0, 1.0, -1.0])
+@pytest.mark.parametrize("current,old", [(-1.0, -100.0), (-100.0, -1.0)])
+def test_actor_extreme_log_ratios_have_finite_loss_and_gradients(losses, loss_fn, dtype, advantage, current, old):
+    batch, logits = _batch([[current]], [[1]], rollout_log_probs=[[old]], advantages=[[advantage]])
+    logits = logits.detach().to(dtype).requires_grad_()
+    loss, metrics = losses.TINKER_LOSS_FUNCTIONS[loss_fn](Namespace(), batch, logits, None)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["loss"])
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.item() == 0.0, "ratios beyond the numerical guard are saturated"
+    if advantage == 0.0:
+        assert loss.item() == 0.0
+
+
+@pytest.mark.parametrize("loss_fn", ["ppo", "importance_sampling"])
+def test_actor_preserves_normal_loss_and_gradients(losses, loss_fn):
+    batch, logits = _batch(
+        [[-1.1, -1.0, -0.9, -1.1, -1.0, -0.9]],
+        [[1] * 6],
+        rollout_log_probs=[[-1.0] * 6],
+        advantages=[[1.0, 2.0, 3.0, -1.0, -2.0, -3.0]],
+        loss_fn_config={"clip_low_threshold": 0.95, "clip_high_threshold": 1.05},
+    )
+    loss, _ = losses.TINKER_LOSS_FUNCTIONS[loss_fn](Namespace(), batch, logits, None)
+    reference = logits.detach().double().requires_grad_()
+    ratio = (reference + 1.0).exp()
+    advantages = torch.tensor(batch["advantages"][0], dtype=torch.float64)
+    objective = ratio * advantages
+    if loss_fn == "ppo":
+        objective = torch.minimum(objective, ratio.clamp(0.95, 1.05) * advantages)
+    expected = -objective.sum()
+    torch.testing.assert_close(loss, expected.float())
+    loss.backward()
+    expected.backward()
+    torch.testing.assert_close(logits.grad, reference.grad.float())
+
+
 def test_critic_ppo_clipping_weights_padding_and_fixed_targets(losses):
     old = torch.zeros(4, requires_grad=True)
     returns = torch.ones(4, requires_grad=True)

@@ -165,31 +165,27 @@ per model lineage, including across resume. Keep at least two so an incomplete
 new pair does not prune the previous pair. RNG state and queued rollouts are
 not restored for exact sampling replay.
 
-## Known numerical limitation
+## Numerical stability
 
-Tinker actor losses `ppo` and `importance_sampling` exponentiate the log-ratio
-without bounding it first. Extreme finite inputs can overflow: in float32,
-`exp(-1 - (-100))` is infinite. Multiplication by zero advantage then yields
-NaN; PPO clipping afterward can also leave NaN gradients despite a finite loss.
-This inherited issue affects PPO and GRPO clients using these losses, in sync
-or async mode, and remains unfixed.
+Tinker actor losses `ppo` and `importance_sampling` use native Miles' numerical
+guard: bound the log-ratio to `[-20, 20]` and exponentiate in FP32. This prevents
+ratio overflow from producing NaN losses or gradients, including for zero
+advantages. Within this range, both retain their usual objectives; `ppo`
+also applies its configured PPO clipping.
 
-Tinker `cispo` avoids this particular failure by clipping to a finite bound
-before multiplying and detaching that coefficient. Native Miles' policy loss
-instead bounds the log-ratio to `[-20, 20]` before exponentiation. These guards
-do not guarantee safety for all other non-finite inputs or arithmetic.
+`cispo` clips and detaches its ratio before multiplying, avoiding this
+particular failure. These guards do not guarantee safety for all other
+non-finite inputs or arithmetic.
 
 For server and client commands, see the [DAPO-Math-17K example](tinker-ppo-client.md).
 
 ## Critic-head initialization
 
-To match the validated Qwen3-4B PPO baseline, use converted Megatron weights
-with `--megatron-to-hf-mode raw` and `--load` / `--critic-load` pointing to the
-converted checkpoint. With the tested checkpoint and runtime, this starts
-the scalar head at zero; HF bridge loading leaves it randomly initialized,
-changing initial values, loss, and gradients. This is loader-dependent, not
-a PPO requirement. Resuming a critic training checkpoint restores its trained
-head and optimizer state rather than resetting the head.
+For a fresh critic, HF Bridge sets the linear head's weights and bias to zero;
+no checkpoint conversion is needed. The tested Qwen3-4B raw Megatron loading
+path also zeroes the head internally when starting from converted LM weights.
+In either mode, resuming a critic training checkpoint restores the saved head
+and optimizer state without resetting them.
 
 Language-model PPO implementations use several initialization choices:
 

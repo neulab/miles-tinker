@@ -2,35 +2,39 @@
 
 ## Setup
 
-Run on an allocated GPU node with Python 3.9+ and Apptainer. MI300 has been
-used with the Qwen3 family; use MI350 for Qwen3.5 and newer models.
+Run on an allocated GPU node with Python 3.9+ and Apptainer. Qwen3 GRPO
+supports MI300 and MI350. Qwen3-4B synchronous PPO with HF Bridge has been
+validated on both GPU types. Use MI350 for Qwen3.5 and newer models.
 
 ```bash
 git clone --branch soni/hyperion https://github.com/neulab/miles-tinker.git ~/miles_final
 cd ~/miles_final
-export MILES_AMD_ROOT="$WORK/miles-tinker"
+export MILES_AMD_ROOT="$WORK/miles_artifacts"
 export MILES_AMD_CHECKPOINTS="$MILES_AMD_ROOT/checkpoints"
 
-python3 tools/amd_tinker.py setup --model-family qwen3 \
-  --root "$MILES_AMD_ROOT" \
-  --image-dir "$MILES_AMD_ROOT/images" --venv-dir "$MILES_AMD_ROOT/venvs"
+python3 tools/amd_tinker.py setup --model-family qwen3 --root "$MILES_AMD_ROOT"
 ```
 
-Use `--model-family qwen3.5` for Qwen3.5. Setup detects MI300/MI350, installs
-the matching image and environment, prepares Modal (prompting for login if
+Use `--model-family qwen3.5` for Qwen3.5. Setup and serve detect MI300/MI350
+on the current node. Setup installs the matching image and environment, prepares Modal (prompting for login if
 needed), and runs the GPU doctor. Run it once on each GPU type you use;
-subsequent jobs reuse the files. The root defaults to `$WORK/miles-tinker`,
-and image/venv paths default to its `images`/`venvs` directories. Keep these
-files on `$WORK`; temporary build files use node-local scratch. If `/tmp`
+subsequent jobs only need `serve`. Always pass the same `--root` shown here.
+Images live in `images/`; environments and dependencies have separate `mi300`
+and `mi350` directories under `venvs/` and `deps/`. HF models and datasets
+can be shared across GPU types. AITER caches persist under `cache/<gpu>/`;
+the launcher sets `AITER_JIT_DIR` and `AITER_ROOT_DIR` automatically.
+Keep these files on `$WORK`; temporary build files use node-local scratch. If `/tmp`
 is too small for setup, prefix the command with `MILES_AMD_TMPDIR=/dev/shm`.
 Modal credentials stay in your home directory. To select an existing Modal
 profile, export `MODAL_PROFILE` before setup and serve.
 
-**Model conversion:** Qwen3.5 requires conversion before serving. The Qwen3
-policy-only example below loads directly through HF bridge; the
-[PPO example](#ppo-example) uses converted Qwen3 weights as well.
+**Model conversion:** Qwen3.5 requires conversion before serving. Both Qwen3
+examples below (GRPO and PPO) load directly through HF Bridge without conversion.
 Choose a matching definition from
 [`scripts/models`](../../scripts/models).
+Reuse converted weights with the same image that created them; Megatron
+checkpoint formats can differ between images. The command skips completed
+conversions already present under the same root.
 
 ```bash
 python3 tools/amd_tinker.py convert --root "$MILES_AMD_ROOT" \
@@ -119,27 +123,22 @@ colocated GRPO with inference offload is not supported by this serving path.
 
 ## PPO example
 
-After the MI350 setup above, convert Qwen3-4B once, then start a PPO server.
+After setup, start a Qwen3-4B PPO server using HF Bridge without conversion.
+The launcher detects the GPU type of your allocated node automatically.
 Actor and critic share four training GPUs with offloading; four dedicated
 GPUs serve inference. Use a fresh run name for each experiment.
 
 ```bash
 PPO_RUN=tinker-ppo-dapo
-python3 tools/amd_tinker.py convert --root "$MILES_AMD_ROOT" \
-  --gpu mi350 --model-family qwen3 \
-  --model-id Qwen/Qwen3-4B --model-type qwen3-4B
 
-python3 tools/amd_tinker.py serve --root "$MILES_AMD_ROOT" --gpu mi350 \
+python3 tools/amd_tinker.py serve --root "$MILES_AMD_ROOT" --model-family qwen3 \
   --model-id Qwen/Qwen3-4B --model-type qwen3-4B \
   --train-gpus 4 --rollout-gpus 4 --tp 1 --pp 1 --cp 1 \
   --mem-fraction 0.9 --keep-checkpoints 3 \
   --checkpoint-root "$MILES_AMD_ROOT/runs/$PPO_RUN/checkpoints" -- \
-  --bf16 --megatron-to-hf-mode raw \
-  --load "$MILES_AMD_ROOT/models/Qwen3-4B_torch_dist" \
-  --critic-load "$MILES_AMD_ROOT/models/Qwen3-4B_torch_dist" \
+  --bf16 --megatron-to-hf-mode bridge \
   --tinker-enable-critic --offload-train --balance-data \
   --rollout-temperature 0.8 --seed 1234 \
-  --sglang-max-running-requests 512 \
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
 ```
 

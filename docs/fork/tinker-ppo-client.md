@@ -1,31 +1,31 @@
 # DAPO-Math-17K PPO through Tinker
 
-Run Qwen3-4B on one 8-GPU MI350 node: actor and critic share four training
+Run Qwen3-4B on one 8-GPU AMD node: actor and critic share four training
 GPUs with offloading; four dedicated GPUs serve inference. Use two Bash
 terminals on the allocated node, with Python 3.9+ and Apptainer available.
 Images, environments, models, and data are stored under `PPO_ROOT`.
+This synchronous PPO setup has been validated on both MI300 and MI350 using HF Bridge.
 
 In **both terminals**, set the same paths and a fresh run name:
 
 ```bash
-cd /home1/adityabs/miles_final
-PPO_ROOT=/work1/grahamneubig/adityabs/miles-final-multinode
+cd ~/miles_final
+PPO_ROOT="$WORK/miles_artifacts"
 PPO_RUN=tinker-ppo-dapo
 ```
 
 ## First-time server preparation
 
-Skip this if the server environment and converted Qwen3-4B model are already
-prepared. Setup installs the GPU image and environment and runs the GPU doctor;
-it also prepares Modal and may prompt for login. Conversion downloads the model.
+Run setup once per GPU type, using the same root as the
+[AMD guide](../platforms/amd-tinker.md#setup). Setup and serve automatically
+detect the current node's MI300 or MI350 GPUs. Setup installs
+the image and environment, runs the GPU doctor, and prepares Modal access.
+Qwen3-4B loads HF weights through Bridge; no checkpoint conversion is needed.
+Bridge initializes the new critic head's weights and bias to zero.
 
 ```bash
-python3 tools/amd_tinker.py setup --root "$PPO_ROOT" --gpu mi350 --model-family qwen3
-python3 tools/amd_tinker.py convert --root "$PPO_ROOT" --gpu mi350 \
-  --model-family qwen3 --model-id Qwen/Qwen3-4B --model-type qwen3-4B
+python3 tools/amd_tinker.py setup --root "$PPO_ROOT" --model-family qwen3
 ```
-
-See [AMD setup](../platforms/amd-tinker.md#setup) for storage and environment options.
 
 ## Server — terminal 1
 
@@ -33,17 +33,14 @@ The launcher runs the server inside the prepared GPU Apptainer image.
 
 ```bash
 python3 tools/amd_tinker.py serve \
-  --root "$PPO_ROOT" --gpu mi350 \
+  --root "$PPO_ROOT" --model-family qwen3 \
   --model-id Qwen/Qwen3-4B --model-type qwen3-4B \
   --train-gpus 4 --rollout-gpus 4 --tp 1 --pp 1 --cp 1 \
   --mem-fraction 0.9 --keep-checkpoints 3 \
   --checkpoint-root "$PPO_ROOT/runs/$PPO_RUN/checkpoints" -- \
-  --bf16 --megatron-to-hf-mode raw \
-  --load "$PPO_ROOT/models/Qwen3-4B_torch_dist" \
-  --critic-load "$PPO_ROOT/models/Qwen3-4B_torch_dist" \
+  --bf16 --megatron-to-hf-mode bridge \
   --tinker-enable-critic --offload-train --balance-data \
   --rollout-temperature 0.8 --seed 1234 \
-  --sglang-max-running-requests 512 \
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
 ```
 
@@ -53,13 +50,13 @@ python3 tools/amd_tinker.py serve \
 | `--train-gpus 4 --rollout-gpus 4` | Shared actor/critic training pool and separate inference pool. Do not add `--colocate`. |
 | `--tp 1 --pp 1 --cp 1` | Data parallel training across the four training GPUs. |
 | `--offload-train` | Switch actor/critic residency automatically. |
-| `--megatron-to-hf-mode raw`, `--load`, `--critic-load` | Use converted Megatron weights to match the reference initialization. |
+| `--megatron-to-hf-mode bridge` | Load HF weights directly; initialize the new critic head's weights and bias to zero. |
 | `--rollout-temperature 0.8` | Must match the client's sampling temperature. |
 | `--balance-data` | Balance training sequences across ranks. |
 | `--keep-checkpoints 3` | Retain three checkpoints per model, including across resume. |
 
-BF16, activation recomputation, inference memory fraction, and request capacity
-are runtime settings retained from the tested launch. Server logs are under
+BF16, activation recomputation, and inference memory fraction are retained from
+the tested launch. Request capacity uses the launcher's default of 128. Server logs are under
 `$PPO_ROOT/runs/$PPO_RUN/checkpoints/logs/`.
 
 ## Client — terminal 2
@@ -68,6 +65,10 @@ The CPU-only client uses a separate Python 3.12 image and unmodified
 `tinker==0.16.1`; the prepared GPU image's Python 3.10 cannot run this SDK.
 
 ```bash
+cd ~/miles_final
+PPO_ROOT="$WORK/miles_artifacts"
+PPO_RUN=tinker-ppo-dapo
+
 PPO_IMAGE="$PPO_ROOT/images/ppo-client-python312.sif"
 PPO_ENV="$PPO_ROOT/venvs/ppo-client-container"
 if [ -n "${WANDB_API_KEY:-}" ]; then
@@ -102,7 +103,8 @@ Download the dataset once if it is not already present:
 Miles' grader and sequence balancing require the checkout, CPU PyTorch, and
 `aiohttp`. No Miles-specific SDK or custom transport is installed.
 
-Start training once the server is healthy:
+Start synchronous PPO once the server is healthy. Synchronous sampling is
+the default; do not add `--async-rollouts` for this run.
 
 ```bash
 curl --fail http://127.0.0.1:10613/health &&

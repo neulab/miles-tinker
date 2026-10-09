@@ -106,13 +106,14 @@ class LinearForLastLayer(torch.nn.Linear):
         *,
         config: TransformerConfig,
         bias: bool = True,
+        init_std: float = 0.02,
     ) -> None:
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
 
-        self.weight.data.normal_(mean=0.0, std=0.02)
+        self.weight.data.normal_(mean=0.0, std=init_std)
         if bias:
             self.bias.data.zero_()
 
@@ -187,7 +188,7 @@ def get_model_provider_func(
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size, output_size=1, config=model.config, init_std=0.0
                 )
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.

@@ -19,7 +19,7 @@ with your allocated hosts:
 
 ```bash
 cd ~/miles_final
-export MILES_AMD_ROOT="$WORK/miles-final-multinode"
+export MILES_AMD_ROOT="$WORK/miles_artifacts"
 export MILES_AMD_CHECKPOINTS="$MILES_AMD_ROOT/checkpoints"
 NODES=(HEAD_HOSTNAME WORKER_HOSTNAME_1 WORKER_HOSTNAME_2)
 TRAIN_GPUS=2
