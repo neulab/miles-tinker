@@ -43,16 +43,17 @@ def _trial(request):
     os.environ.update(credentials)
     os.environ["SCIENCE_LOCAL_MODEL_KEY"] = "local-miles"
     solver_runtime.ProxyLLM = SciencePolicyLLM
-    # An exhausted action budget ends the policy rollout. Grade its actual
+    # An exhausted action budget or detected policy loop ends the rollout. Grade its actual
     # artifacts with the hidden verifier rather than labeling it infrastructure.
     harbor_runtime._sdk_run = partial(
         harbor_runtime._sdk_run,
         allow_iteration_limit=True,
+        allow_stuck=True,
         system_prompt=(
-            "You are a computational solver. Use only the container tool and execute your computation. "
+            "You are a computational solver. Use container_execute for shell commands and execute your computation. "
             "You have at most 30 tool actions. Inspect small data samples instead of printing entire large files. "
             "Save the runnable computation in /work/analysis.py and its result in /work/answer.json. "
-            "Once these files are ready, finish the task."
+            "Once these files are ready, call finish."
         ),
     )
     # Native Harbor still grades after AgentTimeoutError. Accept only that

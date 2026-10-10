@@ -9,10 +9,12 @@ serialization while preserving tool identities and message content. Tools execut
 containers; hidden verifiers execute separately. An infrastructure failure
 aborts the sample and filters its entire group before optimization.
 Use the runtime patch in [paper2rlenv PR #14](https://github.com/neulab/paper2rlenv/pull/14)
-(commit `71c1cc5`):
+(commit `8991ef2`):
 recoverable action-validation errors can recover normally, and the training
 adapter explicitly allows hidden-verifier grading after the action budget
-ends. Native agent wall-clock deadlines are accepted only when Harbor supplies
+ends or the SDK detects a policy loop. The latter records a `PolicyTermination`
+event; stuck behavior never creates a reward or excuses infrastructure failures.
+Native agent wall-clock deadlines are accepted only when Harbor supplies
 a binary hidden-verifier reward. Exhausting the action budget does not itself bypass the verifier or
 determine a reward. Actual API and sandbox failures still abort the group.
 Training also truncates oversized tool observations to the byte limit with
