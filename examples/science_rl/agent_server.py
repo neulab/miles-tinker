@@ -18,13 +18,12 @@ from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
 import httpx
 import paper2rlenv.harbor as harbor_runtime
 import paper2rlenv.runtime as solver_runtime
-from pydantic import BaseModel
-
 from examples.science_rl.policy_llm import SciencePolicyLLM
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
 
 class TrialRequest(BaseModel):
@@ -128,9 +127,7 @@ async def trial(request: TrialRequest, authorization: str = Header(default="")):
         raise HTTPException(status_code=404, detail="Unknown task")
     app.state.active += 1
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            app.state.pool, _trial, request.model_dump()
-        )
+        result = await asyncio.get_running_loop().run_in_executor(app.state.pool, _trial, request.model_dump())
         app.state.counts[result["science_status"]] += 1
         print(json.dumps({"task_id": request.task_id, **result}), flush=True)
         return result

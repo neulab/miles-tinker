@@ -52,7 +52,7 @@ def _wandb_args(args):
     words = shlex.split(U.get_default_wandb_args(__file__, run_id=args.run_id))
     if "--wandb-key" in words:
         index = words.index("--wandb-key")
-        del words[index:index + 2]
+        del words[index : index + 2]
     return shlex.join(words)
 
 
@@ -85,9 +85,7 @@ def execute(args: ScriptArgs):
         f"--micro-batch-size 1 --use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
         f"--log-probs-chunk-size {args.log_probs_chunk_size} --recompute-loss-function "
     )
-    algorithm_args = (
-        "--advantage-estimator grpo --entropy-coef 0 --eps-clip 0.2 --eps-clip-high 0.28 "
-    )
+    algorithm_args = "--advantage-estimator grpo --entropy-coef 0 --eps-clip 0.2 --eps-clip-high 0.28 "
     optimizer_args = (
         f"--optimizer adam --lr {args.learning_rate} --lr-decay-style constant "
         "--weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 "
@@ -103,8 +101,19 @@ def execute(args: ScriptArgs):
         f"--num-gpus-per-node {args.num_gpus_per_node} "
     )
     U.execute_train(
-        train_args=" ".join((ckpt_args, rollout_args, perf_args, algorithm_args,
-                             optimizer_args, sglang_args, misc_args, _wandb_args(args), args.extra_args)),
+        train_args=" ".join(
+            (
+                ckpt_args,
+                rollout_args,
+                perf_args,
+                algorithm_args,
+                optimizer_args,
+                sglang_args,
+                misc_args,
+                _wandb_args(args),
+                args.extra_args,
+            )
+        ),
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type="qwen3.5-4B",

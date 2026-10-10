@@ -1,5 +1,8 @@
-# Qwen3.5-4B scientific GRPO with OpenHands
-
+---
+title: "Qwen3.5-4B scientific GRPO with OpenHands"
+description: "Qwen3.5-4B scientific GRPO with OpenHands, Harbor/Sail verifiers, and four-GPU gradient accumulation."
+# Generated from examples/science_rl/README.md by scripts/tools/sync_example_docs.py. Edit that README, not this file.
+---
 The recipe in `scripts/run_qwen35_4b_science.py` uses the native GRPO loop in
 neulab/miles-tinker. OpenHands calls the policy through Miles' Qwen3.5 TITO
 session server, which preserves sampled token IDs, policy log probabilities,

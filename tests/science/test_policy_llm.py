@@ -1,10 +1,9 @@
 """No GPU/model call: SDK wire history must preserve the sampled assistant turn."""
 
+from examples.science_rl.policy_llm import SciencePolicyLLM
 from openhands.sdk import Message, TextContent
 from openhands.sdk.llm.message import MessageToolCall
 from pydantic import SecretStr
-
-from examples.science_rl.policy_llm import SciencePolicyLLM
 
 
 def test_qwen_reasoning_and_tool_history_survive_sdk_serialization():
@@ -20,10 +19,10 @@ def test_qwen_reasoning_and_tool_history_survive_sdk_serialization():
     )
     messages = [
         Message(role="user", content=[TextContent(text="Read the data.")]),
-        Message(role="assistant", content=[TextContent(text="\n\n")],
-                reasoning_content=reasoning, tool_calls=[call]),
-        Message(role="tool", content=[TextContent(text="table.json\n")],
-                tool_call_id="call_test", name="container_execute"),
+        Message(role="assistant", content=[TextContent(text="\n\n")], reasoning_content=reasoning, tool_calls=[call]),
+        Message(
+            role="tool", content=[TextContent(text="table.json\n")], tool_call_id="call_test", name="container_execute"
+        ),
     ]
     wire = llm.format_messages_for_llm(messages)
     assert wire[0]["content"] == "Read the data."
