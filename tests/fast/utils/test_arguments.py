@@ -1277,6 +1277,34 @@ class TestValidateSkipActorForwardOnly:
         )
 
 
+class TestRefillGranularity:
+    def _parse(self, size):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(
+            [
+                "--num-rollout",
+                "1",
+                "--rollout-batch-size",
+                "32",
+                "--over-sampling-batch-size",
+                str(size),
+            ]
+        )
+
+    @pytest.mark.parametrize("size", [1, 8, 32, 64])
+    def test_positive_refill_granularity_is_independent_of_batch(self, size):
+        args = self._parse(size)
+        miles_validate_args(args)
+        assert args.rollout_batch_size == 32
+        assert args.over_sampling_batch_size == size
+
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_nonpositive_refills_are_rejected(self, size):
+        with pytest.raises(AssertionError, match="over_sampling_batch_size must be positive"):
+            miles_validate_args(self._parse(size))
+
+
 class TestRunUuidResolution:
     def _parse(self, extra: list[str]):
         parser = argparse.ArgumentParser()
