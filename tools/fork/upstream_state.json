@@ -5,7 +5,7 @@
     "prs": "#2839-#2849",
     "branch": "yueming/multi-lora-example",
     "head": "06716481e85478242af3904fa2ecc93a651bf9fc",
-    "merged_into_main": false
+    "merged_into_main": true
   },
   "last_sync": {
     "base_ref": "upstream/yueming/multi-lora-example",
