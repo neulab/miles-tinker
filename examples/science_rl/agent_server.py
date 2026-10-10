@@ -44,6 +44,9 @@ def _trial(request):
     os.environ.update(credentials)
     os.environ["SCIENCE_LOCAL_MODEL_KEY"] = "local-miles"
     solver_runtime.ProxyLLM = SciencePolicyLLM
+    # An exhausted action budget ends the policy rollout. Grade its actual
+    # artifacts with the hidden verifier rather than labeling it infrastructure.
+    harbor_runtime._sdk_run = partial(harbor_runtime._sdk_run, allow_iteration_limit=True)
     # One trial per process: scope native Harbor resources to this allocation,
     # allowing the external watchdog to clean up even if the host is killed.
     app_name = os.environ.get("SCIENCE_SAIL_APP", "science-rl-" + os.environ.get("SLURM_JOB_ID", "local"))
