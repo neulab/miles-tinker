@@ -1,0 +1,59 @@
+# Qwen3.5-4B scientific GRPO with OpenHands
+
+The recipe in `scripts/run_qwen35_4b_science.py` uses the native GRPO loop in
+neulab/miles-tinker. OpenHands calls the policy through Miles' Qwen3.5 TITO
+session server, which preserves sampled token IDs, policy log probabilities,
+and assistant-only loss masks. `SciencePolicyLLM` preserves reasoning and
+whitespace in SDK history; `loose_tool_call` permits equivalent JSON argument
+serialization while preserving tool identities and message content. Tools execute in hardened Harbor/Sail learner
+containers; hidden verifiers execute separately. An infrastructure failure
+aborts the sample and filters its entire group before optimization.
+
+The batch is **32 prompts × 8 independent responses = 256 trajectories**.
+Training uses four GPUs, tensor parallelism 2 and data parallelism 2, with
+microbatch size 1 and token-budget packing. Gradients accumulate to the global
+batch; the number of packed microbatches depends on trajectory lengths. Four
+single-GPU SGLang engines alternate with training on the same GPUs using
+Miles' colocation/offloading. Explicit `qwen3` reasoning and `qwen3_coder` tool parsers ensure emitted
+XML tool calls reach OpenHands as structured actions. Full activation
+recomputation limits memory on 48GB L40S GPUs. The initial recipe runs 100 updates at learning rate 1e-6 and
+saves a checkpoint every 10 updates.
+
+Prepare a pinned snapshot of `neulab/science-rl`, verify every task against its
+manifest, and create `science-rl.jsonl` with `prompt` (a user-message list) and
+`metadata` (`task_id`, `domain`) columns. Keep the full tasks on the trusted
+agent host. Preconvert the base model to Megatron `torch_dist` using the
+existing Qwen3.5-4B model definition. Never substitute another task corpus or
+mount gold solutions in a learner container.
+
+Install `paper2rlenv` with the Harbor Sail backend and OpenHands SDK in a host
+Python environment separate from CUDA training dependencies. Run the server:
+
+```bash
+export SCIENCE_TASK_ROOT=/datasets/science-rl/tasks
+export SCIENCE_TRIAL_ROOT=/runs/science/trials
+export SCIENCE_CREDENTIAL_FILE=/private/credentials.json
+export SCIENCE_AGENT_AUTH_FILE=/private/agent-auth
+export SCIENCE_AGENT_WORKERS=64
+python -m uvicorn examples.science_rl.agent_server:app --host 127.0.0.1 --port 18085
+```
+
+The credential JSON contains `SAIL_API_KEY` (and `HF_TOKEN` for data download).
+The authorization file contains a random server token. Set both files to mode
+600. The agent server reads these on the host; they are never task inputs.
+W&B authentication uses a scoped host `.netrc`; set `WANDB_API_KEY` for the
+Miles helper to enable logging, and ensure the container home contains that
+`.netrc` so Ray workers authenticate without printing the key in argv.
+
+```bash
+python scripts/run_qwen35_4b_science.py \
+  --model-dir /models --data-dir /datasets/science-rl --output-dir /runs/science \
+  --rollout-batch-size 32 --group-size 8 --num-rollout 100 \
+  --extra-env-vars '{"SCIENCE_AGENT_SERVER_URL":"http://127.0.0.1:18085","SCIENCE_AGENT_AUTH_FILE":"/private/agent-auth","WANDB_MODE":"online"}'
+```
+
+The server `/health` endpoint reports active trials and completed trial
+statuses. Preserve individual Harbor traces, verifier evidence, dataset
+revision, task digests and the W&B run URL alongside checkpoints. These are
+training-set reward metrics; they do not constitute held-out scientific
+evaluation.
