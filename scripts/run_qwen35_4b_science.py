@@ -32,7 +32,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_batch_size: int = 32
     group_size: int = 8
     num_rollout: int = 100
-    max_tokens_per_gpu: int = 8192
+    tensor_parallel_size: int = 4
+    max_tokens_per_gpu: int = 4096
+    log_probs_chunk_size: int = 1024
     max_seq_len: int = 32768
     response_length: int = 4096
     learning_rate: float = 1e-6
@@ -74,12 +76,14 @@ def execute(args: ScriptArgs):
         "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
         "--use-session-server --session-server-workers 4 --tito-model qwen35 "
         "--session-message-matcher loose_tool_call "
+        f"--save-debug-rollout-data {shlex.quote(args.output_dir + '/rollouts/{rollout_id}.pt')} "
     )
     perf_args = (
-        "--tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 1 "
+        f"--tensor-model-parallel-size {args.tensor_parallel_size} --sequence-parallel --pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
         "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
         f"--micro-batch-size 1 --use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
+        f"--log-probs-chunk-size {args.log_probs_chunk_size} --recompute-loss-function "
     )
     algorithm_args = (
         "--advantage-estimator grpo --entropy-coef 0 --eps-clip 0.2 --eps-clip-high 0.28 "

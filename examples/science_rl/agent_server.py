@@ -60,6 +60,11 @@ def _trial(request):
     # typed policy deadline with a valid hidden-verifier result; other failures
     # remain unscored. Artifact-transfer checks in the runner still apply.
     harbor_runtime._summarize = partial(harbor_runtime._summarize, allow_agent_timeout=True)
+    # Bound the observation instead of poisoning a trial when a policy prints
+    # a large file. Command and infrastructure failures retain their semantics.
+    harbor_runtime._EnvironmentSandbox = partial(
+        harbor_runtime._EnvironmentSandbox, truncate_output=True
+    )
     # One trial per process: scope native Harbor resources to this allocation,
     # allowing the external watchdog to clean up even if the host is killed.
     app_name = os.environ.get("SCIENCE_SAIL_APP", "science-rl-" + os.environ.get("SLURM_JOB_ID", "local"))

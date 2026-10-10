@@ -8,22 +8,32 @@ whitespace in SDK history; `loose_tool_call` permits equivalent JSON argument
 serialization while preserving tool identities and message content. Tools execute in hardened Harbor/Sail learner
 containers; hidden verifiers execute separately. An infrastructure failure
 aborts the sample and filters its entire group before optimization.
-Use the runtime patch in `paper2rlenv-science-training` (commit `3673f2d`):
+Use the runtime patch in `paper2rlenv-science-training` (commit `52de7c5`):
 recoverable action-validation errors can recover normally, and the training
 adapter explicitly allows hidden-verifier grading after the action budget
 ends. Native agent wall-clock deadlines are accepted only when Harbor supplies
 a binary hidden-verifier reward. Exhausting the action budget does not itself bypass the verifier or
 determine a reward. Actual API and sandbox failures still abort the group.
+Training also truncates oversized tool observations to the byte limit with
+an explicit notice, preserving the command exit code and allowing the agent
+to continue. The default curation runtime remains strict.
 
 The batch is **32 prompts × 8 independent responses = 256 trajectories**.
-Training uses four GPUs, tensor parallelism 2 and data parallelism 2, with
+Training uses four GPUs, tensor parallelism 4 and data parallelism 1, with
 microbatch size 1 and token-budget packing. Gradients accumulate to the global
 batch; the number of packed microbatches depends on trajectory lengths. Four
 single-GPU SGLang engines alternate with training on the same GPUs using
 Miles' colocation/offloading. Explicit `qwen3` reasoning and `qwen3_coder` tool parsers ensure emitted
 XML tool calls reach OpenHands as structured actions. Full activation
-recomputation limits memory on 48GB L40S GPUs. The initial recipe runs 100 updates at learning rate 1e-6 and
+recomputation, loss recomputation, and 1,024-token probability chunks limit
+memory on L40S GPUs. Tensor parallelism 4 provides room for long trajectories
+and the model's 248,320-token vocabulary. The initial recipe runs 100 updates at learning rate 1e-6 and
 saves a checkpoint every 10 updates.
+
+Each completed rollout batch is saved under `OUTPUT_DIR/rollouts/{rollout_id}.pt`
+before training. These files contain the original policy tokens, log
+probabilities, loss masks, and verifier rewards; preserve them to diagnose or
+recover from a training failure without rerunning the agent trajectories.
 
 Prepare a pinned snapshot of `neulab/science-rl`, verify every task against its
 manifest, and create `science-rl.jsonl` with `prompt` (a user-message list) and
