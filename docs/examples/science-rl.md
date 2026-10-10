@@ -8,10 +8,11 @@ whitespace in SDK history; `loose_tool_call` permits equivalent JSON argument
 serialization while preserving tool identities and message content. Tools execute in hardened Harbor/Sail learner
 containers; hidden verifiers execute separately. An infrastructure failure
 aborts the sample and filters its entire group before optimization.
-Use the runtime patch in `paper2rlenv-science-training` (commit `9c735ba`):
+Use the runtime patch in `paper2rlenv-science-training` (commit `3673f2d`):
 recoverable action-validation errors can recover normally, and the training
 adapter explicitly allows hidden-verifier grading after the action budget
-ends. Exhausting the action budget does not itself bypass the verifier or
+ends. Native agent wall-clock deadlines are accepted only when Harbor supplies
+a binary hidden-verifier reward. Exhausting the action budget does not itself bypass the verifier or
 determine a reward. Actual API and sandbox failures still abort the group.
 
 The batch is **32 prompts × 8 independent responses = 256 trajectories**.

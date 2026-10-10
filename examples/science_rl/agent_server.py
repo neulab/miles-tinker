@@ -46,7 +46,20 @@ def _trial(request):
     solver_runtime.ProxyLLM = SciencePolicyLLM
     # An exhausted action budget ends the policy rollout. Grade its actual
     # artifacts with the hidden verifier rather than labeling it infrastructure.
-    harbor_runtime._sdk_run = partial(harbor_runtime._sdk_run, allow_iteration_limit=True)
+    harbor_runtime._sdk_run = partial(
+        harbor_runtime._sdk_run,
+        allow_iteration_limit=True,
+        system_prompt=(
+            "You are a computational solver. Use only the container tool and execute your computation. "
+            "You have at most 30 tool actions. Inspect small data samples instead of printing entire large files. "
+            "Save the runnable computation in /work/analysis.py and its result in /work/answer.json. "
+            "Once these files are ready, finish the task."
+        ),
+    )
+    # Native Harbor still grades after AgentTimeoutError. Accept only that
+    # typed policy deadline with a valid hidden-verifier result; other failures
+    # remain unscored. Artifact-transfer checks in the runner still apply.
+    harbor_runtime._summarize = partial(harbor_runtime._summarize, allow_agent_timeout=True)
     # One trial per process: scope native Harbor resources to this allocation,
     # allowing the external watchdog to clean up even if the host is killed.
     app_name = os.environ.get("SCIENCE_SAIL_APP", "science-rl-" + os.environ.get("SLURM_JOB_ID", "local"))
@@ -70,6 +83,7 @@ def _trial(request):
         "science_reward": int(result["passed"]) if result.get("passed") is not None else None,
         "science_trial_id": trial_id,
         "science_error": result.get("error"),
+        "science_agent_deadline": result.get("agent_budget_exhausted", False),
     }
 
 
