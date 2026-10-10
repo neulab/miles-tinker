@@ -63,7 +63,9 @@ def _trial(request):
     # Bound the observation instead of poisoning a trial when a policy prints
     # a large file. Command and infrastructure failures retain their semantics.
     harbor_runtime._EnvironmentSandbox = partial(
-        harbor_runtime._EnvironmentSandbox, truncate_output=True
+        harbor_runtime._EnvironmentSandbox,
+        truncate_output=True,
+        command_timeout_as_observation=True,
     )
     # One trial per process: scope native Harbor resources to this allocation,
     # allowing the external watchdog to clean up even if the host is killed.
