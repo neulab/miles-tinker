@@ -8,7 +8,7 @@ whitespace in SDK history; `loose_tool_call` permits equivalent JSON argument
 serialization while preserving tool identities and message content. Tools execute in hardened Harbor/Sail learner
 containers; hidden verifiers execute separately. An infrastructure failure
 aborts the sample and filters its entire group before optimization.
-Use the runtime patch in `paper2rlenv-science-training` (commit `4982706`):
+Use the runtime patch in `paper2rlenv-science-training` (commit `71c1cc5`):
 recoverable action-validation errors can recover normally, and the training
 adapter explicitly allows hidden-verifier grading after the action budget
 ends. Native agent wall-clock deadlines are accepted only when Harbor supplies
@@ -21,6 +21,9 @@ Training bounds learner commands with GNU `timeout`, returning exit code 124
 as a tool observation so the policy can recover from a slow computation. The
 remote transport gets termination grace; its failures still abort the group.
 A missing timeout executable is an infrastructure failure.
+If a solver omits an artifact and the hidden verifier returns 0, training
+retains that policy failure. Files captured by the SDK must still transfer
+successfully; missing transfers remain infrastructure errors.
 
 The batch is **32 prompts × 8 independent responses = 256 trajectories**.
 Training uses four GPUs, tensor parallelism 4 and data parallelism 1, with

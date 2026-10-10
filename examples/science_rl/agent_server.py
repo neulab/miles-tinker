@@ -60,6 +60,7 @@ def _trial(request):
     # typed policy deadline with a valid hidden-verifier result; other failures
     # remain unscored. Artifact-transfer checks in the runner still apply.
     harbor_runtime._summarize = partial(harbor_runtime._summarize, allow_agent_timeout=True)
+    harbor_runtime._run = partial(harbor_runtime._run, allow_missing_solver_artifacts=True)
     # Bound the observation instead of poisoning a trial when a policy prints
     # a large file. Command and infrastructure failures retain their semantics.
     harbor_runtime._EnvironmentSandbox = partial(
