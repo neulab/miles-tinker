@@ -19,6 +19,7 @@ from functools import partial
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
+import httpx
 import paper2rlenv.harbor as harbor_runtime
 import paper2rlenv.runtime as solver_runtime
 from pydantic import BaseModel
@@ -33,6 +34,12 @@ class TrialRequest(BaseModel):
 
 
 def _trial(request):
+    # Miles cancels surplus sampled groups after filling the batch. Avoid
+    # provisioning a Sailbox for a queued request whose TITO session is gone.
+    response = httpx.get(request["base_url"].removesuffix("/v1"), timeout=30, trust_env=False)
+    if response.status_code == 404:
+        return {"science_status": "canceled", "science_reward": None}
+    response.raise_for_status()
     credentials = json.loads(Path(os.environ["SCIENCE_CREDENTIAL_FILE"]).read_text())
     os.environ.update(credentials)
     os.environ["SCIENCE_LOCAL_MODEL_KEY"] = "local-miles"
