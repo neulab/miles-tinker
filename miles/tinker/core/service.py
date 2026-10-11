@@ -4,6 +4,7 @@ The trainer lock serializes trainer calls across dispatch, model creation, and l
 
 import asyncio
 import logging
+import math
 import os
 import time
 import uuid
@@ -339,7 +340,7 @@ class TinkerService:
             if "error" in outcome:
                 outcomes.append(outcome)
             else:
-                outcomes.append({"op": "optim_step", "metrics": {key: float(value) for key, value in outcome.items()}})
+                outcomes.append({"op": "optim_step", "metrics": _wire_safe_metrics(outcome)})
         return outcomes
 
     async def _finish_request(self, model_queue, pending, outcome: dict) -> None:
@@ -583,3 +584,13 @@ class TinkerService:
             if record.session_id in session_ids:
                 logger.warning(f"{reason} for {model_id}; freeing slot {record.slot}")
                 await self._close_model(model_id, reason, "user")
+
+
+def _wire_safe_metrics(metrics: dict) -> dict[str, float]:
+    """The SDK types optim metrics as dict[str, float] and JSON has no NaN, so a
+    non-finite value (a vetoed step's grad norm) becomes 0.0; its skip flag carries the meaning."""
+    return {key: _finite_or_zero(float(value)) for key, value in metrics.items()}
+
+
+def _finite_or_zero(value: float) -> float:
+    return value if math.isfinite(value) else 0.0

@@ -116,6 +116,17 @@ async def test_optim_step_returns_the_slot_grad_norm(service):
     assert future.result["metrics"] == {"grad_norm": 0.5 + slot}
 
 
+async def test_non_finite_optim_metrics_reach_the_wire_as_zero(service):
+    model_id = await created_model(service)
+    slot = service.models[model_id].slot
+    service.backend.optim_outcomes[slot] = {"grad_norm": float("nan"), "skipped": 1.0, "lr": float("inf")}
+    service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    request_id = service.submit("tenant", "optim_step", _optim_payload(model_id, 2))
+
+    future = await await_settled(service, "tenant", request_id)
+    assert future.result["metrics"] == {"grad_norm": 0.0, "skipped": 1.0, "lr": 0.0}
+
+
 async def test_save_then_load_roundtrip_paths(service):
     model_id = await created_model(service)
     save = service.submit(
