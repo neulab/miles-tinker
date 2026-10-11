@@ -199,3 +199,56 @@ def test_an_aborted_sample_fails_instead_of_passing_as_a_stop():
     """A truncated sequence fed to RL as a completed sample corrupts training data silently."""
     response = {"meta_info": {"output_token_logprobs": [(-0.1, 11)], "finish_reason": {"type": "abort"}}}
     assert "abort" in _to_sequence(response)["error"]
+
+
+class TestContextClamp:
+    def _max_new_tokens(self, max_tokens: int, context_len: int | None, prompt_len: int = 2) -> int:
+        payload = {
+            "prompt_tokens": list(range(prompt_len)),
+            "sampling_params": {"max_tokens": max_tokens},
+            "num_samples": 1,
+            "prompt_logprobs": False,
+            "topk_prompt_logprobs": 0,
+        }
+        backend = MilesBackend(None, "http://router", context_len=context_len)
+        return backend._generate_request(payload, lora_name=None)["sampling_params"]["max_new_tokens"]
+
+    def test_generation_is_clamped_to_the_room_left_in_the_context(self):
+        assert self._max_new_tokens(100, context_len=10, prompt_len=4) == 6
+
+    def test_a_request_that_fits_is_unchanged(self):
+        assert self._max_new_tokens(5, context_len=10, prompt_len=4) == 5
+        assert self._max_new_tokens(5, context_len=None) == 5
+
+    def test_a_prompt_that_fills_the_context_is_a_user_error(self):
+        with pytest.raises(UserInputError, match="no room"):
+            self._max_new_tokens(5, context_len=4, prompt_len=4)
+
+
+async def test_in_flight_generate_posts_are_capped(monkeypatch):
+    import asyncio
+
+    import miles.tinker.runtime as runtime
+
+    in_flight = peak = 0
+
+    async def fake_post(url, body):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return {"meta_info": {"output_token_logprobs": [[-0.1, 5, None]], "finish_reason": {"type": "stop"}}}
+
+    monkeypatch.setattr(runtime, "post", fake_post)
+    backend = MilesBackend(None, "http://router", max_concurrent_samples=3)
+    payload = {
+        "prompt_tokens": [1, 2],
+        "sampling_params": {"max_tokens": 4},
+        "num_samples": 8,
+        "prompt_logprobs": False,
+        "topk_prompt_logprobs": 0,
+    }
+    results = await asyncio.gather(*[backend.sample(payload, lora_name=None) for _ in range(2)])
+    assert all(len(result["sequences"]) == 8 for result in results)
+    assert peak == 3, "posts from every sampling request share one cap"

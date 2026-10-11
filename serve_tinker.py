@@ -70,14 +70,26 @@ async def serve(args, *, disposer: Disposer):
         lease_timeout_s=args.tinker_lease_timeout_s,
         coalesce_wait_s=args.tinker_coalesce_wait_s,
         coalesce_max_wait_s=args.tinker_coalesce_max_wait_s,
-        max_concurrent_samples=args.tinker_max_concurrent_samples,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
     dp_size = actor_world_size // (
         args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     )
-    service = TinkerService(MilesBackend(trainer, router_url, dp_size=dp_size), config)
+    # the engine context generations must fit in: explicit settings first, else the model's own limit
+    context_len = (
+        args.rollout_max_context_len
+        or getattr(args, "sglang_context_length", None)
+        or hf_config.max_position_embeddings
+    )
+    backend = MilesBackend(
+        trainer,
+        router_url,
+        dp_size=dp_size,
+        context_len=context_len,
+        max_concurrent_samples=args.tinker_max_concurrent_samples,
+    )
+    service = TinkerService(backend, config)
 
     server = uvicorn.Server(
         uvicorn.Config(

@@ -44,10 +44,20 @@ def _build_train_data(slot_datums: list) -> dict:
 
 
 class MilesBackend:
-    def __init__(self, trainer, router_url: str, dp_size: int = 1) -> None:
+    def __init__(
+        self,
+        trainer,
+        router_url: str,
+        dp_size: int = 1,
+        context_len: int | None = None,
+        max_concurrent_samples: int = 512,
+    ) -> None:
         self.trainer = trainer
         self.router_url = router_url
         self.dp_size = dp_size
+        self.context_len = context_len  # engine context; generations are clamped to fit it
+        # bounds in-flight /generate posts across every sampling request
+        self._generate_slots = asyncio.Semaphore(max_concurrent_samples)
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -120,10 +130,7 @@ class MilesBackend:
         request = self._generate_request(payload, lora_name, lora_path)
         try:
             responses = await asyncio.gather(
-                *[
-                    post(f"{self.router_url}/generate", _with_sample_seed(request, index))
-                    for index in range(payload["num_samples"])
-                ]
+                *[self._post_generate(_with_sample_seed(request, index)) for index in range(payload["num_samples"])]
             )
         except httpx.HTTPError as error:
             return {"error": str(error)}
@@ -138,13 +145,17 @@ class MilesBackend:
             result["topk_prompt_logprobs"] = _topk_prompt_logprobs(responses[0], payload["topk_prompt_logprobs"])
         return result
 
+    async def _post_generate(self, body: dict) -> dict:
+        async with self._generate_slots:
+            return await post(f"{self.router_url}/generate", body)
+
     def _generate_request(self, payload: dict, lora_name: str | None, lora_path: str | None = None) -> dict:
         params = payload["sampling_params"]
         max_tokens = params.get("max_tokens")
         if max_tokens is None:
             raise UserInputError("sampling_params.max_tokens is required")
         sampling_params = {
-            "max_new_tokens": max_tokens,
+            "max_new_tokens": _clamp_max_new_tokens(max_tokens, len(payload["prompt_tokens"]), self.context_len),
             "temperature": params.get("temperature", 1.0),
             "top_p": params.get("top_p", 1.0),
             "top_k": params.get("top_k", -1),
@@ -171,6 +182,16 @@ class MilesBackend:
                 # request-carried backfill source: the engine refills an evicted version itself
                 request["lora_backfill_paths"] = {lora_name: lora_path}
         return request
+
+
+def _clamp_max_new_tokens(max_tokens: int, prompt_len: int, context_len: int | None) -> int:
+    """Fit the generation into the engine context instead of letting the engine reject the request."""
+    if not context_len:
+        return max_tokens
+    room = context_len - prompt_len
+    if room <= 0:
+        raise UserInputError(f"prompt of {prompt_len} tokens leaves no room in a {context_len}-token context")
+    return min(max_tokens, room)
 
 
 def _slot_failure(worker_results: list) -> dict | None:
