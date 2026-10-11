@@ -91,6 +91,7 @@ def test_the_sdk_parses_our_forward_backward_output():
     parsed = deserialize_forward_backward_output(encoded)
 
     assert parsed.metrics["loss:sum"] == pytest.approx(3.5)
+    assert (parsed.metrics["num_tokens:sum"], parsed.metrics["num_datums:sum"]) == (3.0, 2.0)
     assert [list(record["loss:sum"].data) for record in parsed.loss_fn_outputs] == [[2.5], [1.0]]
     assert list(parsed.loss_fn_outputs[0]["logprobs"].data) == pytest.approx([-0.1, -0.2])
 

@@ -100,5 +100,5 @@ class TestRenderResult:
     def test_forward_backward_renders_per_datum_records(self):
         rendered = render_result({"op": "forward_backward", "outputs": [{"loss": 2.0, "logprobs": [0.1, 0.2]}]})
         assert rendered["loss_fn_output_type"] == "ArrayRecord"
-        assert rendered["metrics"] == {"loss:sum": 2.0}
+        assert rendered["metrics"] == {"loss:sum": 2.0, "num_tokens:sum": 2.0, "num_datums:sum": 1.0}
         assert rendered["loss_fn_outputs"][0]["logprobs"] == {"dtype": "float32", "shape": [2], "data": [0.1, 0.2]}

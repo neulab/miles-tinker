@@ -167,6 +167,15 @@ def decode_sample_request(payload: dict) -> dict:
 # -------- result rendering (JSON; proto_codec renders the binary forms) --------
 
 
+def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
+    """Request-level metrics in the SDK's ``name:reduction`` form."""
+    return {
+        "loss:sum": float(sum(output["loss"] for output in outputs)),
+        "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
+        "num_datums:sum": float(len(outputs)),
+    }
+
+
 def render_result(result: dict) -> dict:
     op = result["op"]
     if op in ("forward_backward", "forward_only"):
@@ -178,7 +187,7 @@ def render_result(result: dict) -> dict:
                 {"loss:sum": _tensor_json([output["loss"]]), "logprobs": _tensor_json(output["logprobs"])}
                 for output in outputs
             ],
-            "metrics": {"loss:sum": float(sum(output["loss"] for output in outputs))},
+            "metrics": forward_backward_metrics(outputs),
         }
     if op == "sample":
         rendered = {"type": "sample", "sequences": result["sequences"]}
