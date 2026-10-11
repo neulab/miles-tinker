@@ -3,12 +3,27 @@
 from dataclasses import replace
 
 from openhands.sdk import TextContent
-from paper2rlenv.runtime import ProxyLLM
+from paper2rlenv.runtime import PolicyTokenBudgetReached, ProxyLLM
+from pydantic import Field
 
 
 class SciencePolicyLLM(ProxyLLM):
     # SGLang returns text strings; SDK list serialization changes replayed history.
     force_string_serializer: bool = True
+    episode_token_limit: int | None = Field(default=None, gt=0, exclude=True)
+
+    def generate(self, *args, **kwargs):
+        result = super().generate(*args, **kwargs)
+        if self.episode_token_limit is not None:
+            response = result.raw_response
+            if response.choices[0].finish_reason == "length":
+                raise PolicyTokenBudgetReached("model_call_length")
+            usage = response.usage
+            if usage is None or usage.total_tokens is None:
+                raise ValueError("Token-budget enforcement requires policy token usage")
+            if usage.total_tokens >= self.episode_token_limit:
+                raise PolicyTokenBudgetReached("episode_context_limit")
+        return result
 
     def _model_features(self):
         # The SDK's model registry does not currently enable Qwen reasoning replay.

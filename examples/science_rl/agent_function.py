@@ -20,6 +20,7 @@ async def run(base_url, prompt, request_kwargs, metadata, **kwargs):
                 "task_id": metadata["task_id"],
                 "base_url": resolve_session_url(base_url),
                 "sampling": request_kwargs,
+                "max_seq_len": metadata.get("max_seq_len"),
             },
         )
         response.raise_for_status()

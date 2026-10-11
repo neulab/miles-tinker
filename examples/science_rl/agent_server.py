@@ -23,13 +23,14 @@ import paper2rlenv.harbor as harbor_runtime
 import paper2rlenv.runtime as solver_runtime
 from examples.science_rl.policy_llm import SciencePolicyLLM
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TrialRequest(BaseModel):
     task_id: str
     base_url: str
     sampling: dict
+    max_seq_len: int | None = Field(default=None, gt=0)
 
 
 def _trial(request):
@@ -42,13 +43,14 @@ def _trial(request):
     credentials = json.loads(Path(os.environ["SCIENCE_CREDENTIAL_FILE"]).read_text())
     os.environ.update(credentials)
     os.environ["SCIENCE_LOCAL_MODEL_KEY"] = "local-miles"
-    solver_runtime.ProxyLLM = SciencePolicyLLM
+    solver_runtime.ProxyLLM = partial(SciencePolicyLLM, episode_token_limit=request.get("max_seq_len"))
     # An exhausted action budget or detected policy loop ends the rollout. Grade its actual
     # artifacts with the hidden verifier rather than labeling it infrastructure.
     harbor_runtime._sdk_run = partial(
         harbor_runtime._sdk_run,
         allow_iteration_limit=True,
         allow_stuck=True,
+        allow_token_budget=request.get("max_seq_len") is not None,
         system_prompt=(
             "You are a computational solver. Use container_execute for shell commands and execute your computation. "
             "You have at most 30 tool actions. Inspect small data samples instead of printing entire large files. "
