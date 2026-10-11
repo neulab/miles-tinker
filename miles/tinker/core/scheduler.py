@@ -62,8 +62,10 @@ class RequestScheduler:
             if model_queue.queue and model_queue.queue[0].command.validation_error is not None
         ]
 
-    def schedule_next(self) -> BatchUnit | BarrierUnit | None:
-        """Arrival order selects the seed; compatible work may overtake intervening requests."""
+    def schedule_next(self, *, commit: bool = True) -> BatchUnit | BarrierUnit | None:
+        """Arrival order selects the seed; compatible work may overtake intervening requests.
+
+        ``commit=False`` previews the unit without issuing its datums; the next call returns the same unit."""
         datums = self._ready_datums()
         barriers = self._ready_barriers()
 
@@ -73,7 +75,11 @@ class RequestScheduler:
             return None
         if barrier_seed is not None and (datum_seed is None or barrier_seed[1].command.arrival < datum_seed.arrival):
             return self._merge_barriers(barrier_seed, barriers)
-        return self._pack_batch(datum_seed, datums)
+        batch = self._pack_batch(datum_seed, datums)
+        if commit:
+            for ref in batch.datums:
+                ref.request.num_issued_datums += 1
+        return batch
 
     def _ready_datums(self) -> list[DatumRef]:
         datums = []
@@ -106,8 +112,6 @@ class RequestScheduler:
                 break
             picked.append(ref)
             tokens += datum_tokens
-        for ref in picked:
-            ref.request.num_issued_datums += 1
         command = seed.request.command
         return BatchUnit(
             op=command.op,

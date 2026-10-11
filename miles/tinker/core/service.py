@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import suppress
 
 from miles.tinker.core.future import RequestFuture, RequestFutureStore
 from miles.tinker.core.input_validation import (
@@ -69,6 +70,7 @@ class TinkerService:
                     raise self._background_error
                 # unit selection shares the critical section with execution, so
                 # lease expiry cannot reclaim a model queue between the two
+                hold = None
                 async with self._trainer_lock:
                     rejections = self.scheduler.ready_rejections()
                     if rejections:
@@ -79,8 +81,11 @@ class TinkerService:
                                 {"error": pending.command.validation_error, "error_category": "user"},
                             )
                         continue
-                    unit = self.scheduler.schedule_next()
-                    if unit is not None:
+                    preview = self.scheduler.schedule_next(commit=False)
+                    if isinstance(preview, BatchUnit):
+                        hold = self._coalesce_hold(preview)
+                    if preview is not None and not hold:
+                        unit = self.scheduler.schedule_next()
                         if isinstance(unit, BatchUnit):
                             await self._run_batch(unit)
                         else:
@@ -88,7 +93,9 @@ class TinkerService:
                         if await self.backend.trainer_dead():
                             raise RuntimeError("the trainer workers died; exiting so clients get refused connections")
                         continue
-                await self._wake.wait()
+                # waiting releases the trainer lock, so lease expiry and model creation proceed meanwhile
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=hold)
                 self._wake.clear()
         finally:
             tasks = [sweep_task, *self._create_tasks, *(task for task, _ in self._sample_tasks.values())]
@@ -96,6 +103,25 @@ class TinkerService:
                 task.cancel()
             # Cleanup failures must not replace the error that stopped the dispatcher.
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _coalesce_hold(self, batch: BatchUnit) -> float:
+        """Seconds to keep an under-filled batch open for more chunks of a request still
+        arriving (the SDK splits large forward_backward calls); 0 runs it now."""
+        if self.config.coalesce_wait_s <= 0:
+            return 0.0
+        if sum(len(ref.datum["tokens"]) for ref in batch.datums) >= self.config.batch_token_budget:
+            return 0.0
+        growing = {ref.model_queue for ref in batch.datums if ref.model_queue.batch_run_may_grow()}
+        if not growing:
+            return 0.0
+        now = time.monotonic()
+        last_submit = max(model_queue.last_submit_at for model_queue in growing)
+        first_ready = min(ref.request.enqueued_at for ref in batch.datums)
+        remaining = min(
+            self.config.coalesce_wait_s - (now - last_submit),
+            self.config.coalesce_max_wait_s - (now - first_ready),
+        )
+        return max(0.0, remaining)
 
     def _observe_background_task(self, task: asyncio.Task) -> None:
         if not task.cancelled() and (error := task.exception()) is not None:

@@ -1,5 +1,6 @@
 """Per-model command ordering and batch runs separated by barriers."""
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -15,6 +16,7 @@ class PendingRequest:
     num_issued_datums: int = 0
     outputs: list[dict | None] = field(default_factory=list)
     remaining: int = 0
+    enqueued_at: float = field(default_factory=time.monotonic)  # when it became schedulable
 
     @property
     def is_batch_op(self) -> bool:
@@ -41,9 +43,11 @@ class ModelRequestQueue:
         self.last_enqueued_seq_id = 0
         self.pending_by_seq: dict[int, Command] = {}
         self.queue: deque[PendingRequest] = deque()
+        self.last_submit_at = 0.0
 
     def submit(self, command: Command) -> None:
         """Accept one deduplicated command; feed the queue in seq order."""
+        self.last_submit_at = time.monotonic()
         self.pending_by_seq[command.seq_id] = command
         self._enqueue_contiguous_commands()
 
@@ -66,6 +70,10 @@ class ModelRequestQueue:
                 break
             run.append(pending)
         return run
+
+    def batch_run_may_grow(self) -> bool:
+        """True while only batch ops are queued: a later chunk of the same run can still arrive and pack with them."""
+        return bool(self.queue) and len(self.open_batch_run()) == len(self.queue)
 
     def ready_barrier(self) -> PendingRequest | None:
         """The head barrier, executable once every batch op ahead of it completed."""
