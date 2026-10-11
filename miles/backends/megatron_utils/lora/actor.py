@@ -26,7 +26,7 @@ class MultiLoRATrainRayActor(MegatronTrainRayActor):
     @with_logs
     def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
         self._heartbeat.bump()
-        return lora_model.optim_step(self.slot_optimizers, adam_params_by_slot)
+        return lora_model.optim_step(self.args, self.slot_optimizers, adam_params_by_slot)
 
     @with_logs
     def forward_only(self, batch_id: int, rollout_data_ref: StoreObjectRef) -> dict:

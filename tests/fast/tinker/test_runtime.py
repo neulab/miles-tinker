@@ -252,3 +252,38 @@ async def test_in_flight_generate_posts_are_capped(monkeypatch):
     results = await asyncio.gather(*[backend.sample(payload, lora_name=None) for _ in range(2)])
     assert all(len(result["sequences"]) == 8 for result in results)
     assert peak == 3, "posts from every sampling request share one cap"
+
+
+async def test_optim_step_logs_each_slot_window_to_perf_jsonl(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    perf_log = tmp_path / "ckpt" / "perf.jsonl"
+    window_perf = {"actor_train_mfu": 0.2, "num_tokens": 999, "num_datums": 9, "num_units": 9}
+
+    async def optim_step(adam_params_by_slot):
+        return [{0: {"grad_norm": 1.0, **window_perf}, 1: {"error": "boom"}}]
+
+    backend = MilesBackend(SimpleNamespace(optim_step=optim_step), "http://router", perf_log_path=str(perf_log))
+
+    async def fake_call_trainer(method, batch_id, train_data):
+        return [{"per_datum": [{"sample_index": i, "loss": 0.0, "logprobs": torch.tensor([0.0])} for i in range(3)]}]
+
+    backend._call_trainer = fake_call_trainer
+    await backend.forward_backward(1, [(0, _datum([1, 2, 3])), (0, _datum([4, 5])), (1, _datum([6, 7]))], "ce", {})
+    await backend.forward_only(2, [(0, _datum([1, 2]))], "ce", {})  # scoring passes are not training work
+
+    metrics = await backend.optim_step({0: {}, 1: {}})
+    assert metrics[0] == {
+        "grad_norm": 1.0,
+        "actor_train_mfu": 0.2,
+        "num_tokens": 5,
+        "num_datums": 2,
+        "num_units": 1,
+    }, "the gateway's exact per-slot counts replace the trainer's padded ones"
+    assert metrics[1] == {"error": "boom"}
+    records = [json.loads(line) for line in perf_log.read_text().splitlines()]
+    assert [(record["slot"], record["num_tokens"]) for record in records] == [(0, 5)]
+
+    metrics = await backend.optim_step({0: {}})
+    assert (metrics[0]["num_tokens"], metrics[0]["num_units"]) == (0, 0), "each optim step starts a new window"

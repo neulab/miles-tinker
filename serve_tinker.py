@@ -88,6 +88,7 @@ async def serve(args, *, disposer: Disposer):
         dp_size=dp_size,
         context_len=context_len,
         max_concurrent_samples=args.tinker_max_concurrent_samples,
+        perf_log_path=f"{checkpoint_root}/perf.jsonl",
     )
     service = TinkerService(backend, config)
 

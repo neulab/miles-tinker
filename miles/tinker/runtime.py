@@ -1,6 +1,10 @@
 """Translate gateway datums to trainer batches and sampling requests to SGLang."""
 
 import asyncio
+import json
+import logging
+import time
+from pathlib import Path
 
 import httpx
 
@@ -9,6 +13,8 @@ from miles.tinker.core.types import UserInputError
 from miles.utils import object_store
 from miles.utils.http_utils import post
 from tinker.types.sample_response import MASK_LOGPROB
+
+logger = logging.getLogger(__name__)
 
 # internal datum key -> trainer batch key
 DATUM_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
@@ -51,6 +57,7 @@ class MilesBackend:
         dp_size: int = 1,
         context_len: int | None = None,
         max_concurrent_samples: int = 512,
+        perf_log_path: str | None = None,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -58,6 +65,9 @@ class MilesBackend:
         self.context_len = context_len  # engine context; generations are clamped to fit it
         # bounds in-flight /generate posts across every sampling request
         self._generate_slots = asyncio.Semaphore(max_concurrent_samples)
+        # one JSON line per stepped slot and optim window: the trainer's MFU and throughput
+        self.perf_log_path = Path(perf_log_path) if perf_log_path else None
+        self._window_counts: dict[int, dict[str, int]] = {}  # slot -> exact counts since its last step
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -65,11 +75,13 @@ class MilesBackend:
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> dict | None:
+        self._window_counts.pop(slot, None)  # a (re)loaded slot starts a fresh optim window
         return _slot_failure(
             await self.trainer.load_slot(slot, rank, alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer)
         )
 
     async def unload_slot(self, slot: int) -> dict | None:
+        self._window_counts.pop(slot, None)
         return _slot_failure(await self.trainer.unload_slot(slot))
 
     async def forward_backward(
@@ -85,6 +97,8 @@ class MilesBackend:
     async def _execute_batch(
         self, method: str, batch_id: int, slot_datums: list, loss_fn: str, loss_fn_config: dict
     ) -> list[dict] | dict:
+        if method == "forward_backward":
+            self._note_window(slot_datums)
         train_data = _build_train_data(_pad_to_dp_multiple(slot_datums, self.dp_size))
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
@@ -112,7 +126,32 @@ class MilesBackend:
 
     async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
         worker_results = await self.trainer.optim_step(adam_params_by_slot=adam_params_by_slot)
-        return worker_results[0]
+        metrics_by_slot = {}
+        for slot, metrics in worker_results[0].items():
+            # the trainer counts padded rows; the gateway knows each slot's exact window
+            counts = self._window_counts.pop(slot, _empty_window())
+            metrics_by_slot[slot] = metrics if "error" in metrics else {**metrics, **counts}
+            if "error" not in metrics:
+                self._log_perf(slot, metrics_by_slot[slot])
+        return metrics_by_slot
+
+    def _note_window(self, slot_datums: list) -> None:
+        touched = set()
+        for slot, datum in slot_datums:
+            counts = self._window_counts.setdefault(slot, _empty_window())
+            counts["num_tokens"] += len(datum["tokens"])
+            counts["num_datums"] += 1
+            if slot not in touched:
+                counts["num_units"] += 1
+                touched.add(slot)
+
+    def _log_perf(self, slot: int, metrics: dict) -> None:
+        record = {"time": time.time(), "slot": slot, **metrics}
+        logger.info(f"tinker perf: {json.dumps(record)}")
+        if self.perf_log_path is not None:
+            self.perf_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.perf_log_path.open("a") as log:
+                log.write(json.dumps(record) + "\n")
 
     async def save_slot(self, slot: int, path: str, metadata: dict | None = None) -> dict | None:
         return _slot_failure(await self.trainer.save_slot(slot=slot, path=path, metadata=metadata))
@@ -182,6 +221,10 @@ class MilesBackend:
                 # request-carried backfill source: the engine refills an evicted version itself
                 request["lora_backfill_paths"] = {lora_name: lora_path}
         return request
+
+
+def _empty_window() -> dict[str, int]:
+    return {"num_tokens": 0, "num_datums": 0, "num_units": 0}
 
 
 def _clamp_max_new_tokens(max_tokens: int, prompt_len: int, context_len: int | None) -> int:

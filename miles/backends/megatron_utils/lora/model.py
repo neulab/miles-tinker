@@ -2,9 +2,11 @@
 
 from argparse import Namespace
 from collections.abc import Sequence
+from contextlib import nullcontext
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 
+from miles.backends.megatron_utils import tinker_perf
 from miles.backends.megatron_utils.lora.optimizer import (
     SlotOptimizer,
     reset_grad_metadata_keep_grads,
@@ -15,6 +17,7 @@ from miles.backends.training_utils.data.rollout import get_data_iterator
 from miles.backends.training_utils.metrics.log_utils import aggregate_train_losses
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
+from miles.utils.timer import Timer, timer
 from miles.utils.types import RolloutBatch
 
 
@@ -39,17 +42,21 @@ def run_forward_backward(
         reset_grad_metadata_keep_grads(model)
 
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=batch_id)
-    losses_reduced = run_forward_backward_pass(
-        args,
-        dumper_phase_util,
-        data_iterator,
-        model,
-        num_microbatches[0],
-        num_rollouts=None,
-        forward_only=forward_only,
-    )
+    # only training passes count toward the optim window's MFU
+    with timer(tinker_perf.ACTOR_TRAIN_TIMER) if not forward_only else nullcontext():
+        losses_reduced = run_forward_backward_pass(
+            args,
+            dumper_phase_util,
+            data_iterator,
+            model,
+            num_microbatches[0],
+            num_rollouts=None,
+            forward_only=forward_only,
+        )
     per_datum_outputs = [output for microbatch in losses_reduced for output in microbatch["per_datum"]]
     dumper_phase_util.finalize(model)
+    if not forward_only:
+        tinker_perf.note_unit(Timer().seq_lens)
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
@@ -57,11 +64,16 @@ def run_forward_backward(
 
 
 def optim_step(
+    args: Namespace,
     slot_optimizers: dict[int, SlotOptimizer],
     adam_params_by_slot: dict[int, dict],
 ) -> dict[int, dict]:
     stepped = {slot: slot_optimizers[slot] for slot in adam_params_by_slot}
-    return step_slot_optimizers(stepped, adam_params_by_slot)
+    with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+        metrics_by_slot = step_slot_optimizers(stepped, adam_params_by_slot)
+    # the perf window is process-wide, so every slot stepped in this call reports the same numbers
+    perf = tinker_perf.pop_optim_window_metrics(args)
+    return {slot: {**metrics, **perf} for slot, metrics in metrics_by_slot.items()}
 
 
 def load_slot(args: Namespace, model: Sequence[DDP], slot: int, rank: int, alpha: float) -> SlotOptimizer:
