@@ -6,30 +6,31 @@ LoRA adapters. The Tinker SDKs only expose `create_lora_training_client`, so
 this page documents where the full-fine-tuning (FFT) gateway deviates from
 Tinker's LoRA semantics and why unmodified clients still work.
 
-Code: `miles/backends/megatron_utils/full/executor.py` (P2),
-`miles/tinker/core/service.py` (`_resolve_lora_config`, `_resolve_sampler`,
-`weights_info`) and `miles/tinker/runtime.py` (P1/P2). Design notes:
+Code: `miles/backends/megatron_utils/full/` (`actor.py`, `model.py`),
+`miles/tinker/core/service.py` (`create_model`, `submit_sample`, `weights_info`)
+and `miles/tinker/runtime.py` (`export_slot`). Design notes:
 `v2_executor_full_ft_design.md` section 4, `v2_sampling_versioning.md` section 5.
 
 ## Single tenant, `lora_config` ignored
 
 - The deployment has exactly one trainable model: `GatewayConfig.n_slots == 1`
   (slot 0 = the base weights); the service refuses any other `n_slots`.
-- `create_model` accepts **any** `lora_config` (cookbook and platoon always
-  send `{"rank": N, ...}`); it is logged (`train_mode=full: ignoring lora_config
-  ...`) and ignored, and the record is created with `is_lora=False,
-  lora_rank=0`. A client-side `lora_rank` / `learning_rate` meant for LoRA is
+- `create_model` accepts **any** `lora_config` (the SDK always sends
+  `{"rank": N, ...}`) and ignores it; the record is created with
+  `lora_rank=0`. A client-side `lora_rank` / `learning_rate` meant for LoRA is
   therefore a no-op for the rank and a real change for the learning rate: use
   an FFT learning rate (1e-6 in `deploy/clients/cookbook_guess_number_async.py`
   `learning_rate=1e-6`; the LoRA default is 3e-5).
-- A second concurrent training client gets `UserInputError("this full
-  fine-tuning gateway serves one model at a time")` until the first model's
+- A second concurrent training client gets `UserInputError("no free adapter
+  slots (capacity 1)")` until the first model's
   lease expires (`--tinker-lease-timeout-s`, default 600 s after the last
   heartbeat) or its session ends. Run one client at a time.
 - Every fresh `create_model` starts from the pristine base: `load_slot(slot=0,
   ckpt_path=None)` reloads the weights the server started from (the HF
-  snapshot through the bridge) and zeroes the optimizer moments and step
-  clocks in place (`reset_to_base`).
+  snapshot through the bridge) with fresh optimizer state (`reset_to_base`; a
+  no-op while nothing has been trained or loaded yet). Resetting refuses
+  `--chunked-optimizer-state-offload`, whose moments live outside the state it
+  clears, so with offload only the first model of a server starts cleanly.
 
 ## Training semantics
 
@@ -50,17 +51,16 @@ Code: `miles/backends/megatron_utils/full/executor.py` (P2),
 Tinker guarantees that a sampler path pins a weight version. The FFT gateway
 cannot: each SGLang engine holds one copy of the base weights and
 `save_weights_for_sampler` is the ordinary full weight sync
-(`TrainerController.update_weights()`), which returns the engines' global
-`weight_version`. Therefore:
+(`TrainerController.update_weights()` inside the inference controller's update
+bracket). Therefore:
 
-- `save_weights_for_sampler` (named or unnamed) pushes the current weights,
-  stores the returned engine version as the model's `sampler_version` and
-  returns `tinker://<model_id>/sampler_weights/<name>` as usual. Nothing is
-  written to disk for sampler saves.
-- `_resolve_sampler` validates the path (model owned by the tenant, version
-  <= `sampler_version`) and returns `None`, i.e. **every sampling session of
-  the model samples the newest pushed weights**, including sessions created
-  from older sampler paths.
+- `save_weights_for_sampler` (named or unnamed) pushes the current weights and
+  returns `tinker://<model_id>/sampler_weights/<name>` as usual. Only the
+  path's `META.json` (ownership and mode) is written to disk.
+- Sampling resolves the path (it must exist and belong to the tenant) and then
+  samples with no adapter name, i.e. **every sampling session of the model
+  samples the newest pushed weights**, including sessions created from older
+  sampler paths.
 - Correctness for RL clients: the returned per-token `logprobs` are those of
   the weights that actually produced each token, so importance-sampling / PPO
   / CISPO ratios computed by the client remain valid; only the trajectory is
@@ -85,20 +85,19 @@ Both SDKs assert `is_lora` when resuming from a state path
 
 ```json
 {"base_model": "...", "is_lora": true, "lora_rank": 0,
- "train_unembed": true, "train_mlp": true, "train_attn": true, "train_mode": "full"}
+ "train_unembed": true, "train_mlp": true, "train_attn": true}
 ```
 
-for an FFT checkpoint: `is_lora` is always `true` on this endpoint, `lora_rank`
-is the real rank (0 for FFT) and `train_mode` tells the truth. `get_info` /
-`GET training_runs/{id}` report the honest `is_lora: false, lora_rank: null`.
-`load_state` refuses a checkpoint whose sidecar `train_mode` does not match the
-gateway's mode (`UserInputError`).
+for an FFT checkpoint: `is_lora` is always `true` on this endpoint and
+`lora_rank` is the real rank (0 for FFT). The checkpoint's `META.json` records
+`train_mode`, and `load_state` refuses a checkpoint whose `train_mode` does not
+match the gateway's mode (`UserInputError`).
 
 ## Checkpoints and resume
 
 - `save_state(name)` -> `<checkpoint_root>/<model_id>/weights/<name>/`, a
   Megatron `torch_dist` checkpoint (model + optimizer, fixed iteration 1) plus
-  the `tinker_meta.json` sidecar. Size for Qwen3-4B ~56 GB (8 GB bf16 weights
+  the gateway's `META.json`. Size for Qwen3-4B ~56 GB (8 GB bf16 weights
   + 16 GB fp32 master + 32 GB Adam), 30-60 s at 1-2 GB/s: prefer
   `save_every >= 5` (cookbook) / `--checkpoint.every 5` (platoon) over the
   per-step default of platoon's synth config.
@@ -106,10 +105,8 @@ gateway's mode (`UserInputError`).
   `optimizer=False` restores weights and resets Adam (fresh optimizer). The
   parallel topology (TP/PP/DP) must match the save.
 - Resume works across gateway restarts and sessions of the same tenant because
-  `weights_info` and `load_state` read the sidecar; restart the gateway with the
+  `weights_info` and `load_state` read `META.json`; restart the gateway with the
   same `--checkpoint-root` (`RUN_NAME` in `deploy/abci/tinker_gateway.pbs`).
-- Deleting a checkpoint (`DELETE .../checkpoints/...`) removes the directory;
-  a missing checkpoint is treated as already deleted.
 
 ## Memory and performance (Qwen3-4B, 8 H200 trainers TP=1/DP=8)
 

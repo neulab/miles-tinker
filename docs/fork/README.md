@@ -1,77 +1,75 @@
 # miles-tinker fork: overview
 
 This fork of [radixark/miles](https://github.com/radixark/miles) serves the
-Tinker training/sampling API (`serve_tinker.py`) so that an **unmodified**
-tinker-cookbook (SDK 0.27.1) and platoon (SDK 0.16.1) can train against a miles
-cluster. The authoritative list of what changed and why is `FORK.md` at the
-repo root; this directory holds the operator-facing docs.
+Tinker training/sampling API (`serve_tinker.py`) so that **unmodified** Tinker
+SDK clients can train against a miles cluster. The gateway speaks upstream's
+SDK pin (`tinker==0.26.2`); clients on SDK 0.16.1 (platoon today) are no longer
+served. The authoritative list of what changed and why is `FORK.md` at the repo
+root; this directory holds the operator-facing docs.
 
 | Page | What it covers |
 |---|---|
 | `FORK.md` (repo root) | fork deltas by file, base-branch strategy, fast tests, upstream sync summary |
 | `docs/fork/full-finetuning.md` | `--tinker-train-mode full`: latest-only sampler, `weights_info` compatibility, resume, memory |
-| `docs/fork/acceptance.md` | the two acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
+| `docs/fork/acceptance.md` | the two pre-sync acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
 | `deploy/abci/README.md` | ABCI runbook: image pull, rootfs, gateway launch, endpoint file, clients, logs, stop |
 | `deploy/babel/README.md` | Serving the Tinker gateway on Babel and running clients against it |
-| `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc, kept in step by P1) |
+| `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc) |
 | `.claude/skills/upstream-sync/SKILL.md` | the upstream-sync procedure and conflict policy |
 
 ## What the gateway is
 
 ```
 client (tinker SDK) --HTTP--> serve_tinker.py (FastAPI, miles/tinker/server)
-                                  |  TinkerService (miles/tinker/core): sessions, models, promises,
-                                  |  planner (units of rows), checkpoints + tinker_meta.json sidecars
+                                  |  TinkerService (miles/tinker/core): sessions, models, futures,
+                                  |  scheduler (batches of datums), checkpoints + META.json metadata
                                   v
                               MilesBackend (miles/tinker/runtime.py)
                      /---------------------------------------------\
    TrainerController (Ray actors, Megatron)          sgl-router -> N SGLang engines
-   LoRA: slot executor, one adapter per client       LoRA: versioned adapters "<model_id>@<v>"
-   full: single-tenant executor on the base weights  full: base weights, latest push only
+   LoRA: MultiLoRATrainRayActor, one slot per client LoRA: adapters exported to disk, loaded on demand
+   full: FullTinkerTrainRayActor on the base weights full: base weights, latest push only
 ```
 
-Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gateway.py --mode`):
+Two deployment modes are selected at launch (`deploy/babel/container/gateway.py --mode`):
 
 - **lora** (`--multi-lora-n-adapters N`): N training clients share one frozen
-  base; each `save_weights_for_sampler` registers a versioned adapter in every
-  engine; the gateway keeps the last `--tinker-sampler-versions-to-keep`
-  versions loaded (older sampler paths are retired with a `UserInputError`).
+  base; each `save_weights_for_sampler` exports an adapter directory, which a
+  sample request names so the engines load (or reload) it on demand.
 - **full** (`--tinker-train-mode full`): one client at a time trains the base
-  weights; a sampler push is a full weight sync; only the latest version is
-  servable. See `full-finetuning.md`.
+  weights; a sampler save pushes the base weights to the engines; every sampler
+  path samples the latest weights. See `full-finetuning.md`.
 
-## Interface summary (from the design contract)
+## Interface summary
 
 - `GatewayConfig` (`miles/tinker/core/types.py`): `train_mode`, `n_slots`,
-  `lease_timeout_s` (600 s), `retrieve_poll_timeout_s` (20 s long-poll, below
-  the SDK's 45 s), `sampler_versions_to_keep` (3), `coalesce_wait_s` /
-  `coalesce_max_wait_s` (0.3 / 2.0 s: wait for more chunks of an open
-  forward_backward window before training a unit), `max_concurrent_samples`
-  (512), `unit_token_budget` (262,144 tokens). `serve_tinker.py` sets them
-  from `--tinker-train-mode`, `--tinker-lease-timeout-s`,
-  `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`,
-  `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s` and
-  `--tinker-unit-token-budget` (`n_slots` comes from `--multi-lora-n-adapters`,
-  `base_model` / `checkpoint_root` from `--tinker-base-model` /
-  `--tinker-checkpoint-root`; `coalesce_max_wait_s` keeps its default).
-- `ExecutorBackend` (`miles/tinker/core/service.py`): `load_slot`,
-  `unload_slot`, `forward_backward`, `forward_only`, `optim_step` (returns a
-  per-slot metrics dict: `grad_norm`, `skipped`, `lr`, `num_tokens`,
-  `num_datums`, `num_units`, `actor_train_time`, `actor_train_tflops`,
-  `actor_train_mfu`, `actor_train_tok_per_s`), `discard_grads`, `save_slot`,
-  `push_slot` (LoRA: None; full: the new engine weight version),
-  `unload_adapter`, `warmup`, `sample`.
+  `lease_timeout_s`, `batch_token_budget` (262,144 tokens), `coalesce_wait_s` /
+  `coalesce_max_wait_s` (wait for more chunks of a growing forward_backward
+  batch). `serve_tinker.py` sets them from `--tinker-train-mode`,
+  `--tinker-lease-timeout-s` (600 s), `--tinker-coalesce-wait-s` (0.3 s) and
+  `--tinker-coalesce-max-wait-s` (2 s); `n_slots` comes from
+  `--multi-lora-n-adapters` (1 in full mode). `--tinker-max-concurrent-samples`
+  (512) caps in-flight `/generate` posts in `MilesBackend`.
+- `MilesBackend` (`miles/tinker/runtime.py`): `load_slot`, `unload_slot`,
+  `forward_backward`, `forward_only`, `optim_step` (per-slot metrics: `grad_norm`
+  or `skipped`, plus `num_tokens`, `num_datums`, `num_units` and the window's
+  `actor_train_time`, `actor_train_tflops`, `actor_train_mfu`,
+  `actor_train_tok_per_s`, also appended to `<checkpoint_root>/perf.jsonl`),
+  `save_slot`, `export_slot` (full mode: push the base weights), `sample`.
 - Checkpoints: `<checkpoint_root>/<model_id>/<weights|sampler_weights>/<name>/`
-  plus `tinker_meta.json` (`model_id, tenant, session_id, base_model, is_lora,
-  lora_rank, lora_alpha, kind, name, sampler_version, created_at, train_mode`).
-  `/api/v1/weights_info` and `load_state` resolve from the sidecar, so resume
-  works after a gateway restart and from another session of the same tenant.
+  plus `META.json` (`tenant_digest, base_model, lora_rank, lora_alpha,
+  train_attn, train_mlp, train_unembed, train_mode`). `/api/v1/weights_info` and
+  `load_state` read it, so resume works after a gateway restart; a checkpoint
+  loads only into a model of the same train mode.
 - Metrics on the wire: `forward_backward` returns `loss:sum` and `logprobs`
   per datum plus `num_tokens:sum` / `num_datums:sum`; `optim_step` returns the
-  backend metrics dict verbatim (plain keys), always with `grad_norm`.
-- Tenant = the `X-API-Key` header (`TINKER_API_KEY`; SDK 0.16.1 needs a `tml-`
-  prefix, any value works). Sessions lease their models for `lease_timeout_s`
-  after the last heartbeat.
+  backend metrics, non-finite values as 0.0.
+- Tenant = the `X-API-Key` header (`TINKER_API_KEY`); a request without one is
+  rejected. Sessions lease their models for `lease_timeout_s` after the last
+  heartbeat, and a SESSION_END telemetry event releases them at once.
+- Failure policy (upstream): a failed `forward_backward`, `optim_step` or
+  `load_state` closes the model, including requests rejected for their content
+  (each datum must carry exactly the `loss_fn_inputs` its loss reads).
 
 ## Where to start
 

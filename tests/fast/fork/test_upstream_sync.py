@@ -94,7 +94,7 @@ def test_fork_rationale_covers_every_row_of_the_real_fork_md():
     fork_md = (Path(__file__).resolve().parents[3] / "FORK.md").read_text()
     listed = [row for row in fork_md.splitlines() if row.startswith("| `")]
     assert listed, "FORK.md tables not found"
-    sample = ("miles/tinker/runtime.py", "miles/utils/timer.py", "tests/fast/tinker/test_runtime.py", "deploy/abci/x.pbs")
+    sample = ("miles/tinker/runtime.py", "miles/tinker/core/future.py", "tests/fast/tinker/test_runtime.py", "deploy/abci/x.pbs")
     assert set(sync.fork_rationale(fork_md, sample)) == set(sample)
 
 
