@@ -36,6 +36,7 @@ def build_checkpoint_metadata(record: ModelRecord, config: GatewayConfig) -> dic
         "train_attn": config.trains_attn,
         "train_mlp": config.trains_mlp,
         "train_unembed": config.trains_unembed,
+        "train_mode": config.train_mode,
     }
 
 

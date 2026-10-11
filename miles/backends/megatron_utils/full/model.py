@@ -1,6 +1,6 @@
 """Command-grained full fine-tuning over the plain Megatron model + distributed optimizer.
 
-Design (see scratchpad note v2_executor_full_ft_design.md, section 4):
+The Tinker gateway's ``--tinker-train-mode full``: one model (slot 0) trains the base weights.
 
 * Deferred finalize. ``forward_backward`` runs Megatron's schedule with
   ``config.finalize_model_grads_func`` replaced by a no-op that only records
@@ -8,41 +8,37 @@ Design (see scratchpad note v2_executor_full_ft_design.md, section 4):
   DP reduce-scatter and the sequence-parallel / tied-embedding SUM all-reduces
   happen, so the fp32 ``main_grad`` buffers keep accumulating locally and
   linearly across calls (DDP's ``zero_grad_buffer`` is never called between
-  units; only ``reset_grad_metadata_keep_grads`` resets bookkeeping). The real
-  ``finalize_model_grads`` runs exactly once, at ``optim_step``. Per-call
+  batches; only ``reset_grad_metadata_keep_grads`` resets bookkeeping). The
+  real ``finalize_model_grads`` runs exactly once, at ``optim_step``. Per-call
   finalize would be wrong: the distributed optimizer's reduce-scatter and the
   SP-layernorm sums are not idempotent. ``overlap_grad_reduce`` and
   ``overlap_param_gather`` must stay off (asserted at serve validation).
-* Loss scaling. loss.py uses ``global_batch_size = 1`` for tinker units, so
-  each call contributes the exact datum SUM; the DDP ``1/dp`` pre-scale at the
-  single deferred reduce-scatter is cancelled by the ``* dp_cp_size`` in
-  loss.py. Padding rows (weight 0) add nothing.
+* Loss scaling. A batch carrying a Tinker ``loss_fn`` is an exact datum SUM
+  (loss/objective.py); the DDP ``1/dp`` pre-scale at the single deferred
+  reduce-scatter is cancelled by the loss's ``* dp_cp_size``. Padding datums
+  (zero loss mask) add nothing.
 * AdamParams arrive per optim_step (no scheduler): lr/betas/eps/weight_decay
   (times Megatron's ``wd_mult``/``lr_mult``) are written into the param groups
   and ``grad_clip_norm`` becomes ``OptimizerConfig.clip_grad`` (0 = no clip).
   A non-finite gradient norm vetoes the step: grads are zeroed, ``skipped=1``.
-* Latest-only sampler. ``push_slot`` is the ordinary base weight sync
-  (``actor.update_weights``): engines hold one copy of the weights, so every
-  sampler version resolves to the newest push (P1 documents the deviation).
+* Latest-only sampler. The gateway publishes sampler weights by pushing the
+  base weights to the engines (``actor.update_weights``); engines hold one copy,
+  so every sampler version of the model samples the newest push.
 * Checkpoints. ``save_state`` writes a Megatron torch_dist checkpoint
-  (model + optimizer, synchronous, fixed iteration 1) under the tinker
-  checkpoint path; ``load_state`` reads it back with a temporary ``args.load``
-  (optimizer optional; a weights-only load resets Adam state so the semantics
-  equal "fresh optimizer"). Resume needs the same parallel topology.
-  ``reset_to_base`` reloads the weights the server started from (``args.load``:
-  the HF checkpoint through the bridge, or the Megatron dir) and zeroes the
-  optimizer moments and step clocks in place (same as --reset-optimizer-states;
-  no optimizer re-creation).
-* Memory. The fp32 grad buffer (DDP, replicated) stays live between calls; it
-  is allocated permanently anyway. Qwen3-4B at TP=1/DP=8: ~30 GB static per
-  rank plus activations; a checkpoint is ~56 GB (bf16 + fp32 master + Adam).
+  (model + optimizer, synchronous, fixed iteration 1) plus the gateway's
+  ``META.json`` under the tinker checkpoint path; ``load_state`` reads it back
+  with a temporary ``args.load`` (optimizer optional; a weights-only load resets
+  Adam state so the semantics equal "fresh optimizer"). Resume needs the same
+  parallel topology. ``reset_to_base`` reloads the weights the server started
+  from (``args.load``) with fresh optimizer state, and is a no-op while the
+  weights are still those.
 """
 
 import logging
 from argparse import Namespace
 from collections.abc import Sequence
+from contextlib import nullcontext
 
-import torch
 import torch.distributed as dist
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.optimizer import MegatronOptimizer
@@ -59,9 +55,10 @@ from miles.backends.megatron_utils.model import (
     save,
     setup_train_iteration_config,
 )
-from miles.backends.training_utils.data import get_data_iterator
-from miles.backends.training_utils.log_utils import aggregate_train_losses
-from miles.backends.training_utils.loss_hub.tinker_losses import drain_per_datum_outputs, start_per_datum_outputs
+from miles.backends.megatron_utils.optimizer_utils import reset_optimizer_state
+from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
+from miles.backends.training_utils.data.rollout import get_data_iterator
+from miles.backends.training_utils.metrics.log_utils import aggregate_train_losses
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.distributed_utils import get_gloo_group
@@ -74,8 +71,9 @@ logger = logging.getLogger(__name__)
 # One directory per client-chosen name; the iteration inside it is fixed.
 SAVE_ITERATION = 1
 
-# Single tenant: one accumulation window per process.
-_state = {"pending_finalize": False, "dirty": False, "num_updates": 0}
+# Single tenant: one accumulation window per process. ``pristine`` means the
+# weights and optimizer are still the ones the server started from.
+_state = {"pending_finalize": False, "dirty": False, "num_updates": 0, "pristine": True}
 
 
 def _deferred_finalize(*_args, **_kwargs) -> None:
@@ -92,10 +90,12 @@ def _check_accumulation_config(args: Namespace) -> None:
 
 def forward_backward(
     args: Namespace,
-    unit_id: int,
+    batch_id: int,
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
     rollout_data: RolloutBatch,
+    *,
+    forward_only: bool = False,
 ) -> dict:
     _check_accumulation_config(args)
     data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
@@ -105,25 +105,35 @@ def forward_backward(
         iterator.reset()
     for model_chunk in model:
         model_chunk.train()
-    config = setup_train_iteration_config(args, model, optimizer, disable_optimizer=False)
-    config.finalize_model_grads_func = _deferred_finalize
-    reset_grad_metadata_keep_grads(model)
+    if forward_only:
+        # scoring touches no gradients: no optimizer interaction, no accumulation bookkeeping
+        setup_train_iteration_config(args, model, None, disable_optimizer=True)
+    else:
+        config = setup_train_iteration_config(args, model, optimizer, disable_optimizer=False)
+        config.finalize_model_grads_func = _deferred_finalize
+        reset_grad_metadata_keep_grads(model)
 
-    dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=unit_id)
-    start_per_datum_outputs()
+    dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=batch_id)
     try:
-        with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+        with timer(tinker_perf.ACTOR_TRAIN_TIMER) if not forward_only else nullcontext():
             losses_reduced = run_forward_backward_pass(
-                args, dumper_phase_util, data_iterator, model, num_microbatches[0], num_rollouts=None
+                args,
+                dumper_phase_util,
+                data_iterator,
+                model,
+                num_microbatches[0],
+                num_rollouts=None,
+                forward_only=forward_only,
             )
     except Exception:
-        # partially accumulated grads: optim_step discards the window
-        _state["dirty"] = True
+        if not forward_only:
+            # partially accumulated grads: the next optim_step discards the window
+            _state["dirty"] = True
         raise
-    finally:
-        per_datum_outputs = drain_per_datum_outputs()
+    per_datum_outputs = [output for microbatch in losses_reduced for output in microbatch["per_datum"]]
     dumper_phase_util.finalize(model)
-    tinker_perf.note_unit(Timer().seq_lens)
+    if not forward_only:
+        tinker_perf.note_unit(Timer().seq_lens)
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
@@ -135,6 +145,7 @@ def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimiz
         grad_norm, skipped = _step_accumulated_grads(model, optimizer, adam_params)
     if not skipped:
         _state["num_updates"] += 1
+        _state["pristine"] = False
     metrics = {
         "grad_norm": grad_norm,
         "skipped": skipped,
@@ -178,11 +189,16 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
     _state["dirty"] = False
 
 
-def save_state(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str) -> None:
-    """Megatron torch_dist checkpoint (model + optimizer) under ``path``; complete on return."""
-    with inplace_modify_args(args, {"save": path, "async_save": False}):
-        save(SAVE_ITERATION, model, optimizer, None)
-    _barrier()
+def save_state(
+    args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str, metadata: dict | None = None
+) -> None:
+    """Megatron torch_dist checkpoint (model + optimizer) plus META.json under ``path``; complete on return."""
+
+    def write(checkpoint_dir) -> None:
+        with inplace_modify_args(args, {"save": str(checkpoint_dir), "async_save": False}):
+            save(SAVE_ITERATION, model, optimizer, None)
+
+    write_checkpoint_dir(path, write, metadata=metadata)
 
 
 def load_state(
@@ -205,43 +221,35 @@ def load_state(
         )
     if not load_optimizer:
         optimizer.reload_model_params()
-        reset_optimizer_state(optimizer)
+        _reset_optimizer_state(args, optimizer)
     discard_grads(model, optimizer)
+    _state["pristine"] = False
     _barrier()
 
 
 def reset_to_base(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
     """Pristine base weights + fresh optimizer: reload what the server started from."""
+    discard_grads(model, optimizer)
+    if _state["pristine"]:
+        return  # nothing trained or loaded since startup: already the base weights and a fresh optimizer
     assert _has_loadable_ckpt(args.load), f"cannot reset to base: --load {args.load!r} holds no checkpoint"
     # weights only; the same args.load/ckpt_step the init load used (HF via bridge, or a Megatron dir)
     with inplace_modify_args(args, {"finetune": True, "no_load_optim": True, "no_load_rng": True}):
         load_checkpoint(model, None, None, checkpointing_context={}, skip_load_to_model_and_opt=False)
     optimizer.reload_model_params()
-    reset_optimizer_state(optimizer)
-    discard_grads(model, optimizer)
+    _reset_optimizer_state(args, optimizer)
     _state["num_updates"] = 0
+    _state["pristine"] = True
     _barrier()
 
 
-def reset_optimizer_state(optimizer: MegatronOptimizer) -> None:
-    """Zero Adam moments and step clocks in place (group-level FusedAdam or per-param torch Adam)."""
-    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
-        inner = child.optimizer
-        for group in inner.param_groups:
-            if "step" in group:
-                group["step"] = _zeroed_step(group["step"])
-        for state in inner.state.values():
-            for key in ("exp_avg", "exp_avg_sq"):
-                if key in state:
-                    state[key].zero_()
-            if "step" in state:
-                state["step"] = _zeroed_step(state["step"])
-
-
-def _zeroed_step(step):
-    if torch.is_tensor(step):
-        return step.zero_()
-    return 0
+def _reset_optimizer_state(args: Namespace, optimizer: MegatronOptimizer) -> None:
+    # refuses offloaded or streamed optimizer state, whose moments live outside what it clears
+    reset_optimizer_state(
+        optimizer,
+        stream_optimizer_state_to_disk=args.stream_optimizer_state_to_disk,
+        chunked_optimizer_state_offload=args.chunked_optimizer_state_offload,
+    )
 
 
 def _barrier() -> None:

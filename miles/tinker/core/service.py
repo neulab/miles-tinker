@@ -51,6 +51,8 @@ class TinkerService:
         self.models: dict[str, ModelRecord] = {}
         self.sessions: dict[str, SessionRecord] = {}
         self.sampling_sessions: dict[str, SamplingSessionRecord] = {}
+        if config.train_mode == "full" and config.n_slots != 1:
+            raise ValueError(f"train_mode='full' serves exactly one model, got n_slots={config.n_slots}")
         self.free_slots = set(range(config.n_slots))
         self._wake = asyncio.Event()
         self._trainer_lock = asyncio.Lock()
@@ -161,9 +163,13 @@ class TinkerService:
         if base_model != self.config.base_model:
             raise UserInputError(f"this gateway serves {self.config.base_model!r}, not {base_model!r}")
         lora_config = payload.get("lora_config") or {}
-        validate_model_config(lora_config, self.config)
-        rank = lora_config.get("rank", 32)
-        alpha = self.config.lora_alpha if self.config.lora_alpha is not None else float(2 * rank)
+        if self.config.train_mode == "full":
+            # the SDK always sends a LoRA config; full fine-tuning trains the base weights instead
+            rank, alpha = 0, 0.0
+        else:
+            validate_model_config(lora_config, self.config)
+            rank = lora_config.get("rank", 32)
+            alpha = self.config.lora_alpha if self.config.lora_alpha is not None else float(2 * rank)
         if not self.free_slots:
             raise UserInputError(f"no free adapter slots (capacity {self.config.n_slots})")
         slot = min(self.free_slots)
@@ -499,6 +505,9 @@ class TinkerService:
             if model_path
             else (None, None)
         )
+        if self.config.train_mode == "full":
+            # the engines hold the latest pushed base weights; every sampler path of the model samples them
+            lora_name, lora_path = None, None
         future = self.futures.create(model_path or "base", tenant)
         sequence_ids = [f"seq-{uuid.uuid4().hex}" for _ in range(payload.get("num_samples", 1))]
         task = asyncio.create_task(self._run_sample(future.request_id, sequence_ids, payload, lora_name, lora_path))

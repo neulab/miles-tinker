@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 async def serve(args, *, disposer: Disposer):
-    assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
+    full = args.tinker_train_mode == "full"
+    assert full or args.multi_lora, "serve_tinker --tinker-train-mode lora requires --multi-lora-n-adapters > 0"
     assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
@@ -58,11 +59,11 @@ async def serve(args, *, disposer: Disposer):
 
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
-        n_slots=args.multi_lora_n_adapters,
+        n_slots=1 if full else args.multi_lora_n_adapters,
         checkpoint_root=checkpoint_root,
         vocab_size=hf_config.vocab_size,
         max_tokens_per_datum=max_tokens_per_datum,
-        lora_alpha=args.lora_alpha,
+        lora_alpha=None if full else args.lora_alpha,
         max_lora_rank=args.lora_rank,
         trains_attn="attn" in args.tinker_lora_groups,
         trains_mlp="mlp" in args.tinker_lora_groups,
@@ -70,6 +71,7 @@ async def serve(args, *, disposer: Disposer):
         lease_timeout_s=args.tinker_lease_timeout_s,
         coalesce_wait_s=args.tinker_coalesce_wait_s,
         coalesce_max_wait_s=args.tinker_coalesce_max_wait_s,
+        train_mode=args.tinker_train_mode,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
@@ -89,6 +91,8 @@ async def serve(args, *, disposer: Disposer):
         context_len=context_len,
         max_concurrent_samples=args.tinker_max_concurrent_samples,
         perf_log_path=f"{checkpoint_root}/perf.jsonl",
+        train_mode=args.tinker_train_mode,
+        inference_controller=inference_controller,
     )
     service = TinkerService(backend, config)
 

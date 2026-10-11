@@ -274,17 +274,21 @@ class TestConstructorArguments:
         assert "indep_dp_store_addr" not in spec.ctor_kwargs(_make_context())
 
     @pytest.mark.parametrize(
-        "backend,multi_lora,actor_class",
+        "backend,multi_lora,tinker_train_mode,actor_class",
         [
-            ("megatron", False, "miles.backends.megatron_utils.actor.MegatronTrainRayActor"),
-            ("megatron", True, "miles.backends.megatron_utils.lora.actor.MultiLoRATrainRayActor"),
-            ("fsdp", False, "miles.backends.fsdp_utils.actor.FSDPTrainRayActor"),
+            ("megatron", False, None, "miles.backends.megatron_utils.actor.MegatronTrainRayActor"),
+            ("megatron", True, None, "miles.backends.megatron_utils.lora.actor.MultiLoRATrainRayActor"),
+            ("megatron", True, "lora", "miles.backends.megatron_utils.lora.actor.MultiLoRATrainRayActor"),
+            ("megatron", False, "full", "miles.backends.megatron_utils.full.actor.FullTinkerTrainRayActor"),
+            ("fsdp", False, None, "miles.backends.fsdp_utils.actor.FSDPTrainRayActor"),
         ],
-        ids=["megatron", "multi-lora", "fsdp"],
+        ids=["megatron", "multi-lora", "tinker-lora", "tinker-full", "fsdp"],
     )
-    def test_the_backend_selects_the_worker_class(self, backend, multi_lora, actor_class):
+    def test_the_backend_selects_the_worker_class(self, backend, multi_lora, tinker_train_mode, actor_class):
         actor_spec, critic_spec = specs_trainer(
-            _make_args(train_backend=backend, multi_lora=multi_lora, use_critic=True)
+            _make_args(
+                train_backend=backend, multi_lora=multi_lora, tinker_train_mode=tinker_train_mode, use_critic=True
+            )
         )
 
         assert actor_spec.worker_class == actor_class

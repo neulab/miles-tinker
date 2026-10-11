@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
 from miles.utils import object_store
@@ -30,8 +31,10 @@ def _pad_to_dp_multiple(slot_datums: list, dp_size: int) -> list:
     return slot_datums + [(slot, filler)] * (dp_size - remainder)
 
 
-def _build_train_data(slot_datums: list) -> dict:
-    """Miles response_lengths select label positions here, including prompt targets."""
+def _build_train_data(slot_datums: list, *, with_adapter_slots: bool = True) -> dict:
+    """Miles response_lengths select label positions here, including prompt targets.
+
+    Full fine-tuning has no adapters: its batches carry no ``adapter_slots``."""
     datums = [datum for _, datum in slot_datums]
     train_data = {
         "tokens": [datum["tokens"] for datum in datums],
@@ -40,9 +43,10 @@ def _build_train_data(slot_datums: list) -> dict:
         "response_lengths": [datum["target_len"] for datum in datums],
         "total_lengths": [len(datum["tokens"]) for datum in datums],
         "sample_indices": list(range(len(datums))),
-        "adapter_slots": [slot for slot, _ in slot_datums],
         "dynamic_global_batch_size": len(datums),
     }
+    if with_adapter_slots:
+        train_data["adapter_slots"] = [slot for slot, _ in slot_datums]
     for datum_key, batch_key in DATUM_TO_BATCH_KEYS.items():
         if datum_key in datums[0]:
             train_data[batch_key] = [datum[datum_key] for datum in datums]
@@ -58,8 +62,13 @@ class MilesBackend:
         context_len: int | None = None,
         max_concurrent_samples: int = 512,
         perf_log_path: str | None = None,
+        train_mode: str = "lora",
+        inference_controller=None,
     ) -> None:
         self.trainer = trainer
+        self.train_mode = train_mode
+        # full fine-tuning publishes sampler weights by pushing the base weights to the engines
+        self.inference_controller = inference_controller
         self.router_url = router_url
         self.dp_size = dp_size
         self.context_len = context_len  # engine context; generations are clamped to fit it
@@ -99,7 +108,9 @@ class MilesBackend:
     ) -> list[dict] | dict:
         if method == "forward_backward":
             self._note_window(slot_datums)
-        train_data = _build_train_data(_pad_to_dp_multiple(slot_datums, self.dp_size))
+        train_data = _build_train_data(
+            _pad_to_dp_multiple(slot_datums, self.dp_size), with_adapter_slots=self.train_mode != "full"
+        )
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
         worker_results = await self._call_trainer(method, batch_id, train_data)
@@ -159,9 +170,23 @@ class MilesBackend:
     async def export_slot(
         self, slot: int, rank: int, alpha: float, path: str, metadata: dict | None = None
     ) -> dict | None:
+        if self.train_mode == "full":
+            await self._push_base_weights()
+            # engines hold one copy of the base weights: the sampler path only carries ownership metadata
+            write_checkpoint_dir(path, lambda _: None, metadata=metadata)
+            return None
         return _slot_failure(
             await self.trainer.export_slot(slot=slot, rank=rank, alpha=alpha, path=path, metadata=metadata)
         )
+
+    async def _push_base_weights(self) -> None:
+        info = await self.inference_controller.start_update_weights()
+        try:
+            await self.trainer.update_weights(info=info)
+        except BaseException:
+            await self.inference_controller.abort_update_weights()
+            raise
+        await self.inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
     # -------- sampling --------
 

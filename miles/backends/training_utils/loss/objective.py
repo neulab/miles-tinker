@@ -198,8 +198,9 @@ def loss_function(
     else:
         assert args.use_dynamic_global_batch_size == ("dynamic_global_batch_size" in batch)
         global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
-    # Tinker losses already carry the client's normalization
-    loss_normalizer = 1 if is_multi_lora_enabled(args) else global_batch_size
+    # Tinker losses already carry the client's normalization, in multi-LoRA and full fine-tuning
+    # alike: a batch with a Tinker loss_fn is an exact sum over its datums
+    loss_normalizer = 1 if is_multi_lora_enabled(args) or batch.get("loss_fn") is not None else global_batch_size
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (

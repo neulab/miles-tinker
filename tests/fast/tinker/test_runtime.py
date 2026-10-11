@@ -287,3 +287,71 @@ async def test_optim_step_logs_each_slot_window_to_perf_jsonl(tmp_path):
 
     metrics = await backend.optim_step({0: {}})
     assert (metrics[0]["num_tokens"], metrics[0]["num_units"]) == (0, 0), "each optim step starts a new window"
+
+
+def test_full_fine_tuning_batches_carry_no_adapter_slots():
+    train_data = _build_train_data([(0, _datum([1, 2, 3]))], with_adapter_slots=False)
+    assert "adapter_slots" not in train_data
+
+
+async def test_a_full_mode_sampler_save_pushes_the_base_weights(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Controller:
+        async def start_update_weights(self):
+            calls.append("start")
+            return SimpleNamespace(snapshot_cell_id_to_hashes={"cell": "hash"})
+
+        async def end_update_weights(self, snapshot_cell_id_to_hashes):
+            calls.append(("end", snapshot_cell_id_to_hashes))
+
+        async def abort_update_weights(self):
+            calls.append("abort")
+
+    async def update_weights(info):
+        calls.append("update_weights")
+        return 7
+
+    backend = MilesBackend(
+        SimpleNamespace(update_weights=update_weights),
+        "http://router",
+        train_mode="full",
+        inference_controller=Controller(),
+    )
+    path = tmp_path / "sampler_weights" / "1"
+    assert await backend.export_slot(0, 0, 0.0, str(path), metadata={"train_mode": "full"}) is None
+    assert calls == ["start", "update_weights", ("end", {"cell": "hash"})]
+    assert json.loads((path / "META.json").read_text()) == {"train_mode": "full"}
+
+
+async def test_a_failed_full_mode_push_aborts_the_weight_update(tmp_path):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Controller:
+        async def start_update_weights(self):
+            return SimpleNamespace(snapshot_cell_id_to_hashes={})
+
+        async def end_update_weights(self, snapshot_cell_id_to_hashes):
+            calls.append("end")
+
+        async def abort_update_weights(self):
+            calls.append("abort")
+
+    async def update_weights(info):
+        raise RuntimeError("nccl")
+
+    backend = MilesBackend(
+        SimpleNamespace(update_weights=update_weights),
+        "http://router",
+        train_mode="full",
+        inference_controller=Controller(),
+    )
+    with pytest.raises(RuntimeError, match="nccl"):
+        await backend.export_slot(0, 0, 0.0, str(tmp_path / "s"), metadata={})
+    assert calls == ["abort"]
+    assert not (tmp_path / "s").exists(), "no sampler path for weights the engines never received"

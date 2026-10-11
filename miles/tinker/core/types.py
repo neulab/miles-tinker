@@ -67,6 +67,7 @@ class GatewayConfig:
     # coalesce_wait_s after the latest submit, and coalesce_max_wait_s in total; 0 disables the wait
     coalesce_wait_s: float = 0.0
     coalesce_max_wait_s: float = 2.0
+    train_mode: str = "lora"  # "full" trains the base weights of a single model (n_slots == 1)
 
 
 @dataclass

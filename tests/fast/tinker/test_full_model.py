@@ -1,9 +1,11 @@
-"""The full fine-tuning executor's optim window: finalize exactly once per
+"""The full fine-tuning model's optim window: finalize exactly once per
 window, AdamParams applied per step, non-finite grads vetoed, windows
-discarded on failure. Megatron and the heavy miles modules are stubbed; the
-test drives the executor's own state machine."""
+discarded on failure, checkpoints written with the gateway metadata. Megatron
+and the heavy miles modules are stubbed; the test drives full/model.py's own
+state machine."""
 
 import importlib
+import json
 import sys
 import types
 from argparse import Namespace
@@ -12,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-EXECUTOR = "miles.backends.megatron_utils.full.executor"
+EXECUTOR = "miles.backends.megatron_utils.full.model"
 ADAM = {
     "learning_rate": 1e-4,
     "beta1": 0.9,
@@ -82,12 +84,14 @@ def rig(monkeypatch):
     """Import the executor against stubs and expose the calls it makes."""
     log: list[str] = []
     config = SimpleNamespace(finalize_model_grads_func=None)
+    args = rig_args = Namespace()
 
-    def run_forward_backward_pass(args, dumper, data_iterator, model, num_microbatches, num_rollouts):
-        log.append("fwd_bwd")
-        # the schedule ends by calling the (now deferred) finalize hook
-        config.finalize_model_grads_func([model], None)
-        return [{"loss": torch.tensor(1.0)}]
+    def run_forward_backward_pass(args, dumper, data_iterator, model, num_microbatches, num_rollouts, forward_only):
+        log.append("fwd" if forward_only else "fwd_bwd")
+        if not forward_only:
+            # the schedule ends by calling the (now deferred) finalize hook
+            config.finalize_model_grads_func([model], None)
+        return [{"loss": torch.tensor(1.0), "per_datum": [{"sample_index": 0}]}]
 
     def finalize(model, num_tokens, **kwargs):
         log.append("finalize")
@@ -101,7 +105,7 @@ def rig(monkeypatch):
         _zero_grads=zero_grads,
         finalize_model_grads_with_empty_cache=finalize,
         run_forward_backward_pass=run_forward_backward_pass,
-        save=lambda iteration, model, optimizer, sched: log.append(f"save:{iteration}"),
+        save=lambda iteration, model, optimizer, sched: log.append(f"save:{iteration}:{rig_args.save}"),
         setup_train_iteration_config=lambda args, model, optimizer, disable_optimizer: config,
     )
     stubs = {
@@ -118,17 +122,16 @@ def rig(monkeypatch):
             "miles.backends.megatron_utils.lora.optimizer",
             reset_grad_metadata_keep_grads=lambda model: log.append("reset_grad_metadata"),
         ),
-        "miles.backends.training_utils.data": _module(
-            "miles.backends.training_utils.data",
+        "miles.backends.megatron_utils.optimizer_utils": _module(
+            "miles.backends.megatron_utils.optimizer_utils",
+            reset_optimizer_state=lambda optimizer, **flags: log.append(f"reset_optimizer_state:{sorted(flags)}"),
+        ),
+        "miles.backends.training_utils.data.rollout": _module(
+            "miles.backends.training_utils.data.rollout",
             get_data_iterator=lambda args, model, rollout_data: ([SimpleNamespace(reset=lambda: None)], [1]),
         ),
-        "miles.backends.training_utils.log_utils": _module(
-            "miles.backends.training_utils.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}
-        ),
-        "miles.backends.training_utils.loss_hub.tinker_losses": _module(
-            "miles.backends.training_utils.loss_hub.tinker_losses",
-            start_per_datum_outputs=lambda: None,
-            drain_per_datum_outputs=lambda: [{"sample_index": 0}],
+        "miles.backends.training_utils.metrics.log_utils": _module(
+            "miles.backends.training_utils.metrics.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}
         ),
         "miles.backends.training_utils.parallel": _module(
             "miles.backends.training_utils.parallel",
@@ -145,7 +148,7 @@ def rig(monkeypatch):
     for name in (EXECUTOR, "miles.backends.megatron_utils.full"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     executor = importlib.import_module(EXECUTOR)
-    executor._state.update(pending_finalize=False, dirty=False, num_updates=0)
+    executor._state.update(pending_finalize=False, dirty=False, num_updates=0, pristine=True)
     from miles.backends.megatron_utils import tinker_perf
 
     tinker_perf.pop_window()
@@ -153,7 +156,14 @@ def rig(monkeypatch):
     from miles.utils.timer import Timer
 
     Timer().seq_lens = [3, 3]
-    args = Namespace(overlap_grad_reduce=False, overlap_param_gather=False, load="/base", mfu_peak_tflops=None)
+    args.__dict__.update(
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        load="/base",
+        mfu_peak_tflops=None,
+        stream_optimizer_state_to_disk=False,
+        chunked_optimizer_state_offload=False,
+    )
     rig = SimpleNamespace(executor=executor, log=log, config=config, args=args, model=[FakeModelChunk()])
     yield rig
     for name in (EXECUTOR, "miles.backends.megatron_utils.full"):
@@ -165,7 +175,7 @@ def test_units_defer_finalize_and_optim_step_runs_it_once(rig):
     for unit_id in (1, 2):
         out = rig.executor.forward_backward(rig.args, unit_id, rig.model, optimizer, {})
         assert out == {"metrics": {"loss": 1.0}, "per_datum": [{"sample_index": 0}]}
-    assert rig.log == ["reset_grad_metadata", "fwd_bwd", "reset_grad_metadata", "fwd_bwd"], "no collective per unit"
+    assert rig.log == ["reset_grad_metadata", "fwd_bwd", "reset_grad_metadata", "fwd_bwd"], "no collective per batch"
     assert rig.executor._state["pending_finalize"] is True
 
     metrics = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
@@ -228,19 +238,21 @@ def test_discard_grads_clears_pending_finalize(rig):
     assert "finalize" not in rig.log, "nothing accumulated: no collective to run"
 
 
-def test_reset_optimizer_state_zeroes_moments_and_clocks(rig):
+def test_forward_only_scores_without_touching_the_window(rig):
     optimizer = FakeOptimizer()
-    rig.executor.reset_optimizer_state(optimizer)
-    state = optimizer.inner.state["p"]
-    assert state["exp_avg"].sum() == 0 and state["exp_avg_sq"].sum() == 0 and state["step"].item() == 0
-    assert optimizer.inner.param_groups[0]["step"] == 0
+    out = rig.executor.forward_backward(rig.args, 1, rig.model, optimizer, {}, forward_only=True)
+    assert out["per_datum"] == [{"sample_index": 0}]
+    assert rig.log == ["fwd"], "no grad bookkeeping and no deferred finalize for a scoring pass"
+    assert rig.executor._state["pending_finalize"] is False
 
 
-def test_save_state_uses_a_temporary_synchronous_save_dir(rig):
+def test_save_state_writes_a_synchronous_checkpoint_and_the_gateway_metadata(rig, tmp_path):
     rig.args.save = "/native"
     rig.args.async_save = True
-    rig.executor.save_state(rig.args, rig.model, FakeOptimizer(), "/ckpt/weights/step-1")
-    assert rig.log == [f"save:{rig.executor.SAVE_ITERATION}"]
+    path = tmp_path / "weights" / "step-1"
+    rig.executor.save_state(rig.args, rig.model, FakeOptimizer(), str(path), metadata={"train_mode": "full"})
+    assert rig.log == [f"save:{rig.executor.SAVE_ITERATION}:{path}"], "Megatron saves into the checkpoint dir"
+    assert json.loads((path / "META.json").read_text())["train_mode"] == "full"
     assert (rig.args.save, rig.args.async_save) == ("/native", True), "args restored after the save"
 
 
@@ -254,19 +266,35 @@ def test_load_state_without_optimizer_gives_a_fresh_optimizer(rig):
     )
     optimizer = FakeOptimizer()
     rig.executor.load_state(rig.args, rig.model, optimizer, "/ckpt/weights/step-1", load_optimizer=False)
-    assert rig.log == ["load_checkpoint", "zero_grads"]
+    assert rig.log == [
+        "load_checkpoint",
+        "reset_optimizer_state:['chunked_optimizer_state_offload', 'stream_optimizer_state_to_disk']",
+        "zero_grads",
+    ]
     assert optimizer.calls == ["reload_model_params"], "masters refreshed from the loaded weights"
-    assert optimizer.inner.state["p"]["step"].item() == 0, "weights-only load means a fresh optimizer"
     assert rig.args.load == "/base", "args restored after the load"
+    assert rig.executor._state["pristine"] is False
 
 
-def test_reset_to_base_reloads_the_startup_weights(rig):
+def test_reset_to_base_is_a_no_op_on_pristine_weights(rig):
+    optimizer = FakeOptimizer()
+    rig.executor.reset_to_base(rig.args, rig.model, optimizer)
+    assert rig.log == ["zero_grads"] and optimizer.calls == [], "nothing trained yet: keep the startup state"
+
+
+def test_reset_to_base_reloads_the_startup_weights_after_training(rig):
     rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng = False, False, False
     optimizer = FakeOptimizer()
-    rig.executor._state["num_updates"] = 3
+    rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    rig.log.clear()
+    optimizer.calls.clear()
+
     rig.executor.reset_to_base(rig.args, rig.model, optimizer)
-    assert rig.log == ["load_checkpoint", "zero_grads"]
+    assert rig.log == [
+        "zero_grads",
+        "load_checkpoint",
+        "reset_optimizer_state:['chunked_optimizer_state_offload', 'stream_optimizer_state_to_disk']",
+    ]
     assert optimizer.calls == ["reload_model_params"]
-    assert optimizer.inner.state["p"]["step"].item() == 0
-    assert rig.executor._state["num_updates"] == 0
+    assert (rig.executor._state["num_updates"], rig.executor._state["pristine"]) == (0, True)
     assert (rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng) == (False, False, False)

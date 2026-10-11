@@ -224,11 +224,7 @@ def _compute_spec_trainer(
             pg_name="actor",
             pg_slot_offset=pg_slot_offset,
         ),
-        worker_class=(
-            "miles.backends.megatron_utils.lora.actor.MultiLoRATrainRayActor"
-            if args.train_backend == "megatron" and config.role == ACTOR_ROLE and is_multi_lora_enabled(args)
-            else _TRAINER_ACTOR_CLASSES[args.train_backend]
-        ),
+        worker_class=_trainer_worker_class(args, role=config.role),
         ctor_kwargs=lambda ctx: dict(
             args=args,
             world_size=gpus_per_cell,
@@ -279,3 +275,13 @@ def compute_trainer_env_vars(args, ctx: WorkerLaunchContext, *, fp8_scales: str)
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
     return env_vars
+
+
+def _trainer_worker_class(args, *, role: str) -> str:
+    """The Tinker gateway trains through a per-mode actor; every other run uses the backend's actor."""
+    if args.train_backend == "megatron" and role == ACTOR_ROLE:
+        if getattr(args, "tinker_train_mode", None) == "full":
+            return "miles.backends.megatron_utils.full.actor.FullTinkerTrainRayActor"
+        if is_multi_lora_enabled(args):
+            return "miles.backends.megatron_utils.lora.actor.MultiLoRATrainRayActor"
+    return _TRAINER_ACTOR_CLASSES[args.train_backend]
