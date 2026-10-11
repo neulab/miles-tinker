@@ -17,6 +17,36 @@ def add_tinker_arguments(parser):
         "checkpoint-root",
         help="Directory for tinker:// checkpoints (default: <save>/tinker)",
     )
+    add_argument(
+        "train-mode",
+        choices=["lora", "full"],
+        default="lora",
+        help="'lora' serves multi-LoRA slots; 'full' fine-tunes the base weights for a single tenant",
+    )
+    add_argument(
+        "lease-timeout-s",
+        type=float,
+        default=600.0,
+        help="Seconds without a heartbeat before a session's models and slots are released",
+    )
+    add_argument(
+        "max-concurrent-samples",
+        type=int,
+        default=512,
+        help="Maximum in-flight /generate posts across all sampling requests",
+    )
+    add_argument(
+        "coalesce-wait-s",
+        type=float,
+        default=0.3,
+        help="Idle seconds a forward_backward batch waits for more chunks of a request still arriving (0 disables)",
+    )
+    add_argument(
+        "coalesce-max-wait-s",
+        type=float,
+        default=2.0,
+        help="Cap on the total coalesce wait for one batch, however many chunks keep arriving",
+    )
     return parser
 
 

@@ -67,6 +67,10 @@ async def serve(args, *, disposer: Disposer):
         trains_attn="attn" in args.tinker_lora_groups,
         trains_mlp="mlp" in args.tinker_lora_groups,
         trains_unembed="unembed" in args.tinker_lora_groups,
+        lease_timeout_s=args.tinker_lease_timeout_s,
+        coalesce_wait_s=args.tinker_coalesce_wait_s,
+        coalesce_max_wait_s=args.tinker_coalesce_max_wait_s,
+        max_concurrent_samples=args.tinker_max_concurrent_samples,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node

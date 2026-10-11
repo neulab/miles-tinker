@@ -63,6 +63,11 @@ class GatewayConfig:
     trains_unembed: bool = False
     lease_timeout_s: float = 300.0  # sessions stale beyond this lose their sampling, models, and slots
     batch_token_budget: int = 262_144  # packing bound per BatchUnit
+    # a forward_backward batch whose request may still grow (more chunks arriving) waits up to
+    # coalesce_wait_s after the latest submit, and coalesce_max_wait_s in total; 0 disables the wait
+    coalesce_wait_s: float = 0.0
+    coalesce_max_wait_s: float = 2.0
+    max_concurrent_samples: int = 512  # in-flight /generate posts across all sampling requests
 
 
 @dataclass
