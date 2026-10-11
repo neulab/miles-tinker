@@ -61,7 +61,7 @@ def _install(venv: Path) -> None:
     image_constraints = venv / "image-constraints.txt"
     image_constraints.write_text(_image_constraints())
     constraints = ["-c", str(REPO / "requirements.txt"), "-c", str(image_constraints)]
-    subprocess.run([*install, *constraints, "tinker==0.27.1"], check=True)
+    subprocess.run([*install, *constraints, "tinker==0.26.2"], check=True)
 
 
 def _image_constraints() -> str:

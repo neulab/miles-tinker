@@ -27,7 +27,8 @@ Args:
   --tinker-port: HTTP port the gateway binds on 0.0.0.0.
   --checkpoint-root: where ``tinker://`` checkpoints are written.
   --n-adapters / --lora-rank / --lora-alpha / --target-modules: LoRA slot pool
-    (``--mode lora``); the SGLang ``max_loras_per_batch`` follows ``--n-adapters``
+    (``--mode lora``); targets are whole groups (``attn,mlp,unembed``); the SGLang
+    ``max_loras_per_batch`` follows ``--n-adapters``
     (``--sglang-max-loras-per-batch`` is shadowed by miles for multi-LoRA).
   --max-tokens-per-gpu: packed tokens per training microbatch (raise until OOM).
   --recompute-args: extra Megatron recompute flags, e.g.
@@ -59,7 +60,6 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    run_id: str = U.create_run_id()
 
     mode: str = "lora"
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
@@ -81,7 +81,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lora_rank: int = 32
     lora_alpha: int = 32  # Tinker convention: alpha fixed at 32 regardless of rank
     n_adapters: int = 8
-    target_modules: str = "linear_qkv,linear_proj,linear_fc1,linear_fc2"
+    target_modules: str = "attn,mlp,unembed"  # Tinker trains whole groups: any of attn, mlp, unembed
 
     # Training performance knobs.
     max_tokens_per_gpu: int = 8192
@@ -116,8 +116,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
     """Download the HF checkpoint. Run once per shared filesystem."""
-    U.exec_command_cpu(f"mkdir -p {args.model_dir}")
-    U.exec_command_cpu(f"hf download {args.model_name} --local-dir {args.hf_checkpoint}")
+    backend = args.create_backend()
+    backend.exec_command_cpu(f"mkdir -p {args.model_dir}")
+    backend.exec_command_cpu(f"hf download {args.model_name} --local-dir {args.hf_checkpoint}")
 
 
 @app.command()
@@ -187,13 +188,14 @@ def serve(args: ScriptArgs):
         f"{perf_args} {sglang_args} {update_weight_args} {topology_args} {misc_args} {args.extra_args} "
     )
 
-    U.execute_train(
+    # the Ray job lives as long as this launcher, so stopping serve.py stops the gateway
+    args.create_backend().execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
+        job_lifetime="launcher",
     )
 
 

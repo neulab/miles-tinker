@@ -100,4 +100,9 @@ to any `tml-` value.
   reach the port can train or sample. Keep it inside the cluster.
 - The gateway stops at the Slurm time limit. Clients resume only through their checkpoints,
   against a gateway started with the same `--name`.
-- The server uses the tinker SDK 0.27.1 for its codec. Platoon's own pinned SDK is compatible.
+- The server speaks the tinker SDK 0.26.2 wire format (upstream's pin). Clients need a compatible
+  SDK: Platoon still pins 0.16.1, which this gateway no longer supports, so `client/` and
+  `train.sbatch` work again once Platoon moves to a newer SDK.
+- Each datum must carry exactly the `loss_fn_inputs` its loss reads. Any other key is rejected, and a
+  rejected `forward_backward`, `optim_step` or `load_state` closes the model (create a new one and
+  load a checkpoint).
