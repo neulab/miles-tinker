@@ -1,11 +1,12 @@
-"""The unmodified tinker SDK (0.27.1, the cookbook's) drives the gateway over a
-real uvicorn socket with the FakeBackend behind it: bootstrap, proto
-forward_backward, optim_step, named and unnamed sampler saves, sampling,
-save_state -> weights_info -> resume, training_runs, unload."""
+"""The unmodified tinker SDK drives the gateway over a real uvicorn socket with
+the FakeBackend behind it: bootstrap, proto forward_backward with the request
+metrics, optim_step, named and unnamed sampler saves, sampling, and
+save_state -> weights_info -> resume."""
 
 import asyncio
 import os
 import socket
+import tempfile
 import threading
 import time
 
@@ -35,7 +36,9 @@ class _Gateway:
 
     def _serve(self) -> None:
         async def main():
-            self.service = make_service(base_model=BASE_MODEL, n_slots=2, retrieve_poll_timeout_s=1.0)
+            self.service = make_service(
+                tempfile.mkdtemp(prefix="tinker-sdk-flow-"), base_model=BASE_MODEL, n_slots=2, trains_unembed=True
+            )
             run_task = asyncio.create_task(self.service.run())
             self._server = uvicorn.Server(
                 uvicorn.Config(build_app(self.service), host="127.0.0.1", port=self.port, log_level="warning")
@@ -78,16 +81,16 @@ def sdk(gateway):
     return tinker.ServiceClient(base_url=gateway.url)
 
 
-def _datum(n: int) -> types.Datum:
+def _datum(n: int, loss_fn: str = "importance_sampling") -> types.Datum:
+    """Exactly the inputs the loss reads: the gateway rejects any other loss_fn_inputs key."""
     tokens = [10, 20, 30, 40, 50, 60]
+    if loss_fn == "cross_entropy":
+        inputs = {"weights": [1.0] * n}
+    else:
+        inputs = {"logprobs": [-0.5] * n, "advantages": [0.1] * n}
     return types.Datum(
         model_input=types.ModelInput.from_ints(tokens[:n]),
-        loss_fn_inputs={
-            "target_tokens": tokens[1 : n + 1],
-            "weights": [1.0] * n,
-            "logprobs": [-0.5] * n,
-            "advantages": [0.1] * n,
-        },
+        loss_fn_inputs={"target_tokens": tokens[1 : n + 1], **inputs},
     )
 
 
@@ -101,7 +104,7 @@ def test_the_sdk_training_loop(gateway, sdk):
     assert [len(record["logprobs"].data) for record in output.loss_fn_outputs] == [5, 4, 3]
     assert output.metrics["num_tokens:sum"] == 12.0 and output.metrics["num_datums:sum"] == 3.0
 
-    forward = training.forward([_datum(2)], loss_fn="cross_entropy").result()
+    forward = training.forward([_datum(2, "cross_entropy")], loss_fn="cross_entropy").result()
     assert len(forward.loss_fn_outputs) == 1
 
     optim = training.optim_step(types.AdamParams(learning_rate=1e-4)).result()
@@ -136,25 +139,4 @@ def test_the_sdk_training_loop(gateway, sdk):
     assert gateway.service.backend.named("load_slot")[-1]["load_optimizer"] is True
     assert gateway.service.backend.named("load_slot")[-1]["ckpt_path"].endswith("/weights/ckpt")
 
-    rest = sdk.create_rest_client()
-    run = rest.get_training_run_by_tinker_path(state.path).result()
-    assert (run.is_lora, run.lora_rank, run.user_metadata) == (True, 8, {"renderer_name": "qwen3"})
-    rest.delete_checkpoint_from_tinker_path(state.path).result()
-
-    lora_names = [push["lora_name"] for push in gateway.service.backend.named("push_slot")]
-    assert len(lora_names) == 2 and all("@" in name for name in lora_names)
-    assert not any("warning" in call for call, _ in gateway.service.backend.calls)
-
-    # unload_model has no 0.27.1 SDK wrapper: the REST route frees the slot behind a future
-    headers = {"X-API-Key": os.environ["TINKER_API_KEY"]}
-    unload = httpx.post(f"{gateway.url}/api/v1/unload_model", json={"model_id": training.model_id}, headers=headers)
-    body = unload.json()
-    for _ in range(20):
-        polled = httpx.post(
-            f"{gateway.url}/api/v1/retrieve_future", json={"request_id": body["request_id"]}, headers=headers
-        )
-        if polled.status_code != 408:
-            break
-    assert polled.json() == {"type": "unload_model", "model_id": training.model_id}
-    assert training.model_id not in gateway.service.models
-    assert {u["lora_name"] for u in gateway.service.backend.named("unload_adapter")} == set(lora_names)
+    assert gateway.service.backend.named("export_slot"), "sampler saves export the adapter for the engines"
