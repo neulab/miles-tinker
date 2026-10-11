@@ -529,18 +529,31 @@ class TinkerService:
                 for session_id, session in self.sessions.items()
                 if now - session.last_heartbeat >= self.config.lease_timeout_s
             }
-            for session_id in expired_sessions:
-                del self.sessions[session_id]
-            for sampling_session_id, record in list(self.sampling_sessions.items()):
-                if record.session_id in expired_sessions:
-                    del self.sampling_sessions[sampling_session_id]
+            await self._release_sessions(expired_sessions, "lease expired")
 
-            for request_id, (task, session_id) in list(self._sample_tasks.items()):
-                if session_id in expired_sessions:
-                    logger.warning(f"lease expired for session of sample {request_id}; cancelling")
-                    self.futures.fail(request_id, "lease expired", "user")
-                    task.cancel()
-            for model_id, record in list(self.models.items()):
-                if record.session_id in expired_sessions:
-                    logger.warning(f"lease expired for {model_id}; freeing slot {record.slot}")
-                    await self._close_model(model_id, "lease expired", "user")
+    async def end_session(self, tenant: str, session_id: str) -> None:
+        """The client announced its exit (SESSION_END telemetry): release the
+        session now instead of after the lease timeout. Unknown sessions are ignored."""
+        session = self.sessions.get(session_id)
+        if session is None or session.tenant != tenant:
+            return
+        async with self._trainer_lock:
+            await self._release_sessions({session_id}, "session ended")
+
+    async def _release_sessions(self, session_ids: set[str], reason: str) -> None:
+        """Drop the sessions with their sampling sessions, samples, models, and slots; requires the trainer lock."""
+        for session_id in session_ids:
+            self.sessions.pop(session_id, None)
+        for sampling_session_id, record in list(self.sampling_sessions.items()):
+            if record.session_id in session_ids:
+                del self.sampling_sessions[sampling_session_id]
+
+        for request_id, (task, session_id) in list(self._sample_tasks.items()):
+            if session_id in session_ids:
+                logger.warning(f"{reason} for session of sample {request_id}; cancelling")
+                self.futures.fail(request_id, reason, "user")
+                task.cancel()
+        for model_id, record in list(self.models.items()):
+            if record.session_id in session_ids:
+                logger.warning(f"{reason} for {model_id}; freeing slot {record.slot}")
+                await self._close_model(model_id, reason, "user")

@@ -44,6 +44,16 @@ def _tenant(request: Request) -> str:
     return key
 
 
+def _ended_session(payload: object) -> str | None:
+    """The session a telemetry batch ends: the SDK flushes a SESSION_END event when the client shuts down."""
+    if not isinstance(payload, dict) or not payload.get("session_id"):
+        return None
+    for event in payload.get("events") or []:
+        if isinstance(event, dict) and event.get("event", event.get("event_type")) == "SESSION_END":
+            return payload["session_id"]
+    return None
+
+
 def build_app(service: TinkerService) -> FastAPI:
     app = FastAPI()
 
@@ -70,7 +80,12 @@ def build_app(service: TinkerService) -> FastAPI:
         return {}
 
     @app.post("/api/v1/telemetry")
-    async def telemetry():
+    async def telemetry(request: Request):
+        # telemetry is best effort: malformed or unauthenticated batches are still accepted
+        with suppress(ValueError, UserInputError):
+            session_id = _ended_session(await request.json())
+            if session_id is not None:
+                await service.end_session(_tenant(request), session_id)
         return {"status": "accepted"}
 
     @app.post("/api/v1/create_session")

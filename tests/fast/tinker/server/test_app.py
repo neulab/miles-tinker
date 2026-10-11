@@ -181,3 +181,23 @@ async def test_retrieve_long_polls_until_settlement(client):
     client.service.futures.resolve(future.request_id, {"op": "optim_step", "metrics": {"grad_norm": 1.0}})
     response = await asyncio.wait_for(poll, timeout=2)
     assert response.json() == {"type": "optim_step", "metrics": {"grad_norm": 1.0}}
+
+
+async def test_a_session_end_event_frees_the_slots_at_once(client):
+    body = await _model_body(client, lora_config={"rank": 8})
+    created = (await client.post("/api/v1/create_model", json=body, headers=_headers())).json()
+    await _poll(client, created["request_id"])
+    free_before = len(client.service.free_slots)
+
+    end = {"session_id": body["session_id"], "events": [{"event": "SESSION_END", "event_id": "e"}]}
+    # another tenant cannot end the session
+    assert (await client.post("/api/v1/telemetry", json=end, headers=_headers("tenant-b"))).status_code == 200
+    assert created["model_id"] in client.service.models
+
+    assert (await client.post("/api/v1/telemetry", json=end, headers=_headers())).json() == {"status": "accepted"}
+    assert created["model_id"] not in client.service.models
+    assert body["session_id"] not in client.service.sessions
+    assert len(client.service.free_slots) == free_before + 1
+    # malformed or unauthenticated telemetry is still accepted
+    assert (await client.post("/api/v1/telemetry", content=b"not json")).json() == {"status": "accepted"}
+    assert (await client.post("/api/v1/telemetry", json=end)).json() == {"status": "accepted"}
