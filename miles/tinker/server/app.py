@@ -166,6 +166,7 @@ def build_app(service: TinkerService) -> FastAPI:
                 await asyncio.wait_for(future.settled.wait(), timeout=RETRIEVE_LONG_POLL_S)
         if future.state == PENDING:
             return {"type": "try_again", "queue_state": "active"}
+        service.futures.delivered(future)
         if future.state == FAILED:
             return {"error": future.error, "category": future.error_category}
         encoder = PROTO_ENCODERS.get(future.result["op"])
