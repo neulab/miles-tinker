@@ -30,7 +30,7 @@ class TrialRequest(BaseModel):
     task_id: str
     base_url: str
     sampling: dict
-    max_seq_len: int | None = Field(default=None, gt=0)
+    max_seq_len: int | None = Field(default=32768, gt=0)
 
 
 def _trial(request):
@@ -43,14 +43,17 @@ def _trial(request):
     credentials = json.loads(Path(os.environ["SCIENCE_CREDENTIAL_FILE"]).read_text())
     os.environ.update(credentials)
     os.environ["SCIENCE_LOCAL_MODEL_KEY"] = "local-miles"
-    solver_runtime.ProxyLLM = partial(SciencePolicyLLM, episode_token_limit=request.get("max_seq_len"))
+    # Existing live v1 clients omit this field. Their recipe uses 32,768;
+    # an explicit None still opts out for clients without a sequence limit.
+    token_limit = request.get("max_seq_len", 32768)
+    solver_runtime.ProxyLLM = partial(SciencePolicyLLM, episode_token_limit=token_limit)
     # An exhausted action budget or detected policy loop ends the rollout. Grade its actual
     # artifacts with the hidden verifier rather than labeling it infrastructure.
     harbor_runtime._sdk_run = partial(
         harbor_runtime._sdk_run,
         allow_iteration_limit=True,
         allow_stuck=True,
-        allow_token_budget=request.get("max_seq_len") is not None,
+        allow_token_budget=token_limit is not None,
         system_prompt=(
             "You are a computational solver. Use container_execute for shell commands and execute your computation. "
             "You have at most 30 tool actions. Inspect small data samples instead of printing entire large files. "
@@ -88,12 +91,22 @@ def _trial(request):
         temperature=temperature,
         extra_body=sampling,
     )
+    policy_stop = None
+    events = output / "events.jsonl"
+    if events.exists():
+        for line in events.read_text().splitlines():
+            event = json.loads(line)
+            if event.get("kind") == "PolicyTermination":
+                policy_stop = event.get("reason", event["execution_status"])
+            elif event.get("kind") == "ConversationErrorEvent" and event.get("code") == "MaxIterationsReached":
+                policy_stop = "iteration_limit"
     return {
         "science_status": result["status"],
         "science_reward": int(result["passed"]) if result.get("passed") is not None else None,
         "science_trial_id": trial_id,
         "science_error": result.get("error"),
         "science_agent_deadline": result.get("agent_budget_exhausted", False),
+        "science_policy_stop_reason": policy_stop,
     }
 
 

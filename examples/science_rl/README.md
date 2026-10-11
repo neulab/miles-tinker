@@ -9,7 +9,7 @@ serialization while preserving tool identities and message content. Tools execut
 containers; hidden verifiers execute separately. An infrastructure failure
 aborts the sample and filters its entire group before optimization.
 Use the runtime patch in [paper2rlenv PR #14](https://github.com/neulab/paper2rlenv/pull/14)
-(commit `8991ef2`):
+(commit `25e0de1` or later, including typed token-budget handling):
 recoverable action-validation errors can recover normally, and the training
 adapter explicitly allows hidden-verifier grading after the action budget
 ends or the SDK detects a policy loop. The latter records a `PolicyTermination`
@@ -27,6 +27,18 @@ A missing timeout executable is an infrastructure failure.
 If a solver omits an artifact and the hidden verifier returns 0, training
 retains that policy failure. Files captured by the SDK must still transfer
 successfully; missing transfers remain infrastructure errors.
+
+The science adapter forwards the trajectory sequence limit to the host policy.
+Before returning a length-limited or over-context completion to the SDK, the
+host stops the episode with a typed token-budget event, preventing that response
+from executing a tool action or starting later model calls. Harbor then grades
+the existing artifacts. This addresses the later-action omission documented in
+[issue #5](https://github.com/neulab/miles-tinker/issues/5); it does not create a
+reward. The default limit is 32,768 for legacy science clients, matching this
+recipe; a forwarded value overrides it and explicit `None` disables enforcement.
+The server records `science_policy_stop_reason` to distinguish model-call length,
+episode context, SDK iterations, and detected loops. Use a compatible runtime
+from PR #14 before updating these host modules.
 
 The batch is **32 prompts × 8 independent responses = 256 trajectories**.
 Training uses four GPUs, tensor parallelism 4 and data parallelism 1, with
