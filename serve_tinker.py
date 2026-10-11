@@ -1,95 +1,104 @@
 import asyncio
 import logging
+from contextlib import suppress
 
 import uvicorn
 
-try:
-    import uvloop
-except ImportError:  # optional: the sglang image ships it, a bare miles install may not
-    uvloop = None
-
-from miles.ray.rollout.inference_controller import InferenceController
-from miles.ray.train.group import TrainerController
-from miles.ray.wiring import launch_worker_manager
+from miles.backends.megatron_utils.megatron_config import compute_trainer_args
+from miles.ray.placement_group import create_trainer_handles
+from miles.ray.rollout.router_manager import resolve_router_addrs
+from miles.ray.specs.inference import compute_router_providers, create_inference_controller_handle
+from miles.ray.specs.train import ACTOR_ROLE, compute_trainer_configs
+from miles.ray.wiring import get_backend_capability
+from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
 from miles.tinker.runtime import MilesBackend
 from miles.tinker.server.app import build_app
-from miles.utils import object_store
 from miles.utils.arguments import parse_args
-from miles.utils.audit_utils.process_identity import MainProcessIdentity
+from miles.utils.async_utils import Disposer, with_disposer
+from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.http_utils import init_http_client
-from miles.utils.logging_utils import configure_logger
+from miles.utils.orchestration_utils import init_orchestration_script
 
 logger = logging.getLogger(__name__)
 
 
-async def serve(args):
-    train_mode = args.tinker_train_mode
-    assert train_mode == "full" or args.multi_lora, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
-    configure_logger(args, source=MainProcessIdentity())
-
-    # no RolloutExecutor here; the gateway posts /generate itself
-    init_http_client(args)
-
-    _worker_manager = launch_worker_manager(args)
-    object_store.init_instance(args, contribute_segment=False)
-
-    inference_controller = InferenceController(args)
-    await inference_controller.init()
-
-    trainer = TrainerController(
-        args=args,
-        role="actor",
-        with_ref=False,
-        with_opd_teacher=False,
-        inference_controller=inference_controller,
-        rollout_executor=None,
-    )
-    await trainer.init()
-
+async def serve(args, *, disposer: Disposer):
+    assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
+    assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
-    # the backend keeps its perf log beside the checkpoints, whichever flag named the root
-    args.tinker_checkpoint_root = checkpoint_root
+    hf_config = load_hf_config(args.hf_checkpoint).get_text_config()
+    max_tokens_per_datum = hf_config.max_position_embeddings
+    if args.max_tokens_per_gpu is not None:
+        # The trainer pads each packed microbatch to this multiple.
+        pad_size = args.tensor_model_parallel_size * args.data_pad_size_multiplier
+        local_token_limit = args.max_tokens_per_gpu // pad_size * pad_size
+        if args.context_parallel_size > 1:
+            # each rank holds two equal zigzag chunks per datum
+            local_token_limit -= local_token_limit % 2
+        trainer_token_limit = local_token_limit * args.context_parallel_size
+        max_tokens_per_datum = min(max_tokens_per_datum, trainer_token_limit)
+    assert max_tokens_per_datum > 0, "trainer token budget must fit at least one padding block"
+    _worker_manager = init_orchestration_script(args, disposer=disposer)
+    init_http_client(args)
+
+    capability = get_backend_capability(args)
+    await resolve_router_addrs(args, router_providers=compute_router_providers(args, capability=capability))
+    inference_controller = create_inference_controller_handle(capability=capability)
+    await inference_controller.init()
+    disposer.add(inference_controller)
+
+    trainer_configs = compute_trainer_configs(args)
+    [actor_config] = [config for config in trainer_configs if config.role == ACTOR_ROLE]
+    trainer = create_trainer_handles(args, trainer_configs=trainer_configs)[actor_config.trainer_id]
+    await trainer.init(compute_trainer_args(args, actor_config))
+    disposer.add(trainer)
+
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
-        # full fine-tuning: one tenant, slot 0 is the base model
-        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
+        n_slots=args.multi_lora_n_adapters,
         checkpoint_root=checkpoint_root,
-        lora_alpha=args.lora_alpha if train_mode == "lora" else None,
-        lease_timeout_s=args.tinker_lease_timeout_s,
-        unit_token_budget=args.tinker_unit_token_budget,
-        train_mode=train_mode,
-        retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
-        sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
-        coalesce_wait_s=args.tinker_coalesce_wait_s,
-        max_concurrent_samples=args.tinker_max_concurrent_samples,
+        vocab_size=hf_config.vocab_size,
+        max_tokens_per_datum=max_tokens_per_datum,
+        lora_alpha=args.lora_alpha,
+        max_lora_rank=args.lora_rank,
+        trains_attn="attn" in args.tinker_lora_groups,
+        trains_mlp="mlp" in args.tinker_lora_groups,
+        trains_unembed="unembed" in args.tinker_lora_groups,
     )
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-    backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)
-    service = TinkerService(backend, config)
+    actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    dp_size = actor_world_size // (
+        args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    )
+    service = TinkerService(MilesBackend(trainer, router_url, dp_size=dp_size), config)
 
     server = uvicorn.Server(
         uvicorn.Config(
-            build_app(service),
-            host="0.0.0.0",
-            port=args.tinker_server_port,
-            log_level="info",
-            # one log line per request costs the loop 5-20% of its time at hundreds of requests per second
-            access_log=False,
-            # idle keep-alive sockets outlive a stall; at the 5 s default a slow GC pass drops them (SDK ReadError)
-            timeout_keep_alive=60,
+            build_app(service), host=args.tinker_server_host, port=args.tinker_server_port, log_level="info"
         )
     )
     logger.info(f"tinker gateway serving {config.base_model} on :{args.tinker_server_port}")
-    await asyncio.gather(service.run(), server.serve())
+    # supervise both: a crashed dispatcher must take the HTTP server down with it,
+    # not keep answering /healthz while every training future pends forever
+    service_task = asyncio.create_task(service.run())
+    server_task = asyncio.create_task(server.serve())
+    try:
+        done, _ = await asyncio.wait({service_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        for task in (service_task, server_task):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 if __name__ == "__main__":
-    args = parse_args(entry="serve")
+    args = parse_args(add_tinker_arguments, entry="serve", preprocess_args=configure_tinker_args)
     # commands ship one work unit at a time; its size is the batch size
     args.use_dynamic_global_batch_size = True
     args.delay_split_train_data_by_dp = True
-    # one loop serves HTTP and drives the trainer; uvloop (with uvicorn's httptools) cuts its per-request cost by a quarter
-    (uvloop.run if uvloop is not None else asyncio.run)(serve(args))
+    asyncio.run(with_disposer(serve, args))

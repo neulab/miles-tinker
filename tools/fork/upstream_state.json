@@ -8,10 +8,10 @@
     "merged_into_main": true
   },
   "last_sync": {
-    "base_ref": "upstream/yueming/multi-lora-example",
-    "base_commit": "06716481e85478242af3904fa2ecc93a651bf9fc",
-    "fork_commit": "cac7b727b253f791198534173026b10a7fcf9337",
-    "date": "2026-09-05",
-    "tests": "not run (initial state)"
+    "base_ref": "upstream/main",
+    "base_commit": "05bd9cb2afc9f6a1e94544e8fb4e9918771e763b",
+    "fork_commit": "f7b3bfd9f7ed5b4e52c92c47864ec9f321b51879",
+    "date": "2026-10-10",
+    "tests": "upstream tests: tinker 153 passed; fork-only tinker tests and the ABCI launcher test are ported in follow-up commits"
   }
 }

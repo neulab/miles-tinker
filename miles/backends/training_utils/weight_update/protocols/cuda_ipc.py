@@ -15,7 +15,7 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator import Weigh
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.session import check_weight_sync_results
 from miles.utils import async_utils
-from miles.utils.lora import lora_base_cpu_backup_enabled, lora_rollout_enabled
+from miles.utils.lora.utils import lora_base_cpu_backup_enabled, lora_rollout_enabled
 
 try:
     from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
@@ -186,7 +186,16 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
             if futures_distributed:
                 futures = (futures or []) + futures_distributed
         check_weight_sync_results(async_utils.wait_futures(futures or []), is_lora=False)
+        # Only the gather source receives the engine RPC future, but every rank
+        # owns storage referenced by the gathered CUDA IPC handles. Keep each
+        # producer bucket alive until its consumer has completed the import.
+        if self._ipc_gather_group is not None:
+            dist.barrier(group=self._ipc_gather_group)
         del long_lived_tensors
+
+    def after_engines_resumed(self) -> None:
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
 
 
 def _send_to_colocated_engine(

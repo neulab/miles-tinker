@@ -15,7 +15,9 @@ register_cuda_ci(
     est_time=1200,
     suite="stage-c-4-gpu-h200",
     labels=["sglang"],
+    hardware=["hopper", "blackwell"],
     disabled="MiniMax-M2.7 is deprecated.",
+    num_gpus=4,
 )
 register_ci_gate(metric_key="rollout/tito_session_mismatch_rate/v1/assistant_text")
 register_ci_gate(metric_key="rollout/tito_session_mismatch_rate/v2/assistant_text")

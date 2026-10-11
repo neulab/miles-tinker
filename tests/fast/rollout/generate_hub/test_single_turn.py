@@ -1,6 +1,6 @@
 from tests.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=220, suite="stage-b-cpu", labels=[])
+register_cpu_ci(est_time=220, suite="stage-b-cpu", labels=["rollout"])
 
 import numpy as np
 import pybase64
@@ -10,6 +10,9 @@ from PIL import Image
 from tests.fast.fixtures.generation_fixtures import GenerateEnv, generation_env, listify, make_sample, run_generate
 from transformers import AutoProcessor
 
+from miles.rollout.base_types import GenerateFnInput
+from miles.rollout.generate_hub import single_turn
+from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
 from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.test_utils.mock_sglang_server import ProcessResult, ProcessResultMetaInfo
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
@@ -148,6 +151,35 @@ class TestBasicGeneration:
         assert listify(result.sample) == [expected_sample(variant)]
 
 
+class TestEndpointRouting:
+    @pytest.mark.parametrize("variant", ["single_turn"])
+    async def test_an_explicit_url_routes_generation_to_that_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, variant: str, generation_env: GenerateEnv
+    ) -> None:
+        """An explicit endpoint overrides the router address configured in the arguments."""
+        requested_urls: list[str] = []
+
+        async def fake_post(
+            url: str, payload: dict[str, object], headers: dict[str, str] | None = None
+        ) -> dict[str, object]:
+            requested_urls.append(url)
+            return {"text": "", "meta_info": {"finish_reason": {"type": "stop"}}}
+
+        monkeypatch.setattr(single_turn, "post", fake_post)
+        state = GenerateState(generation_env.args)
+        generate_input = GenerateFnInput(
+            state=state,
+            sample=_make_sample(),
+            sampling_params=SAMPLING_PARAMS.copy(),
+            evaluation=False,
+        )
+        explicit_url = "http://policy-router:4321/generate"
+
+        await single_turn.generate(generate_input, url=explicit_url)
+
+        assert requested_urls == [explicit_url]
+
+
 class TestResumedSingleTurn:
     def test_two_consecutive_calls_on_same_sample(self, variant, generation_env):
         if variant == "multi_turn":
@@ -260,7 +292,11 @@ class TestMetaInfo:
         [
             {
                 "args_kwargs": {"sglang_speculative_algorithm": "EAGLE"},
-                "process_fn_kwargs": {"spec_accept_token_num": 10, "spec_draft_token_num": 15, "spec_verify_ct": 3},
+                "process_fn_kwargs": {
+                    "spec_num_correct_drafts": 10,
+                    "spec_num_proposed_drafts": 15,
+                    "spec_verify_ct": 3,
+                },
             }
         ],
         indirect=True,
@@ -272,7 +308,7 @@ class TestMetaInfo:
             expected_sample(
                 variant,
                 spec_info=Sample.SpecInfo(
-                    spec_accept_token_num=10, spec_draft_token_num=15, spec_verify_ct=3, completion_token_num=5
+                    spec_num_correct_drafts=10, spec_num_proposed_drafts=15, spec_verify_ct=3, completion_tokens=5
                 ),
             )
         ]
@@ -296,10 +332,10 @@ class TestInputStatusValidation:
 class TestPayloadStructure:
     def test_sampling_params_passed_through(self, variant, generation_env):
         result = _run_generate(
-            variant, generation_env, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 0.9}
+            variant, generation_env, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 1.0}
         )
         assert result.requests == [
-            expected_request(variant, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 0.9})
+            expected_request(variant, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 1.0})
         ]
         assert listify(result.sample) == [expected_sample(variant)]
 

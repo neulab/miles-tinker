@@ -1,108 +1,123 @@
-"""SDK wire <-> gateway internal language, JSON half (proto_codec.py is the
-binary half; both produce and consume the same internal shapes).
+"""Translate SDK JSON requests and results.
 
-Decode errors are protocol violations and answer HTTP 400; size admission
-happens later in core and fails the promise instead.
+Datums encode input x and explicit target labels t as x + [t[-1]],
+so each output scores logprob(t[i] | x[0..i])."""
 
-Sequence mapping: a datum's model_input tokens x[0..T-1] and target_tokens
-t[0..T-1] must satisfy t[i] == x[i+1] for i < T-1 (standard next-token
-supervision). The encoded row is x + [t[-1]] with T supervised positions, so
-the trainer scores exactly logprob(t[i] | x[0..i]).
-
-Two SDK dialects arrive here: 0.27.1 serialises every field, 0.16.1 omits
-unset defaults (chunk ``type``, adam fields) and sends explicit nulls.
-"""
-
-import logging
 import math
 
-from miles.tinker.core.types import UserInputError
+import pydantic
 
-logger = logging.getLogger(__name__)
+from miles.tinker.core.input_validation import validate_save_options
+from miles.tinker.core.types import LOSS_INPUT_KEYS, UserInputError
+from tinker import types as tinker_types
+from tinker.types.sample_response import MASK_LOGPROB
 
 # materialized at the boundary so core and the executor can require every key
-ADAM_PARAM_DEFAULTS = {
-    "learning_rate": 1e-4,
-    "beta1": 0.9,
-    "beta2": 0.95,
-    "eps": 1e-12,
-    "weight_decay": 0.0,
-    "grad_clip_norm": 0.0,
+ADAM_PARAM_DEFAULTS = tinker_types.AdamParams().model_dump()
+
+# JSON-wire request models; forward_backward travels as protobuf and its datums
+# are checked in build_datum instead
+REQUEST_TYPES = {
+    "optim_step": tinker_types.OptimStepRequest,
+    "save_state": tinker_types.SaveWeightsRequest,
+    "load_state": tinker_types.LoadWeightsRequest,
+    "save_weights_for_sampler": tinker_types.SaveWeightsForSamplerRequest,
 }
 
-# wire loss_fn_inputs key -> internal row key
-INPUT_ROW_KEYS = {"weights": "weights", "advantages": "advantages", "logprobs": "sampling_logprobs"}
+
+def validate_against_sdk(request_type, payload: dict) -> None:
+    """The pinned SDK's request models are the wire contract; reject what they reject."""
+    try:
+        request_type.model_validate(payload)
+    except pydantic.ValidationError as error:
+        first = error.errors()[0]
+        location = ".".join(str(part) for part in first["loc"])
+        raise UserInputError(f"{location or 'request'}: {first['msg']}") from None
 
 
-def decode_command(kind: str, payload: dict) -> tuple[str, dict]:
-    """One JSON command body -> (kind, internal payload)."""
-    decoded = {"model_id": payload["model_id"], "seq_id": payload["seq_id"]}
-    if kind == "forward_backward":
+def validate_create_model(payload: dict) -> None:
+    validate_against_sdk(tinker_types.CreateModelRequest, payload)
+
+
+def validate_create_sampling_session(payload: dict) -> None:
+    validate_against_sdk(tinker_types.CreateSamplingSessionRequest, payload)
+
+
+def decode_command(op: str, payload: dict) -> tuple[str, dict]:
+    """Decode content errors into ordered failures when the envelope is identifiable."""
+    try:
+        envelope = {"model_id": payload["model_id"], "seq_id": payload["seq_id"]}
+    except KeyError as error:
+        raise UserInputError(f"missing command envelope field {error.args[0]!r}") from None
+    try:
+        return _decode_command(op, payload, envelope)
+    except (UserInputError, KeyError, TypeError, ValueError, IndexError) as error:
+        if op == "forward_backward" and payload.get("forward_only"):
+            op = "forward_only"
+        return op, envelope | {"validation_error": str(error)}
+
+
+def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
+    if (request_type := REQUEST_TYPES.get(op)) is not None:
+        validate_against_sdk(request_type, payload)
+    if op == "forward_backward":
         fb_input = payload["forward_backward_input"]
         datums = [
             (model_input_tokens(datum["model_input"]), _decode_inputs(datum["loss_fn_inputs"]))
             for datum in fb_input["data"]
         ]
         decoded |= {
-            "rows": [build_row(tokens, inputs, i) for i, (tokens, inputs) in enumerate(datums)],
+            "datums": [build_datum(tokens, inputs, i) for i, (tokens, inputs) in enumerate(datums)],
             "loss_fn": fb_input["loss_fn"],
             "loss_fn_config": fb_input.get("loss_fn_config") or {},
         }
-        return ("forward_only" if payload.get("forward_only") else kind), decoded
-    if kind == "optim_step":
-        return kind, decoded | {"adam_params": materialize_adam_params(payload["adam_params"])}
-    if kind == "save_state":
-        return kind, decoded | {"name": payload.get("path")}
-    if kind == "load_state":
-        return kind, decoded | {"path": payload["path"], "optimizer": payload["optimizer"]}
-    if kind == "save_weights_for_sampler":
-        return kind, decoded | {
-            "name": payload.get("path"),
-            "sampling_session_seq_id": payload.get("sampling_session_seq_id"),
+        return ("forward_only" if payload.get("forward_only") else op), decoded
+    if op == "optim_step":
+        return op, decoded | {"adam_params": {**ADAM_PARAM_DEFAULTS, **payload["adam_params"]}}
+    if op == "save_state":
+        validate_save_options(payload)
+        return op, decoded | {"name": payload.get("path"), "overwrite": bool(payload.get("overwrite", False))}
+    if op == "load_state":
+        return op, decoded | {
+            "path": payload["path"],
+            "optimizer": payload["optimizer"],
+            "weights_access_token": payload.get("weights_access_token"),
         }
-    raise UserInputError(f"unknown command kind {kind!r}")
-
-
-def decode_forward_request(payload: dict) -> tuple[str, dict]:
-    """0.16.1's POST /forward: the same body under ``forward_input``."""
-    body = {**payload, "forward_backward_input": payload["forward_input"], "forward_only": True}
-    return decode_command("forward_backward", body)
-
-
-def materialize_adam_params(raw: dict) -> dict:
-    unknown = set(raw) - set(ADAM_PARAM_DEFAULTS)
-    if unknown:
-        logger.warning(f"ignoring unknown adam_params keys: {sorted(unknown)}")
-    known = {key: value for key, value in raw.items() if key in ADAM_PARAM_DEFAULTS and value is not None}
-    return {**ADAM_PARAM_DEFAULTS, **known}
+    if op == "save_weights_for_sampler":
+        validate_save_options(payload)
+        return op, decoded | {"sampler_path": payload.get("path")}
+    raise UserInputError(f"unknown command op {op!r}")
 
 
 def model_input_tokens(model_input: dict) -> list[int]:
     tokens: list[int] = []
     for chunk in model_input["chunks"]:
-        chunk_type = chunk.get("type", "encoded_text")  # 0.16.1 omits the default discriminator
-        if chunk_type != "encoded_text":
-            raise UserInputError(f"unsupported model_input chunk type: {chunk_type}")
+        if chunk.get("type") != "encoded_text":
+            raise UserInputError(f"unsupported model_input chunk type: {chunk.get('type')}")
         tokens.extend(chunk["tokens"])
     return tokens
 
 
-def build_row(input_tokens: list[int], inputs: dict[str, list], index: int) -> dict:
-    """One decoded datum (token list + loss_fn_inputs lists) -> internal row."""
-    targets = [int(t) for t in inputs["target_tokens"]]
+def build_datum(input_tokens: list[int], inputs: dict[str, list], index: int) -> dict:
+    """One decoded datum (token list + loss_fn_inputs lists) -> internal datum."""
+    unknown = set(inputs) - set(LOSS_INPUT_KEYS) - {"target_tokens"}
+    if unknown:
+        raise UserInputError(f"datum {index}: unknown loss_fn_inputs {sorted(unknown)}")
+    for name, values in inputs.items():
+        if any(isinstance(value, (list, tuple)) for value in values):
+            raise UserInputError(
+                f"datum {index}: loss_fn_inputs[{name!r}] must be 1-D; multi-target inputs are not supported"
+            )
+    targets = list(inputs["target_tokens"])
     if len(targets) != len(input_tokens):
         raise UserInputError(
             f"datum {index}: target_tokens length {len(targets)} != model_input length {len(input_tokens)}"
         )
-    if targets[:-1] != input_tokens[1:]:
-        raise UserInputError(
-            f"datum {index}: target_tokens must be model_input shifted by one (next-token supervision)"
-        )
-    row = {"tokens": input_tokens + targets[-1:], "target_len": len(targets)}
-    for wire_key, row_key in INPUT_ROW_KEYS.items():
+    datum = {"tokens": input_tokens + targets[-1:], "target_len": len(targets), "target_tokens": targets}
+    for wire_key, datum_key in LOSS_INPUT_KEYS.items():
         if wire_key in inputs:
-            row[row_key] = [float(value) for value in inputs[wire_key]]
-    return row
+            datum[datum_key] = [float(value) for value in inputs[wire_key]]
+    return datum
 
 
 def _decode_inputs(loss_fn_inputs: dict) -> dict[str, list]:
@@ -114,6 +129,8 @@ def tensor_data_to_list(tensor_data) -> list:
         return tensor_data
     if not isinstance(tensor_data, dict):
         raise UserInputError(f"expected TensorData, got {type(tensor_data).__name__}")
+    if len(tensor_data.get("shape") or []) > 1:
+        raise UserInputError("multi-target inputs are not supported; loss_fn_inputs must be 1-D")
     if tensor_data.get("sparse_crow_indices") is not None:
         return _dense_from_csr(tensor_data)
     data = tensor_data.get("data")
@@ -124,7 +141,8 @@ def tensor_data_to_list(tensor_data) -> list:
 
 def _dense_from_csr(tensor_data: dict) -> list:
     (length,) = tensor_data["shape"]
-    assert len(tensor_data["sparse_crow_indices"]) == 2, "1-D CSR expected"
+    if len(tensor_data["sparse_crow_indices"]) != 2:
+        raise UserInputError("1-D CSR expected")
     dense = [0] * length
     for col, value in zip(tensor_data["sparse_col_indices"], tensor_data["data"], strict=True):
         dense[col] = value
@@ -132,8 +150,10 @@ def _dense_from_csr(tensor_data: dict) -> list:
 
 
 def decode_sample_request(payload: dict) -> dict:
+    validate_against_sdk(tinker_types.SampleRequest, payload)
     return {
         "model_path": payload.get("model_path"),
+        "base_model": payload.get("base_model"),
         "sampling_session_id": payload.get("sampling_session_id"),
         "seq_id": payload.get("seq_id"),
         "num_samples": payload.get("num_samples", 1),
@@ -147,18 +167,9 @@ def decode_sample_request(payload: dict) -> dict:
 # -------- result rendering (JSON; proto_codec renders the binary forms) --------
 
 
-def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
-    """Request-level metrics in the SDK's ``name:reduction`` form."""
-    return {
-        "loss:sum": float(sum(output["loss"] for output in outputs)),
-        "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
-        "num_datums:sum": float(len(outputs)),
-    }
-
-
 def render_result(result: dict) -> dict:
-    kind = result["kind"]
-    if kind in ("forward_backward", "forward_only"):
+    op = result["op"]
+    if op in ("forward_backward", "forward_only"):
         outputs = result["outputs"]
         return {
             "type": "forward_backward",
@@ -167,49 +178,40 @@ def render_result(result: dict) -> dict:
                 {"loss:sum": _tensor_json([output["loss"]]), "logprobs": _tensor_json(output["logprobs"])}
                 for output in outputs
             ],
-            "metrics": forward_backward_metrics(outputs),
+            "metrics": {"loss:sum": float(sum(output["loss"] for output in outputs))},
         }
-    if kind == "sample":
-        return _render_sample(result)
-    if kind == "create_model":
+    if op == "sample":
+        rendered = {"type": "sample", "sequences": result["sequences"]}
+        if result.get("prompt_logprobs") is not None:
+            rendered["prompt_logprobs"] = [
+                None if math.isnan(logprob) else logprob for logprob in result["prompt_logprobs"]
+            ]
+        if result.get("topk_prompt_logprobs") is not None:
+            topk = result["topk_prompt_logprobs"]
+            rendered["topk_prompt_logprobs"] = [
+                [
+                    (token_id, logprob)
+                    for token_id, logprob in zip(ids, probs, strict=True)
+                    if (token_id, logprob) != (0, MASK_LOGPROB)
+                ]
+                or None
+                for ids, probs in zip(topk["token_ids"], topk["logprobs"], strict=True)
+            ]
+        return rendered
+    if op == "create_model":
         return {"type": "create_model", "model_id": result["model_id"]}
-    if kind == "unload_model":
-        return {"type": "unload_model", "model_id": result["model_id"]}
-    if kind == "save_state":
+    if op == "save_state":
         return {"type": "save_weights", "path": result["path"]}
-    if kind == "save_weights_for_sampler":
-        sampling_session_id = result.get("sampling_session_id")
-        # unnamed saves answer only the minted session: 0.16.1 asserts path is None there
-        path = None if sampling_session_id is not None else result["path"]
-        return {"type": "save_weights_for_sampler", "path": path, "sampling_session_id": sampling_session_id}
-    if kind == "load_state":
+    if op == "save_weights_for_sampler":
+        rendered = {"type": "save_weights_for_sampler", "path": result["path"]}
+        if "sampling_session_id" in result:
+            rendered["sampling_session_id"] = result["sampling_session_id"]
+        return rendered
+    if op == "load_state":
         return {"type": "load_weights"}
-    if kind == "optim_step":
+    if op == "optim_step":
         return {"type": "optim_step", "metrics": result["metrics"]}
-    raise AssertionError(f"unrenderable result kind {kind!r}")
-
-
-def _render_sample(result: dict) -> dict:
-    """JSON SampleResponse (0.16.1 shape): NaN becomes null, top-k rows are
-    lists of [token, logprob] pairs with null for unscored positions."""
-    rendered = {"type": "sample", "sequences": result["sequences"]}
-    if result.get("prompt_logprobs") is not None:
-        rendered["prompt_logprobs"] = [_nan_to_none(value) for value in result["prompt_logprobs"]]
-    if result.get("topk_prompt_logprobs") is not None:
-        topk = result["topk_prompt_logprobs"]
-        rendered["topk_prompt_logprobs"] = [
-            _topk_pairs(tokens, logprobs) for tokens, logprobs in zip(topk["token_ids"], topk["logprobs"], strict=True)
-        ]
-    return rendered
-
-
-def _topk_pairs(tokens: list[int], logprobs: list[float]) -> list | None:
-    pairs = [[token, logprob] for token, logprob in zip(tokens, logprobs, strict=True) if not math.isnan(logprob)]
-    return pairs or None
-
-
-def _nan_to_none(value: float) -> float | None:
-    return None if math.isnan(value) else value
+    raise AssertionError(f"unrenderable result op {op!r}")
 
 
 def _tensor_json(values: list[float]) -> dict:

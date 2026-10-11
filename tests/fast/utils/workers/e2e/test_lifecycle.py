@@ -6,6 +6,7 @@ import uuid
 
 import httpx
 import pytest
+from tests.ci.ci_register import register_cpu_ci
 from tests.fast.utils.workers.e2e.harness import (
     READY_TIMEOUT_SECONDS,
     ServerProcess,
@@ -16,6 +17,8 @@ from tests.fast.utils.workers.e2e.harness import (
 from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
 from miles.utils.workers.rpc.client.misc import RpcProtocolError, ServerRestartedError
 from miles.utils.workers.worker_handle import WorkerUnreachableError
+
+register_cpu_ci(est_time=160, suite="stage-b-cpu", labels=["rpc-comm"])
 
 
 async def _submit_and_disconnect(server: ServerProcess, method: str, query: dict) -> None:
@@ -75,13 +78,13 @@ class TestRestartDetection:
     async def test_unpinned_handle_mid_call_restart_reports_unknown_call(self, spawn, make_handle, tag):
         """A call whose server was replaced mid-flight fails loudly instead of hanging."""
         server = spawn()
-        handle = make_handle(server, call_timeout_seconds=30.0)
+        handle = make_handle(server, call_timeout_seconds=2 * READY_TIMEOUT_SECONDS)
 
         pending = asyncio.create_task(handle.demo_block_async(tag=tag))
         await asyncio.sleep(0.5)
 
         server.stop()
-        spawn(port=server.port)
+        await asyncio.to_thread(spawn, port=server.port)
 
         with pytest.raises(RpcProtocolError):
             await pending

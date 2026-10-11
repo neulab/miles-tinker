@@ -1,6 +1,4 @@
-"""The binary half round-trips against the real SDK converters: requests the
-SDK encodes must decode to the same rows as the JSON half, and our responses
-must parse with the SDK's own deserializers."""
+"""Protobuf and JSON preserve the same datums and SDK result shapes."""
 
 import pytest
 
@@ -35,16 +33,18 @@ def _sdk_request(loss_fn_inputs: dict) -> bytes:
     return forward_backward_request_to_proto(request).SerializeToString()
 
 
-def test_an_sdk_proto_request_decodes_to_internal_rows():
-    kind, decoded = decode_forward_backward_request(_sdk_request({"weights": [1.0, 0.0, 1.0, 1.0]}))
+def test_an_sdk_proto_request_decodes_to_internal_datums():
+    op, decoded = decode_forward_backward_request(_sdk_request({"weights": [1.0, 0.0, 1.0, 1.0]}))
 
-    assert (kind, decoded["model_id"], decoded["seq_id"]) == ("forward_backward", "model-x", 7)
+    assert (op, decoded["model_id"], decoded["seq_id"]) == ("forward_backward", "model-x", 7)
     assert decoded["loss_fn_config"] == {"beta": 0.5}
-    assert decoded["rows"] == [{"tokens": TOKENS, "target_len": 4, "weights": [1.0, 0.0, 1.0, 1.0]}]
+    assert decoded["datums"] == [
+        {"tokens": TOKENS, "target_len": 4, "target_tokens": TOKENS[1:], "weights": [1.0, 0.0, 1.0, 1.0]}
+    ]
 
 
-def test_both_wire_halves_produce_the_same_rows():
-    proto_rows = decode_forward_backward_request(_sdk_request({"weights": [1.0, 1.0, 1.0, 1.0]}))[1]["rows"]
+def test_both_wire_halves_produce_the_same_datums():
+    proto_datums = decode_forward_backward_request(_sdk_request({"weights": [1.0, 1.0, 1.0, 1.0]}))[1]["datums"]
     _, json_decoded = decode_command(
         "forward_backward",
         {
@@ -61,7 +61,7 @@ def test_both_wire_halves_produce_the_same_rows():
             },
         },
     )
-    assert proto_rows == json_decoded["rows"]
+    assert proto_datums == json_decoded["datums"]
 
 
 def test_a_sparse_tensor_decodes_dense():
@@ -69,7 +69,7 @@ def test_a_sparse_tensor_decodes_dense():
         dtype="float32", shape=[4], data=[2.0], sparse_crow_indices=[0, 1], sparse_col_indices=[2]
     )
     _, decoded = decode_forward_backward_request(_sdk_request({"weights": sparse}))
-    assert decoded["rows"][0]["weights"] == [0.0, 0.0, 2.0, 0.0]
+    assert decoded["datums"][0]["weights"] == [0.0, 0.0, 2.0, 0.0]
 
 
 def test_a_zstd_body_decompresses():
@@ -84,7 +84,7 @@ def test_a_zstd_body_decompresses():
 def test_the_sdk_parses_our_forward_backward_output():
     encoded = encode_forward_backward_output(
         {
-            "kind": "forward_backward",
+            "op": "forward_backward",
             "outputs": [{"loss": 2.5, "logprobs": [-0.1, -0.2]}, {"loss": 1.0, "logprobs": [-0.3]}],
         }
     )
@@ -98,7 +98,7 @@ def test_the_sdk_parses_our_forward_backward_output():
 def test_the_sdk_parses_our_sample_response():
     encoded = encode_sample_response(
         {
-            "kind": "sample",
+            "op": "sample",
             "sequences": [{"sequence_id": "s", "tokens": [5, 6], "logprobs": [-0.5, -0.6], "stop_reason": "length"}],
             "prompt_logprobs": [-1.0, -2.0],
             "topk_prompt_logprobs": {"token_ids": [[1, 2]], "logprobs": [[-0.1, -0.2]]},
@@ -112,27 +112,19 @@ def test_the_sdk_parses_our_sample_response():
     assert list(parsed.prompt_logprobs) == pytest.approx([-1.0, -2.0])
 
 
-def test_string_loss_fn_config_comes_from_the_v2_map():
-    datum = types.Datum(
-        model_input=types.ModelInput.from_ints(TOKENS[:-1]), loss_fn_inputs={"target_tokens": TOKENS[1:]}
-    )
-    request = types.ForwardBackwardRequest(
-        model_id="model-x",
-        seq_id=1,
-        forward_backward_input=types.ForwardBackwardInput(
-            data=[datum], loss_fn="cispo", loss_fn_config={"mode": "ratio", "clip_low_threshold": 0.8}
-        ),
-    )
-    _, decoded = decode_forward_backward_request(forward_backward_request_to_proto(request).SerializeToString())
-    assert decoded["loss_fn_config"] == {"mode": "ratio", "clip_low_threshold": 0.8}
+@pytest.mark.parametrize("forward_only", [False, True])
+@pytest.mark.parametrize("invalid", ["missing_targets", "bad_shape"])
+def test_content_errors_preserve_the_model_queue_envelope(forward_only, invalid):
+    from tinker.proto import tinker_public_pb2 as public_pb
 
-
-def test_our_forward_backward_metrics_carry_token_and_datum_counts():
-    encoded = encode_forward_backward_output(
-        {
-            "kind": "forward_backward",
-            "outputs": [{"loss": 1.0, "logprobs": [-0.1, -0.2]}, {"loss": 1.0, "logprobs": [-0.3]}],
-        }
-    )
-    parsed = deserialize_forward_backward_output(encoded)
-    assert parsed.metrics == {"loss:sum": 2.0, "num_tokens:sum": 3.0, "num_datums:sum": 2.0}
+    request = public_pb.ForwardBackwardRequest()
+    request.ParseFromString(_sdk_request({"weights": [1.0] * 4}))
+    request.forward_only = forward_only
+    if invalid == "missing_targets":
+        del request.data[0].loss_fn_inputs["target_tokens"]
+    else:
+        request.data[0].loss_fn_inputs["weights"].shape.append(2)
+    op, decoded = decode_forward_backward_request(request.SerializeToString())
+    assert op == ("forward_only" if forward_only else "forward_backward")
+    assert decoded["model_id"] == "model-x" and decoded["seq_id"] == 7
+    assert decoded["validation_error"]

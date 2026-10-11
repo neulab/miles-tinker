@@ -1,11 +1,11 @@
 """Shared fakes for the tinker gateway suite."""
 
 import asyncio
-import tempfile
 
-from miles.tinker.core.promise import PENDING, Promise
-from miles.tinker.core.service import ExecutorBackend, TinkerService
-from miles.tinker.core.types import Command, GatewayConfig
+from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
+from miles.tinker.core.future import DONE, PENDING, RequestFuture
+from miles.tinker.core.service import TinkerService
+from miles.tinker.core.types import Command, CommandOp, GatewayConfig
 
 ADAM = {
     "learning_rate": 1e-4,
@@ -17,124 +17,158 @@ ADAM = {
 }
 
 
-class FakeBackend(ExecutorBackend):
-    """Records every call; returns deterministic shapes. Set ``fail_next`` to
-    make the next backend call raise it. ``full`` mimics the FFT executor:
-    push_slot returns a growing engine weight version."""
+class FakeBackend:
+    """Record calls with deterministic outputs and configurable failures."""
 
-    def __init__(self, full: bool = False) -> None:
+    def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
-        self.fail_next: Exception | None = None
-        self.full = full
-        self.weight_version = 0
-        self.warmed_up = False
+        self.fail_next: Exception | dict | None = None
+        self.dead = False
+        self.optim_outcomes: dict[int, dict] = {}
+        self.fail_on: dict[str, Exception | dict] = {}
 
-    def _record(self, name: str, **kwargs) -> None:
+    def _record(self, name: str, **kwargs) -> dict | None:
         self.calls.append((name, kwargs))
-        if self.fail_next is not None:
-            error, self.fail_next = self.fail_next, None
-            raise error
+        failure, self.fail_next = self.fail_next, None
+        if failure is None:
+            failure = self.fail_on.pop(name, None)
+        if isinstance(failure, Exception):
+            self.dead = True
+            raise failure
+        return failure
 
     def named(self, name: str) -> list[dict]:
         return [kwargs for called, kwargs in self.calls if called == name]
 
+    async def trainer_dead(self):
+        return self.dead
+
     async def load_slot(self, slot, rank, alpha, ckpt_path=None, load_optimizer=True):
-        self._record(
+        return self._record(
             "load_slot", slot=slot, rank=rank, alpha=alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer
         )
 
     async def unload_slot(self, slot):
-        self._record("unload_slot", slot=slot)
+        return self._record("unload_slot", slot=slot)
 
-    async def forward_backward(self, unit_id, slot_rows, loss_fn, loss_fn_config):
-        self._record(
-            "forward_backward", unit_id=unit_id, slot_rows=slot_rows, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+    async def forward_backward(self, batch_id, slot_datums, loss_fn, loss_fn_config):
+        failure = self._record(
+            "forward_backward",
+            batch_id=batch_id,
+            slot_datums=slot_datums,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
         )
-        return [{"loss": 1.0, "logprobs": [0.0] * row["target_len"]} for _, row in slot_rows]
+        if failure is not None:
+            return failure
+        return [{"loss": 1.0, "logprobs": [0.0] * datum["target_len"]} for _, datum in slot_datums]
 
-    async def forward_only(self, unit_id, slot_rows, loss_fn, loss_fn_config):
-        self._record(
-            "forward_only", unit_id=unit_id, slot_rows=slot_rows, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+    async def forward_only(self, batch_id, slot_datums, loss_fn, loss_fn_config):
+        failure = self._record(
+            "forward_only", batch_id=batch_id, slot_datums=slot_datums, loss_fn=loss_fn, loss_fn_config=loss_fn_config
         )
-        return [{"loss": 0.0, "logprobs": [0.0] * row["target_len"]} for _, row in slot_rows]
+        if failure is not None:
+            return failure
+        return [{"loss": 0.0, "logprobs": [0.0] * datum["target_len"]} for _, datum in slot_datums]
 
     async def optim_step(self, adam_params_by_slot):
-        self._record("optim_step", adam_params_by_slot=adam_params_by_slot)
-        return {
-            slot: {"grad_norm": 0.5 + slot, "skipped": 0, "lr": params["learning_rate"], "num_units": 1}
-            for slot, params in adam_params_by_slot.items()
-        }
+        failure = self._record("optim_step", adam_params_by_slot=adam_params_by_slot)
+        if failure is not None:
+            return {slot: failure for slot in adam_params_by_slot}
+        return {slot: self.optim_outcomes.get(slot, {"grad_norm": 0.5 + slot}) for slot in adam_params_by_slot}
 
-    async def discard_grads(self, slot):
-        self._record("discard_grads", slot=slot)
+    async def save_slot(self, slot, path, metadata=None):
+        return self._write_checkpoint("save_slot", path, metadata, slot=slot)
 
-    async def save_slot(self, slot, path):
-        self._record("save_slot", slot=slot, path=path)
+    async def export_slot(self, slot, rank, alpha, path, metadata=None):
+        return self._write_checkpoint("export_slot", path, metadata, slot=slot, rank=rank, alpha=alpha)
 
-    async def push_slot(self, slot, lora_name, rank, alpha):
-        self._record("push_slot", slot=slot, lora_name=lora_name, rank=rank, alpha=alpha)
-        if not self.full:
-            return None
-        self.weight_version += 1
-        return self.weight_version
+    def _write_checkpoint(self, name, path, metadata, **kwargs):
+        failure = self._record(name, path=path, metadata=metadata, **kwargs)
+        if failure is None and metadata is not None:
+            write_checkpoint_dir(path, lambda _: None, metadata=metadata, overwrite=name == "save_slot")
+        return failure
 
-    async def unload_adapter(self, lora_name):
-        self._record("unload_adapter", lora_name=lora_name)
-
-    async def warmup(self):
-        self._record("warmup")
-        self.warmed_up = True
-
-    async def sample(self, payload, lora_name):
-        self._record("sample", payload=payload, lora_name=lora_name)
+    async def sample(self, payload, lora_name, lora_path=None):
+        failure = self._record("sample", payload=payload, lora_name=lora_name, lora_path=lora_path)
+        if failure is not None:
+            return failure
         return {
             "sequences": [
-                {"sequence_id": f"seq-{i}", "tokens": [1, 2], "logprobs": [0.0, 0.0], "stop_reason": "stop"}
-                for i in range(payload["num_samples"])
+                {"tokens": [1, 2], "logprobs": [0.0, 0.0], "stop_reason": "stop"}
+                for _ in range(payload["num_samples"])
             ]
         }
 
 
-def make_config(**overrides) -> GatewayConfig:
-    defaults = dict(base_model="base", n_slots=2, checkpoint_root=tempfile.mkdtemp(prefix="tinker-test-"))
+def make_config(checkpoint_root, **overrides) -> GatewayConfig:
+    defaults = dict(base_model="base", n_slots=2, checkpoint_root=str(checkpoint_root), vocab_size=128000)
     return GatewayConfig(**{**defaults, **overrides})
 
 
-def make_service(**config_overrides) -> TinkerService:
-    config = make_config(**config_overrides)
-    return TinkerService(FakeBackend(full=not config.is_lora), config)
+def make_service(checkpoint_root, **config_overrides) -> TinkerService:
+    return TinkerService(FakeBackend(), make_config(checkpoint_root, **config_overrides))
 
 
-def row(tokens: int = 3) -> dict:
-    return {"tokens": list(range(tokens + 1)), "target_len": tokens}
+def datum(tokens: int = 3) -> dict:
+    return {
+        "tokens": list(range(tokens + 1)),
+        "target_tokens": list(range(1, tokens + 1)),
+        "target_len": tokens,
+        "weights": [1.0] * tokens,
+    }
 
 
-def fb_payload(model_id: str, seq_id: int, rows: list[dict], loss_fn: str = "cross_entropy") -> dict:
-    return {"model_id": model_id, "seq_id": seq_id, "rows": rows, "loss_fn": loss_fn, "loss_fn_config": {}}
+def rl_datum(tokens: int = 3) -> dict:
+    """RL losses read logprobs+advantages and reject the cross-entropy weights."""
+    return {
+        "tokens": list(range(tokens + 1)),
+        "target_tokens": list(range(1, tokens + 1)),
+        "target_len": tokens,
+        "sampling_logprobs": [0.0] * tokens,
+        "advantages": [1.0] * tokens,
+    }
 
 
-def command(model_id: str, seq_id: int, kind: str, payload: dict, arrival: int) -> Command:
+def fb_payload(model_id: str, seq_id: int, datums: list[dict], loss_fn: str = "cross_entropy") -> dict:
+    return {"model_id": model_id, "seq_id": seq_id, "datums": datums, "loss_fn": loss_fn, "loss_fn_config": {}}
+
+
+def command(model_id: str, seq_id: int, op: str, payload: dict, arrival: int) -> Command:
     return Command(
-        model_id=model_id, seq_id=seq_id, kind=kind, payload=payload, request_id=f"req-{seq_id}", arrival=arrival
+        model_id=model_id,
+        seq_id=seq_id,
+        op=CommandOp(op),
+        payload=payload,
+        request_id=f"req-{seq_id}",
+        arrival=arrival,
     )
 
 
-def create_model_payload(service: TinkerService, **extra) -> dict:
-    return {"base_model": service.config.base_model, "lora_config": {"rank": 8}, **extra}
+def model_payload(service: TinkerService, tenant: str = "tenant", session_id: str | None = None, **overrides) -> dict:
+    return {
+        "base_model": service.config.base_model,
+        "session_id": session_id or service.create_session(tenant),
+        "model_seq_id": 1,
+        **overrides,
+    }
 
 
-async def created_model(service: TinkerService, tenant: str = "tenant", **extra) -> str:
-    _, model_id = service.create_model(tenant, create_model_payload(service, **extra))
-    await asyncio.sleep(0.01)  # let the slot-init task run against the fake backend
+async def created_model(service: TinkerService, tenant: str = "tenant", session_id: str | None = None) -> str:
+    request_id, model_id = service.create_model(
+        tenant, model_payload(service, tenant, session_id, lora_config={"rank": 8})
+    )
+    future = await await_settled(service, tenant, request_id)
+    assert future.state == DONE, future.error
     return model_id
 
 
-async def await_settled(service: TinkerService, tenant: str, request_id: str, timeout: float = 2.0) -> Promise:
+async def await_settled(service: TinkerService, tenant: str, request_id: str, timeout: float = 2.0) -> RequestFuture:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        promise = service.retrieve(tenant, request_id)
-        assert promise is not None, f"promise {request_id} expired"
-        if promise.state != PENDING:
-            return promise
+        future = service.retrieve_future(tenant, request_id)
+        assert future is not None, f"future {request_id} expired"
+        if future.state != PENDING:
+            return future
         await asyncio.sleep(0.005)
-    raise AssertionError(f"promise {request_id} still pending after {timeout}s")
+    raise AssertionError(f"future {request_id} still pending after {timeout}s")

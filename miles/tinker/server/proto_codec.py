@@ -1,16 +1,9 @@
-"""SDK wire <-> gateway internal language, binary half.
-
-Requests: /forward_backward arrives as a ForwardBackwardRequest protobuf
-(optionally zstd-compressed). Responses: forward_backward and sample results
-encode as ForwardBackwardOutput / SampleResponse protos when the client asks
-(Accept: application/x-protobuf), so logprobs travel as raw bytes instead of
-JSON floats. The schema ships with the tinker pip package.
-"""
+"""Translate Tinker SDK protobuf requests and results, including compressed requests."""
 
 import numpy as np
 
 from miles.tinker.core.types import UserInputError
-from miles.tinker.server.encoding import build_row, forward_backward_metrics
+from miles.tinker.server.encoding import build_datum
 from tinker.proto import tinker_public_pb2 as public_pb
 
 PROTO_CONTENT_TYPE = "application/x-protobuf"
@@ -35,11 +28,18 @@ def maybe_decompress(body: bytes, content_encoding: str | None) -> bytes:
 
 
 def decode_forward_backward_request(body: bytes) -> tuple[str, dict]:
-    """ForwardBackwardRequest proto -> (kind, internal payload)."""
+    """ForwardBackwardRequest proto -> (op, internal payload)."""
     message = public_pb.ForwardBackwardRequest()
     message.ParseFromString(body)
+    op = "forward_only" if message.forward_only else "forward_backward"
+    try:
+        return op, _decode_forward_backward(message)
+    except (UserInputError, KeyError, TypeError, ValueError, IndexError) as error:
+        return op, {"model_id": message.model_id, "seq_id": message.seq_id, "validation_error": str(error)}
 
-    rows = []
+
+def _decode_forward_backward(message) -> dict:
+    datums = []
     for index, datum in enumerate(message.data):
         tokens: list[int] = []
         for chunk in datum.model_input:
@@ -47,31 +47,34 @@ def decode_forward_backward_request(body: bytes) -> tuple[str, dict]:
                 raise UserInputError(f"unsupported model_input chunk type: {chunk.WhichOneof('chunk')}")
             tokens.extend(np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32).tolist())
         inputs = {name: _decode_tensor(name, tensor) for name, tensor in datum.loss_fn_inputs.items()}
-        rows.append(build_row(tokens, inputs, index))
+        datums.append(build_datum(tokens, inputs, index))
+
+    loss_fn_config = dict(message.loss_fn_config)
+    # Tinker SDK's v2 protobuf config supports both numeric and string values.
+    if message.loss_fn_config_v2:
+        loss_fn_config = {}
+        for name, value in message.loss_fn_config_v2.items():
+            kind = value.WhichOneof("value")
+            if kind is None:
+                raise UserInputError(f"loss_fn_config[{name!r}]: missing number or text value")
+            loss_fn_config[name] = getattr(value, kind)
 
     decoded = {
         "model_id": message.model_id,
         "seq_id": message.seq_id,
-        "rows": rows,
+        "datums": datums,
         "loss_fn": message.loss_fn,
-        "loss_fn_config": _decode_loss_fn_config(message),
+        "loss_fn_config": loss_fn_config,
     }
-    return ("forward_only" if message.forward_only else "forward_backward"), decoded
-
-
-def _decode_loss_fn_config(message) -> dict:
-    """The SDK dual-writes numbers into the legacy map and everything (numbers
-    and strings) into loss_fn_config_v2; v2 wins where both are present."""
-    config = dict(message.loss_fn_config)
-    for key, value in message.loss_fn_config_v2.items():
-        config[key] = value.text if value.WhichOneof("value") == "text" else value.number
-    return config
+    return decoded
 
 
 def _decode_tensor(name: str, tensor) -> list:
     np_dtype = _PROTO_DTYPE_TO_NUMPY.get(tensor.dtype)
     if np_dtype is None:
         raise UserInputError(f"loss_fn_inputs[{name!r}]: unsupported tensor dtype {tensor.dtype}")
+    if len(tensor.shape) > 1:
+        raise UserInputError(f"loss_fn_inputs[{name!r}]: shape {list(tensor.shape)} is not supported (1-D only)")
     encoding = tensor.WhichOneof("encoding")
     if encoding == "dense":
         return np.frombuffer(tensor.dense, dtype=np_dtype).tolist()
@@ -91,8 +94,7 @@ def encode_forward_backward_output(result: dict) -> bytes:
     message = public_pb.ForwardBackwardOutput()
     message.loss_fn_output_type = "ArrayRecord"
     outputs = result["outputs"]
-    for name, value in forward_backward_metrics(outputs).items():
-        message.metrics[name] = value
+    message.metrics["loss:sum"] = float(sum(output["loss"] for output in outputs))
 
     record = message.loss_fn_outputs.add()
     record.num_datums = len(outputs)

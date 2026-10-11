@@ -78,6 +78,8 @@ def run_session_server(config: SessionServerConfig):
     """Entry point to start the standalone session server as a subprocess."""
     # Spawned as a fresh interpreter, so it inherits no logging config.
     configure_logger_raw("session_server")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     # Visible to `pkill -9 miles`; without this the daemon inherits "python".
     setproctitle.setproctitle("miles-session-server")
 
@@ -88,7 +90,10 @@ def run_session_server(config: SessionServerConfig):
         config.port,
         config.backend_url,
     )
-    uvicorn.run(server.app, host=config.host, port=config.port, log_level="info")
+    # Keep server-side idle closure well after the HTTP client's default 5s expiry.
+    uvicorn.run(
+        server.app, host=config.host, port=config.port, log_level="info", access_log=False, timeout_keep_alive=60
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

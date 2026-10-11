@@ -1,87 +1,31 @@
-"""runtime.py is the miles translator: rows -> RolloutBatch keys, neutral
-sampling payloads -> sglang /generate requests, engine responses -> sequences."""
-
-import json
-from argparse import Namespace
-from types import SimpleNamespace
+"""Runtime translation preserves datum order, sampling parameters, and token logprobs."""
 
 import pytest
 import torch
 
 from miles.tinker.core.types import UserInputError
 from miles.tinker.runtime import (
-    PAD_ROW,
     MilesBackend,
     _build_train_data,
+    _pad_to_dp_multiple,
     _prompt_logprobs,
+    _slot_failure,
     _to_sequence,
     _topk_prompt_logprobs,
 )
+from miles.tinker.server.proto_codec import encode_sample_response
+from tinker.proto.response_conv import deserialize_sample_response
 
 
-def _row(tokens: list[int], **extra) -> dict:
-    return {"tokens": tokens, "target_len": len(tokens) - 1, **extra}
-
-
-def _args(**overrides) -> Namespace:
-    defaults = dict(
-        actor_num_nodes=1,
-        actor_num_gpus_per_node=4,
-        tensor_model_parallel_size=2,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
-        tinker_train_mode="lora",
-        tinker_checkpoint_root=None,
-    )
-    return Namespace(**{**defaults, **overrides})
-
-
-class FakeTrainer:
-    """Records TrainerController calls; answers per-worker lists like the controller does."""
-
-    def __init__(self, num_workers: int = 2) -> None:
-        self.calls: list[tuple[str, dict]] = []
-        self.num_workers = num_workers
-        self.optim_metrics: dict[int, dict] = {}
-        self.version = 7
-
-    def __getattr__(self, name):
-        async def call(**kwargs):
-            self.calls.append((name, kwargs))
-            if name == "optim_step":
-                return [dict(self.optim_metrics)] * self.num_workers
-            if name == "push_slot":
-                return self.version
-            if name == "update_weights":
-                self.version += 1
-                return self.version
-            return None
-
-        return call
-
-
-class FakeInferenceController:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def start_update_weights(self):
-        self.calls.append("start")
-        return SimpleNamespace(snapshot_cell_id_to_hashes={"cell": "hash"})
-
-    async def end_update_weights(self, snapshot_cell_id_to_hashes):
-        self.calls.append(f"end:{snapshot_cell_id_to_hashes}")
-
-
-def _backend(trainer=None, inference_controller=None, **arg_overrides) -> MilesBackend:
-    return MilesBackend(
-        _args(**arg_overrides), trainer=trainer, router_url="http://router", inference_controller=inference_controller
-    )
+def _datum(tokens: list[int], **extra) -> dict:
+    return {"tokens": tokens, "target_len": len(tokens) - 1, "target_tokens": tokens[1:], **extra}
 
 
 class TestBuildTrainData:
-    def test_rows_become_rollout_batch_keys(self):
-        train_data = _build_train_data([(3, _row([1, 2, 3])), (5, _row([4, 5]))])
+    def test_datums_become_rollout_batch_keys(self):
+        train_data = _build_train_data([(3, _datum([1, 2, 3])), (5, _datum([4, 5]))])
         assert train_data["tokens"] == [[1, 2, 3], [4, 5]]
+        assert train_data["target_tokens"] == [[2, 3], [5]]
         assert train_data["response_lengths"] == [2, 1]
         assert train_data["total_lengths"] == [3, 2]
         assert train_data["loss_masks"] == [[1, 1], [1]]
@@ -89,167 +33,31 @@ class TestBuildTrainData:
         assert train_data["sample_indices"] == [0, 1]
         assert train_data["dynamic_global_batch_size"] == 2
 
-    def test_optional_row_keys_map_to_batch_names(self):
-        train_data = _build_train_data([(0, _row([1, 2], weights=[1.0], advantages=[2.0], sampling_logprobs=[-0.5]))])
+    def test_optional_datum_keys_map_to_batch_names(self):
+        train_data = _build_train_data(
+            [(0, _datum([1, 2], weights=[1.0], advantages=[2.0], sampling_logprobs=[-0.5]))]
+        )
         assert train_data["loss_weights"] == [[1.0]]
         assert train_data["advantages"] == [[2.0]]
         assert train_data["rollout_log_probs"] == [[-0.5]]
 
-    def test_units_are_padded_to_a_multiple_of_dp_size_with_no_op_rows(self):
-        rows = [(3, _row([1, 2, 3], weights=[1.0, 1.0])), (5, _row([4, 5], weights=[1.0]))]
-        train_data = _build_train_data(rows, dp_size=4)
-        assert train_data["dynamic_global_batch_size"] == 4, "the trainer schedules len(rows) // dp_size per rank"
-        assert train_data["tokens"] == [[1, 2, 3], [4, 5], PAD_ROW["tokens"], PAD_ROW["tokens"]]
-        assert train_data["response_lengths"] == [2, 1, 1, 1]
-        assert train_data["loss_weights"] == [[1.0, 1.0], [1.0], [0.0], [0.0]]
-        assert train_data["loss_masks"] == [[1, 1], [1], [0], [0]], "pad rows are masked out under every loss"
-        assert train_data["adapter_slots"] == [3, 5, 3, 3], "pad rows ride on the first real row's slot"
-        assert train_data["sample_indices"] == [0, 1, 2, 3]
 
-    def test_a_full_multiple_is_not_padded(self):
-        train_data = _build_train_data([(0, _row([1, 2])), (0, _row([3, 4]))], dp_size=2)
-        assert train_data["dynamic_global_batch_size"] == 2
-
-    def test_full_fine_tuning_omits_adapter_slots(self):
-        train_data = _build_train_data([(0, _row([1, 2]))], dp_size=2, with_adapter_slots=False)
-        assert "adapter_slots" not in train_data
-        assert train_data["dynamic_global_batch_size"] == 2
-
-
-def test_dp_size_derives_from_the_actor_topology():
-    assert _backend().dp_size == 2
-    assert _backend(actor_num_gpus_per_node=8, tensor_model_parallel_size=1).dp_size == 8
-
-
-async def test_forward_backward_merges_worker_replicas_and_strips_padding():
-    backend = _backend(actor_num_gpus_per_node=8, tensor_model_parallel_size=2)  # dp 4
+async def test_forward_backward_merges_worker_replicas():
+    backend = MilesBackend(trainer=None, router_url="http://router")
     per_datum = [
         {"sample_index": 1, "loss": 2.0, "logprobs": torch.tensor([-0.2])},
         {"sample_index": 0, "loss": 1.0, "logprobs": torch.tensor([-0.1])},
-        {"sample_index": 2, "loss": 0.0, "logprobs": torch.tensor([0.0])},  # pad row
-        {"sample_index": 3, "loss": 0.0, "logprobs": torch.tensor([0.0])},  # pad row
     ]
-    seen = []
 
-    async def fake_run_unit(method, unit_id, train_data):
-        seen.append(train_data)
+    async def fake_call_trainer(method, batch_id, train_data):
         return [{"per_datum": per_datum}, {"per_datum": per_datum}]  # two ranks report the same datums
 
-    backend._run_unit = fake_run_unit
-    outputs = await backend.forward_backward(1, [(0, _row([1, 2])), (0, _row([3, 4]))], "cross_entropy", {})
+    backend._call_trainer = fake_call_trainer
+    outputs = await backend.forward_backward(1, [(0, _datum([1, 2])), (0, _datum([3, 4]))], "cross_entropy", {})
     assert outputs == [
         {"loss": 1.0, "logprobs": [pytest.approx(-0.1)]},
         {"loss": 2.0, "logprobs": [pytest.approx(-0.2)]},
     ]
-    assert seen[0]["dynamic_global_batch_size"] == 4 and seen[0]["loss_fn"] == "cross_entropy"
-    assert "adapter_slots" in seen[0]
-
-
-async def test_full_mode_units_carry_no_adapter_slots():
-    backend = _backend(tinker_train_mode="full", actor_num_gpus_per_node=2, tensor_model_parallel_size=1)
-    seen = []
-
-    async def fake_run_unit(method, unit_id, train_data):
-        seen.append(train_data)
-        return [{"per_datum": [{"sample_index": 0, "loss": 1.0, "logprobs": torch.tensor([-0.1])}]}]
-
-    backend._run_unit = fake_run_unit
-    await backend.forward_backward(1, [(0, _row([1, 2]))], "cross_entropy", {})
-    assert "adapter_slots" not in seen[0] and seen[0]["dynamic_global_batch_size"] == 2
-
-
-class TestOptimStep:
-    async def _train_one_unit(self, backend, slot_rows):
-        async def fake_run_unit(method, unit_id, train_data):
-            return [
-                {"per_datum": [{"sample_index": i, "loss": 0.0, "logprobs": torch.tensor([0.0])} for i in range(8)]}
-            ]
-
-        backend._run_unit = fake_run_unit
-        await backend.forward_backward(1, slot_rows, "cross_entropy", {})
-
-    async def test_returns_first_worker_metrics_with_exact_window_counts(self, tmp_path):
-        trainer = FakeTrainer()
-        trainer.optim_metrics = {
-            0: {"grad_norm": 0.5, "skipped": 0, "actor_train_mfu": 0.2, "num_tokens": 99, "num_datums": 9}
-        }
-        backend = _backend(trainer, tinker_checkpoint_root=str(tmp_path))
-        await self._train_one_unit(backend, [(0, _row([1, 2, 3])), (0, _row([4, 5]))])
-        await self._train_one_unit(backend, [(0, _row([6, 7]))])
-
-        metrics = await backend.optim_step({0: {"learning_rate": 1e-4}})
-
-        assert trainer.calls == [("optim_step", {"adam_params_by_slot": {0: {"learning_rate": 1e-4}}})]
-        assert metrics == {
-            0: {
-                "grad_norm": 0.5,
-                "skipped": 0,
-                "actor_train_mfu": 0.2,
-                "num_tokens": 7,
-                "num_datums": 3,
-                "num_units": 2,
-            }
-        }, "padded actor counts are replaced by the driver's exact per-slot counts"
-        record = json.loads((tmp_path / "perf.jsonl").read_text().splitlines()[0])
-        assert record["slot"] == 0 and record["actor_train_mfu"] == 0.2 and record["num_units"] == 2
-
-    async def test_window_counts_are_per_slot_and_reset(self):
-        trainer = FakeTrainer()
-        trainer.optim_metrics = {3: {"grad_norm": 1.0}, 5: {"grad_norm": 2.0}}
-        backend = _backend(trainer)
-        await self._train_one_unit(backend, [(3, _row([1, 2, 3])), (5, _row([4, 5]))])
-
-        metrics = await backend.optim_step({3: {}, 5: {}})
-        assert metrics[3] == {"grad_norm": 1.0, "num_tokens": 3, "num_datums": 1, "num_units": 1}
-        assert metrics[5] == {"grad_norm": 2.0, "num_tokens": 2, "num_datums": 1, "num_units": 1}
-
-        trainer.optim_metrics = {3: {"grad_norm": 0.0}}
-        assert (await backend.optim_step({3: {}}))[3] == {
-            "grad_norm": 0.0,
-            "num_tokens": 0,
-            "num_datums": 0,
-            "num_units": 0,
-        }
-
-    async def test_discard_grads_drops_the_window_and_reaches_the_trainer(self):
-        trainer = FakeTrainer()
-        trainer.optim_metrics = {0: {"grad_norm": 0.0}}
-        backend = _backend(trainer)
-        await self._train_one_unit(backend, [(0, _row([1, 2, 3]))])
-        await backend.discard_grads(0)
-        assert trainer.calls == [("discard_grads", {"slot": 0})]
-        assert (await backend.optim_step({0: {}}))[0]["num_datums"] == 0
-
-
-class TestControlCommands:
-    async def test_warmup_lora_runs_an_empty_update_weights_round(self):
-        controller = FakeInferenceController()
-        trainer = FakeTrainer()
-        await _backend(trainer, controller).warmup()
-        assert controller.calls == ["start", "end:{'cell': 'hash'}"]
-        assert trainer.calls == []
-
-    async def test_warmup_full_syncs_the_base_weights(self):
-        controller = FakeInferenceController()
-        trainer = FakeTrainer()
-        await _backend(trainer, controller, tinker_train_mode="full").warmup()
-        assert trainer.calls == [("update_weights", {})]
-        assert controller.calls == []
-
-    async def test_push_slot_returns_the_trainer_version(self):
-        trainer = FakeTrainer()
-        assert await _backend(trainer, tinker_train_mode="full").push_slot(0, "m@1", 0, 0.0) == 7
-        assert trainer.calls == [("push_slot", {"slot": 0, "lora_name": "m@1", "rank": 0, "alpha": 0.0})]
-
-    async def test_unload_adapter_and_load_slot_pass_through(self):
-        trainer = FakeTrainer()
-        backend = _backend(trainer)
-        await backend.unload_adapter("m@1")
-        await backend.load_slot(0, 8, 16.0, ckpt_path=None, load_optimizer=False)
-        assert trainer.calls == [
-            ("unload_adapter", {"lora_name": "m@1"}),
-            ("load_slot", {"slot": 0, "rank": 8, "alpha": 16.0, "ckpt_path": None, "load_optimizer": False}),
-        ]
 
 
 class TestGenerateRequest:
@@ -262,7 +70,7 @@ class TestGenerateRequest:
             "topk_prompt_logprobs": 0,
             **payload_extra,
         }
-        return _backend()._generate_request(payload, lora_name="m@1")
+        return MilesBackend(None, "http://router")._generate_request(payload, lora_name="m@1")
 
     def test_max_tokens_is_required(self):
         with pytest.raises(UserInputError, match="max_tokens"):
@@ -280,6 +88,13 @@ class TestGenerateRequest:
         by_text = self._request({"max_tokens": 1, "stop": ["\n"]})
         assert by_ids["sampling_params"]["stop_token_ids"] == [7, 8]
         assert by_text["sampling_params"]["stop"] == ["\n"]
+
+    def test_an_empty_stop_list_disables_eos(self):
+        request = self._request({"max_tokens": 1, "stop": []})
+        assert request["sampling_params"]["ignore_eos"] is True
+        assert "stop" not in request["sampling_params"] and "stop_token_ids" not in request["sampling_params"]
+        default = self._request({"max_tokens": 1})
+        assert "ignore_eos" not in default["sampling_params"], "stop=None keeps the default EOS behavior"
 
     def test_topk_requests_prompt_logprobs(self):
         request = self._request({"max_tokens": 1}, topk_prompt_logprobs=3)
@@ -313,4 +128,74 @@ class TestEngineResponseParsing:
         topk = _topk_prompt_logprobs(response, k=2)
         assert topk["token_ids"] == [[0, 0], [5, 0]]
         assert topk["logprobs"][1][0] == -0.1
-        assert topk["logprobs"][0][0] != topk["logprobs"][0][0]
+        result = {"sequences": [], "topk_prompt_logprobs": topk}
+        decoded = deserialize_sample_response(encode_sample_response(result)).topk_prompt_logprobs
+        assert decoded[0] is None
+        assert len(decoded[1]) == 1
+        token_id, logprob = decoded[1][0]
+        assert token_id == 5
+        assert logprob == pytest.approx(-0.1)
+
+
+async def test_forward_only_runs_the_requested_loss():
+    backend = MilesBackend(trainer=None, router_url="http://router")
+    captured = {}
+
+    async def fake_call_trainer(method, batch_id, train_data):
+        captured["method"] = method
+        captured["loss_fn"] = train_data["loss_fn"]
+        return [{"per_datum": [{"sample_index": 0, "loss": 3.0, "logprobs": torch.tensor([-0.3])}]}]
+
+    backend._call_trainer = fake_call_trainer
+    outputs = await backend.forward_only(1, [(0, _datum([1, 2]))], "importance_sampling", {})
+    assert captured == {"method": "forward_only", "loss_fn": "importance_sampling"}
+    assert outputs == [{"loss": 3.0, "logprobs": [pytest.approx(-0.3)]}]
+
+
+def test_a_pinned_seed_still_gets_one_model_queue_per_sample():
+    from miles.tinker.runtime import _with_sample_seed
+
+    request = {"sampling_params": {"sampling_seed": 7, "temperature": 0.0}}
+    assert [_with_sample_seed(request, i)["sampling_params"]["sampling_seed"] for i in range(3)] == [7, 8, 9]
+    assert request["sampling_params"]["sampling_seed"] == 7
+    assert "sampling_seed" not in _with_sample_seed({"sampling_params": {}}, 2)["sampling_params"]
+
+
+class TestPadToDpMultiple:
+    def test_padding_replicates_the_last_datum_with_a_padding_marker(self):
+        slot_datums = [(0, _datum([1, 2, 3], weights=[1.0, 1.0], advantages=[2.0, 2.0]))]
+        padded = _pad_to_dp_multiple(slot_datums, 4)
+        assert len(padded) == 4
+        for slot, filler in padded[1:]:
+            assert slot == 0 and filler["tokens"] == [1, 2, 3] and filler["padding"]
+        assert "padding" not in slot_datums[0][1], "the original datum must not be mutated"
+
+
+async def test_forward_backward_pads_the_batch_and_drops_padding_outputs():
+    backend = MilesBackend(trainer=None, router_url="http://router", dp_size=2)
+    seen = {}
+
+    async def fake_call_trainer(method, batch_id, train_data):
+        seen.update(train_data)
+        per_datum = [
+            {"sample_index": index, "loss": float(index), "logprobs": torch.tensor([-0.1])}
+            for index in range(len(train_data["tokens"]))
+        ]
+        return [{"per_datum": per_datum}]
+
+    backend._call_trainer = fake_call_trainer
+    outputs = await backend.forward_backward(1, [(0, _datum([1, 2], weights=[1.0]))], "cross_entropy", {})
+    assert seen["dynamic_global_batch_size"] == 2, "a singleton batch must be padded to the DP size"
+    assert seen["loss_masks"] == [[1], [0]], "the zero mask removes padding from every loss term"
+    assert len(outputs) == 1, "padding outputs are dropped"
+
+
+def test_an_actor_error_verdict_survives_runtime_translation():
+    failure = {"error": "bad shard"}
+    assert _slot_failure([None, failure]) is failure
+
+
+def test_an_aborted_sample_fails_instead_of_passing_as_a_stop():
+    """A truncated sequence fed to RL as a completed sample corrupts training data silently."""
+    response = {"meta_info": {"output_token_logprobs": [(-0.1, 11)], "finish_reason": {"type": "abort"}}}
+    assert "abort" in _to_sequence(response)["error"]

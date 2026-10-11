@@ -1,201 +1,59 @@
-"""TinkerService over a FakeBackend: the protocol properties end to end —
-idempotent resubmit, two-phase create, barrier ordering, lease reclamation,
-sampler publication, checkpoint sidecars, poisoned windows."""
+"""The service preserves request ordering, tenant isolation, and failure isolation."""
 
 import asyncio
-import os
+from contextlib import suppress
+from pathlib import Path
 
 import pytest
 from tests.fast.tinker.harness import (
     ADAM,
     await_settled,
-    create_model_payload,
     created_model,
+    datum,
     fb_payload,
     make_service,
-    row,
+    model_payload,
 )
 
-from miles.tinker.core.promise import DONE, FAILED
-from miles.tinker.core.service import SIDECAR_NAME, read_sidecar
-from miles.tinker.core.types import UserInputError
+from miles.tinker.core.future import DONE, FAILED
+from miles.tinker.core.types import OwnershipError, UserInputError
+from miles.tinker.core.utils import resolve_checkpoint_dir, resolve_sampler_checkpoint
 
 
 def _optim_payload(model_id: str, seq_id: int) -> dict:
     return {"model_id": model_id, "seq_id": seq_id, "adam_params": dict(ADAM)}
 
 
-def _sampler_payload(model_id: str, seq_id: int, name: str | None = None, unnamed: bool = False) -> dict:
-    payload = {"model_id": model_id, "seq_id": seq_id, "name": name, "sampling_session_seq_id": None}
-    if unnamed:
-        payload["sampling_session_seq_id"] = 0
-    return payload
-
-
-def _sample_payload(**overrides) -> dict:
-    return {
-        "num_samples": 1,
-        "prompt_tokens": [1, 2],
-        "sampling_params": {"max_tokens": 4},
-        "prompt_logprobs": False,
-        "topk_prompt_logprobs": 0,
-        **overrides,
-    }
-
-
-async def _published(service, model_id: str, seq_id: int, name: str | None = None) -> dict:
-    request_id = service.submit("tenant", "save_weights_for_sampler", _sampler_payload(model_id, seq_id, name))
-    return (await await_settled(service, "tenant", request_id)).result
-
-
-# -------- streams and barriers --------
-
-
-async def test_resubmitted_seq_id_reuses_the_promise_and_runs_once(service):
+async def test_resubmitted_seq_id_reuses_the_future_and_runs_once(service):
     model_id = await created_model(service)
-    payload = fb_payload(model_id, 1, [row()])
+    payload = fb_payload(model_id, 1, [datum()])
 
     first = service.submit("tenant", "forward_backward", payload)
     second = service.submit("tenant", "forward_backward", payload)
     assert first == second
 
-    promise = await await_settled(service, "tenant", first)
-    assert promise.state == DONE
+    future = await await_settled(service, "tenant", first)
+    assert future.state == DONE
     assert service.submit("tenant", "forward_backward", payload) == first, "a resubmit after completion also dedups"
     assert len(service.backend.named("forward_backward")) == 1, "the resubmit must not run the trainer again"
 
 
-async def test_out_of_order_chunks_complete_and_the_barrier_waits(service):
-    model_id = await created_model(service)
-
-    optim = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
-    late = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [row()]))
-    await asyncio.sleep(0.05)
-    assert not service.backend.named("optim_step"), "the barrier must wait for the whole window"
-
-    early = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row()]))
-    for request_id in (early, late, optim):
-        assert (await await_settled(service, "tenant", request_id)).state == DONE
-
-    kinds = [name for name, _ in service.backend.calls if name != "load_slot"]
-    assert kinds.index("optim_step") > max(i for i, k in enumerate(kinds) if k == "forward_backward")
-
-
-async def test_admission_failure_fails_the_promise_not_the_stream(service):
-    model_id = await created_model(service)
-
-    oversized = service.submit(
-        "tenant", "forward_backward", fb_payload(model_id, 1, [row(service.config.max_tokens_per_datum + 1)])
-    )
-    assert (await await_settled(service, "tenant", oversized)).state == FAILED
-
-    healthy = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [row()]))
-    assert (await await_settled(service, "tenant", healthy)).state == DONE, "the stream must keep flowing"
-
-
-async def test_forward_backward_outputs_align_to_datums(service):
-    model_id = await created_model(service)
-    request_id = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row(2), row(5)]))
-
-    promise = await await_settled(service, "tenant", request_id)
-    assert [len(output["logprobs"]) for output in promise.result["outputs"]] == [2, 5]
-
-
-async def test_optim_step_returns_the_backend_metrics(service):
-    model_id = await created_model(service)
-    slot = service.models[model_id].slot
-    service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row()]))
-    request_id = service.submit("tenant", "optim_step", _optim_payload(model_id, 2))
-
-    promise = await await_settled(service, "tenant", request_id)
-    assert promise.result["metrics"]["grad_norm"] == 0.5 + slot
-    assert promise.result["metrics"]["lr"] == ADAM["learning_rate"], "the backend dict travels verbatim"
-
-
-async def test_a_failed_unit_poisons_the_window_until_the_next_optim_step(service):
-    model_id = await created_model(service)
-    slot = service.models[model_id].slot
-    service.backend.fail_next = RuntimeError("cuda went away")
-    failed = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row()]))
-    assert (await await_settled(service, "tenant", failed)).error_category == "server"
-
-    optim = service.submit("tenant", "optim_step", _optim_payload(model_id, 2))
-    promise = await await_settled(service, "tenant", optim)
-    assert (promise.state, promise.error_category) == (FAILED, "user")
-    assert "gradients discarded" in promise.error
-    assert service.backend.named("discard_grads") == [{"slot": slot}]
-    assert not service.backend.named("optim_step"), "a poisoned window must not step"
-
-    clean = service.submit("tenant", "forward_backward", fb_payload(model_id, 3, [row()]))
-    await await_settled(service, "tenant", clean)
-    optim = service.submit("tenant", "optim_step", _optim_payload(model_id, 4))
-    assert (await await_settled(service, "tenant", optim)).state == DONE, "the flag clears with the failed step"
-
-
-async def test_a_backend_returning_the_wrong_output_count_fails_the_riders_not_the_loop(service):
-    model_id = await created_model(service)
-
-    async def short_forward_backward(unit_id, slot_rows, loss_fn, loss_fn_config):
-        return [{"loss": 1.0, "logprobs": [0.0]}]  # one output for two rows
-
-    service.backend.forward_backward = short_forward_backward
-    broken = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row(), row()]))
-    promise = await await_settled(service, "tenant", broken)
-    assert (promise.state, promise.error_category) == (FAILED, "server") and "2 rows" in promise.error
-
-    service.backend.forward_backward = type(service.backend).forward_backward.__get__(service.backend)
-    healthy = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [row()]))
-    assert (await await_settled(service, "tenant", healthy)).state == DONE, "the dispatch loop must survive"
-
-
-async def test_a_dirty_stream_does_not_block_a_merged_clean_one(service):
-    service.config.coalesce_wait_s = 0.0  # keep the two windows in separate units
-    dirty = await created_model(service)
-    clean = await created_model(service)
-    service.backend.fail_next = RuntimeError("boom")
-    service.submit("tenant", "forward_backward", fb_payload(dirty, 1, [row()]))
-    await asyncio.sleep(0.05)
-    service.submit("tenant", "forward_backward", fb_payload(clean, 1, [row()]))
-    await asyncio.sleep(0.05)
-    dirty_optim = service.submit("tenant", "optim_step", _optim_payload(dirty, 2))
-    clean_optim = service.submit("tenant", "optim_step", _optim_payload(clean, 2))
-
-    assert (await await_settled(service, "tenant", dirty_optim)).state == FAILED
-    assert (await await_settled(service, "tenant", clean_optim)).state == DONE
-    assert list(service.backend.named("optim_step")[0]["adam_params_by_slot"]) == [service.models[clean].slot]
-
-
-# -------- models --------
-
-
 async def test_create_model_is_two_phase(service):
-    request_id, model_id = service.create_model("tenant", create_model_payload(service))
+    request_id, model_id = service.create_model("tenant", model_payload(service, lora_config={"rank": 8}))
 
-    promise = await await_settled(service, "tenant", request_id)
-    assert promise.result == {"kind": "create_model", "model_id": model_id}
+    future = await await_settled(service, "tenant", request_id)
+    assert future.result == {"op": "create_model", "model_id": model_id}
     assert service.backend.named("load_slot")[0]["rank"] == 8
-    record = service.models[model_id]
-    assert (record.is_lora, record.lora_rank, record.lora_alpha) == (True, 8, 16.0)
-
-
-async def test_create_model_is_idempotent_per_session_seq(service):
-    session_id = service.create_session("tenant", {"sdk_version": "0.27.1"})
-    first = service.create_model("tenant", create_model_payload(service, session_id=session_id, model_seq_id=0))
-    retry = service.create_model("tenant", create_model_payload(service, session_id=session_id, model_seq_id=0))
-    other = service.create_model("tenant", create_model_payload(service, session_id=session_id, model_seq_id=1))
-
-    assert first == retry, "an SDK retry must not allocate a second slot"
-    assert other[1] != first[1]
-    assert service.models[first[1]].sdk_version == "0.27.1"
+    assert model_id in service.models
 
 
 async def test_failed_slot_init_returns_the_slot(service):
     free_before = set(service.free_slots)
-    service.backend.fail_next = RuntimeError("init blew up")
-    request_id, model_id = service.create_model("tenant", create_model_payload(service))
+    service.backend.fail_next = {"error": "init blew up"}
+    request_id, model_id = service.create_model("tenant", model_payload(service))
 
-    promise = await await_settled(service, "tenant", request_id)
-    assert (promise.state, promise.error_category) == (FAILED, "server")
+    future = await await_settled(service, "tenant", request_id)
+    assert (future.state, future.error_category) == (FAILED, "server")
     assert model_id not in service.models
     assert service.free_slots == free_before
 
@@ -204,65 +62,67 @@ async def test_no_free_slots_is_a_user_error(service):
     for _ in range(service.config.n_slots):
         await created_model(service)
     with pytest.raises(UserInputError, match="no free adapter slots"):
-        service.create_model("tenant", create_model_payload(service))
+        service.create_model("tenant", model_payload(service))
 
 
 async def test_the_wrong_base_model_is_rejected(service):
     with pytest.raises(UserInputError, match="serves"):
-        service.create_model("tenant", {"base_model": "other", "lora_config": {"rank": 8}})
+        service.create_model("tenant", model_payload(service, base_model="other"))
 
 
-@pytest.mark.parametrize("lora_config", [None, {"rank": 0}, {}])
-async def test_a_lora_gateway_needs_a_positive_rank(service, lora_config):
-    with pytest.raises(UserInputError, match="rank must be > 0"):
-        service.create_model("tenant", {"base_model": "base", "lora_config": lora_config})
+async def test_out_of_order_chunks_complete_and_the_barrier_waits(service):
+    model_id = await created_model(service)
+
+    optim = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
+    late = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
+    await asyncio.sleep(0.05)
+    assert not service.backend.named("optim_step"), "the barrier must wait for every batch op ahead"
+
+    early = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    for request_id in (early, late, optim):
+        assert (await await_settled(service, "tenant", request_id)).state == DONE
+
+    calls = [name for name, _ in service.backend.calls if name != "load_slot"]
+    assert calls.index("optim_step") > max(i for i, name in enumerate(calls) if name == "forward_backward")
 
 
-async def test_unload_model_frees_the_slot_and_the_adapters(service):
+async def test_admission_failure_terminates_the_training_model_queue(service):
+    model_id = await created_model(service)
+
+    oversized = service.submit(
+        "tenant", "forward_backward", fb_payload(model_id, 1, [datum(service.config.max_tokens_per_datum + 1)])
+    )
+    assert (await await_settled(service, "tenant", oversized)).state == FAILED
+
+    with pytest.raises(UserInputError, match="create a new model"):
+        service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
+
+
+async def test_forward_backward_outputs_align_to_datums(service):
+    model_id = await created_model(service)
+    request_id = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum(2), datum(5)]))
+
+    future = await await_settled(service, "tenant", request_id)
+    assert [len(output["logprobs"]) for output in future.result["outputs"]] == [2, 5]
+
+
+async def test_optim_step_returns_the_slot_grad_norm(service):
     model_id = await created_model(service)
     slot = service.models[model_id].slot
-    await _published(service, model_id, 1)
-    stale = service.submit("tenant", "forward_backward", fb_payload(model_id, 3, [row()]))  # gapped
+    service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    request_id = service.submit("tenant", "optim_step", _optim_payload(model_id, 2))
 
-    request_id = service.unload_model("tenant", model_id)
-    promise = await await_settled(service, "tenant", request_id)
-    assert promise.result == {"kind": "unload_model", "model_id": model_id}
-    assert model_id not in service.models and slot in service.free_slots
-    assert service.backend.named("unload_adapter") == [{"lora_name": f"{model_id}@1"}]
-    assert service.backend.named("unload_slot") == [{"slot": slot}]
-    assert service.retrieve("tenant", stale).state == FAILED
-
-
-async def test_training_run_reports_the_record(service):
-    model_id = await created_model(service, user_metadata={"renderer_name": "qwen3"})
-    run = service.training_run("tenant", model_id)
-    assert (run["training_run_id"], run["model_owner"], run["is_lora"], run["lora_rank"]) == (
-        model_id,
-        "tenant",
-        True,
-        8,
-    )
-    assert run["user_metadata"] == {"renderer_name": "qwen3"}
-    with pytest.raises(UserInputError):
-        service.training_run("tenant", "model-nope")
-
-
-# -------- checkpoints --------
+    future = await await_settled(service, "tenant", request_id)
+    assert future.result["metrics"] == {"grad_norm": 0.5 + slot}
 
 
 async def test_save_then_load_roundtrip_paths(service):
     model_id = await created_model(service)
-    save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
+    save = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt", "overwrite": False}
+    )
     saved_path = (await await_settled(service, "tenant", save)).result["path"]
     assert saved_path == f"tinker://{model_id}/weights/ckpt"
-    sidecar = read_sidecar(f"{service.config.checkpoint_root}/{model_id}/weights/ckpt")
-    assert (sidecar["tenant"], sidecar["lora_rank"], sidecar["kind"], sidecar["train_mode"], sidecar["slot"]) == (
-        "tenant",
-        8,
-        "weights",
-        "lora",
-        service.models[model_id].slot,
-    )
 
     load = service.submit(
         "tenant", "load_state", {"model_id": model_id, "seq_id": 2, "path": saved_path, "optimizer": False}
@@ -270,328 +130,725 @@ async def test_save_then_load_roundtrip_paths(service):
     assert (await await_settled(service, "tenant", load)).state == DONE
     weights_only = service.backend.named("load_slot")[-1]
     assert weights_only["load_optimizer"] is False
-    assert weights_only["ckpt_path"].endswith(f"{model_id}/weights/ckpt")
+    checkpoint = Path(service.config.checkpoint_root) / model_id / "weights" / "ckpt"
+    assert weights_only["ckpt_path"] == str(checkpoint.resolve())
 
 
-async def test_resume_from_the_sidecar_survives_a_gateway_restart(service):
-    model_id = await created_model(service, tenant="owner")
-    save = service.submit("owner", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
-    saved_path = (await await_settled(service, "owner", save)).result["path"]
-
-    restarted = make_service(checkpoint_root=service.config.checkpoint_root)
-    run_task = asyncio.create_task(restarted.run())
-    try:
-        info = restarted.weights_info("owner", saved_path)
-        assert (info["base_model"], info["is_lora"], info["lora_rank"]) == ("base", True, 8)
-        with pytest.raises(Exception, match="does not belong"):
-            restarted.weights_info("thief", saved_path)
-
-        # the SDK recreates the model with weights_info.lora_rank, then loads at seq 1
-        _, new_model = restarted.create_model("owner", {"base_model": "base", "lora_config": {"rank": 8}})
-        await asyncio.sleep(0.01)
-        load = restarted.submit(
-            "owner", "load_state", {"model_id": new_model, "seq_id": 1, "path": saved_path, "optimizer": True}
-        )
-        assert (await await_settled(restarted, "owner", load)).state == DONE
-        assert restarted.backend.named("load_slot")[-1]["ckpt_path"].endswith(f"{model_id}/weights/ckpt")
-    finally:
-        run_task.cancel()
-
-
-async def test_load_state_takes_rank_and_alpha_from_the_sidecar(service):
-    model_id = await created_model(service)
-    save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
-    saved_path = (await await_settled(service, "tenant", save)).result["path"]
-    other = await created_model(service, lora_config={"rank": 4})
-
-    load = service.submit(
-        "tenant", "load_state", {"model_id": other, "seq_id": 1, "path": saved_path, "optimizer": True}
-    )
-    assert (await await_settled(service, "tenant", load)).state == DONE
-    assert (service.backend.named("load_slot")[-1]["rank"], service.models[other].lora_rank) == (8, 8)
-
-
-@pytest.mark.parametrize(
-    "error, category",
-    [
-        (RuntimeError("load_slot(slot=1) failed on 8/8 rank(s)"), "server"),
-        (UserInputError("not this gateway's"), "user"),
-    ],
-)
-async def test_a_failed_load_state_fails_its_promise_and_keeps_the_model_usable(service, error, category):
-    model_id = await created_model(service)
-    slot = service.models[model_id].slot
-    save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
-    saved_path = (await await_settled(service, "tenant", save)).result["path"]
-
-    service.backend.fail_next = error
-    load = service.submit(
-        "tenant", "load_state", {"model_id": model_id, "seq_id": 2, "path": saved_path, "optimizer": True}
-    )
-    promise = await await_settled(service, "tenant", load)
-    assert (promise.state, promise.error_category) == (FAILED, category)
-
-    # the slot stays allocated (the backend re-initialized it) and the stream keeps flowing
-    assert model_id in service.models and slot not in service.free_slots
-    fb = service.submit("tenant", "forward_backward", fb_payload(model_id, 3, [row()]))
-    step = service.submit("tenant", "optim_step", _optim_payload(model_id, 4))
-    assert (await await_settled(service, "tenant", fb)).state == DONE
-    assert (await await_settled(service, "tenant", step)).state == DONE
-
-
-async def test_a_foreign_checkpoint_is_rejected_as_a_user_error(service):
-    victim = await created_model(service, tenant="tenant-a")
-    thief = await created_model(service, tenant="tenant-b")
-    save = service.submit("tenant-a", "save_state", {"model_id": victim, "seq_id": 1, "name": "ckpt"})
-    await await_settled(service, "tenant-a", save)
-
-    request_id = service.submit(
-        "tenant-b",
-        "load_state",
-        {"model_id": thief, "seq_id": 1, "path": f"tinker://{victim}/weights/ckpt", "optimizer": True},
-    )
-    promise = await await_settled(service, "tenant-b", request_id)
-    assert (promise.state, promise.error_category) == (FAILED, "user")
-
-
-async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
-    model_id = await created_model(service)
-    save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
-    await await_settled(service, "tenant", save)
-    path = f"{service.config.checkpoint_root}/{model_id}/weights/ckpt"
-    assert os.path.exists(f"{path}/{SIDECAR_NAME}")
-
-    service.delete_checkpoint("tenant", model_id, "weights/ckpt")
-    assert not os.path.exists(path)
-    service.delete_checkpoint("tenant", model_id, "weights/ckpt")  # already gone: fine
-    with pytest.raises(UserInputError):
-        service.delete_checkpoint("tenant", model_id, "bogus")
-
-
-async def test_checkpoint_names_cannot_escape_the_checkpoint_root(service):
-    model_id = await created_model(service)
-    escaping = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "../escape"})
-    promise = await await_settled(service, "tenant", escaping)
-    assert (promise.state, promise.error_category) == (FAILED, "user")
-    assert not service.backend.named("save_slot")
-
-    for checkpoint_id in ("weights/..", "weights/a/b"):
-        with pytest.raises(UserInputError, match="invalid checkpoint path"):
-            service.delete_checkpoint("tenant", model_id, checkpoint_id)
-    with pytest.raises(UserInputError, match="invalid checkpoint path"):
-        service.delete_checkpoint("tenant", "..", "weights/ckpt")
-    with pytest.raises(UserInputError, match="invalid checkpoint path"):
-        service.weights_info("tenant", "tinker://../weights/..")
-
-
-# -------- samplers --------
-
-
-async def test_sampler_save_bumps_the_version_and_pushes(service):
+async def test_sampler_save_publishes_successive_versions(service):
     model_id = await created_model(service)
     for seq_id in (1, 2):
-        result = await _published(service, model_id, seq_id)
-        assert result["path"] == f"tinker://{model_id}/sampler_weights/{seq_id}"
-    assert [push["lora_name"] for push in service.backend.named("push_slot")] == [f"{model_id}@1", f"{model_id}@2"]
-    assert service.models[model_id].loaded_versions == {1, 2}
+        request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": seq_id})
+        future = await await_settled(service, "tenant", request_id)
+        assert future.result["path"] == f"tinker://{model_id}/sampler_weights/{seq_id}"
+    assert [export["path"] for export in service.backend.named("export_slot")] == [
+        resolve_checkpoint_dir(service.config.checkpoint_root, model_id, "sampler_weights", str(version))
+        for version in (1, 2)
+    ]
 
 
-async def test_a_named_sampler_save_keeps_the_client_name(service):
+async def test_sampling_resolves_against_the_saved_version(service):
     model_id = await created_model(service)
-    result = await _published(service, model_id, 1, name="000010")
-    assert result["path"] == f"tinker://{model_id}/sampler_weights/000010"
-    assert result["sampling_session_id"] is None
-    assert service.backend.named("save_slot")[-1]["path"].endswith("sampler_weights/000010")
-    assert service.backend.named("push_slot")[-1]["lora_name"] == f"{model_id}@1", "the adapter name stays versioned"
-    assert read_sidecar(f"{service.config.checkpoint_root}/{model_id}/sampler_weights/000010")["sampler_version"] == 1
+    save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    sampler_path = (await await_settled(service, "tenant", save)).result["path"]
 
-
-async def test_an_unnamed_sampler_save_mints_a_sampling_session(service):
-    session_id = service.create_session("tenant", {})
-    model_id = await created_model(service, session_id=session_id)
-    request_id = service.submit("tenant", "save_weights_for_sampler", _sampler_payload(model_id, 1, unnamed=True))
-    result = (await await_settled(service, "tenant", request_id)).result
-
-    sampling_session = service.sampling_sessions[result["sampling_session_id"]]
-    assert sampling_session["model_path"] == result["path"] == f"tinker://{model_id}/sampler_weights/1"
-    assert sampling_session["session_id"] == session_id
-
-    sample, _ = service.submit_sample("tenant", _sample_payload(sampling_session_id=result["sampling_session_id"]))
-    await await_settled(service, "tenant", sample)
-    assert service.backend.named("sample")[0]["lora_name"] == f"{model_id}@1"
-
-
-async def test_sampling_resolves_against_the_pushed_version(service):
-    model_id = await created_model(service)
-    sampler_path = (await _published(service, model_id, 1))["path"]
-
-    request_id, sequence_ids = service.submit_sample("tenant", _sample_payload(model_path=sampler_path, num_samples=2))
+    request_id, sequence_ids = service.submit_sample(
+        "tenant",
+        {
+            "model_path": sampler_path,
+            "num_samples": 2,
+            "prompt_tokens": [1, 2],
+            "sampling_params": {"max_tokens": 4},
+            "prompt_logprobs": False,
+            "topk_prompt_logprobs": 0,
+        },
+    )
     assert len(sequence_ids) == 2
-    promise = await await_settled(service, "tenant", request_id)
-    assert len(promise.result["sequences"]) == 2
+    future = await await_settled(service, "tenant", request_id)
+    assert len(future.result["sequences"]) == 2
     assert service.backend.named("sample")[0]["lora_name"] == f"{model_id}@1"
 
 
-async def test_sample_resubmits_are_idempotent_per_sampling_seq(service):
+async def test_sampler_requests_carry_the_published_checkpoint_path(service):
     model_id = await created_model(service)
-    sampler_path = (await _published(service, model_id, 1))["path"]
-    sid = service.create_sampling_session("tenant", {"model_path": sampler_path})
+    request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    path = (await await_settled(service, "tenant", request_id)).result["path"]
 
-    first = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid, seq_id=0))
-    retry = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid, seq_id=0))
-    fresh = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid, seq_id=1))
-    await await_settled(service, "tenant", fresh[0])
-    assert first == retry and fresh != first
-    assert len(service.backend.named("sample")) == 2
-    await await_settled(service, "tenant", first[0])
-    assert not service._sample_by_seq, "finished samples leave the dedup table (it must not grow per sample)"
+    disk_dir = resolve_checkpoint_dir(service.config.checkpoint_root, model_id, "sampler_weights", "1")
+    assert service.backend.named("export_slot")[0]["path"] == disk_dir
+
+    sample_id, _ = service.submit_sample(
+        "tenant",
+        {
+            "model_path": path,
+            "num_samples": 1,
+            "prompt_tokens": [1],
+            "sampling_params": {"max_tokens": 2},
+            "prompt_logprobs": False,
+            "topk_prompt_logprobs": 0,
+        },
+    )
+    await await_settled(service, "tenant", sample_id)
+    assert service.backend.named("sample")[0]["lora_path"] == disk_dir
 
 
-async def test_unknown_samplers_are_user_errors(service):
+async def test_sample_failure_preserves_the_snapshot_and_training_model_queue(service):
     model_id = await created_model(service)
-    with pytest.raises(UserInputError, match="unknown sampling session"):
-        service.submit_sample("tenant", _sample_payload(sampling_session_id="sampling-nope"))
-    with pytest.raises(UserInputError, match="unknown sampler version"):
-        service.create_sampling_session("tenant", {"model_path": f"tinker://{model_id}/sampler_weights/7"})
-    with pytest.raises(UserInputError, match="unknown model"):
-        service.create_sampling_session("tenant", {"model_path": "tinker://model-nope/sampler_weights/1"})
-    with pytest.raises(UserInputError, match="serves"):
-        service.create_sampling_session("tenant", {"base_model": "other"})
+    request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    future = await await_settled(service, "tenant", request_id)
+    assert future.result["path"] == f"tinker://{model_id}/sampler_weights/1"
+
+    service.backend.fail_on["sample"] = {"error": "engine down"}
+    sample_id, _ = service.submit_sample(
+        "tenant",
+        {
+            "model_path": future.result["path"],
+            "num_samples": 1,
+            "prompt_tokens": [1],
+            "sampling_params": {"max_tokens": 2},
+            "prompt_logprobs": False,
+            "topk_prompt_logprobs": 0,
+        },
+    )
+    future = await await_settled(service, "tenant", sample_id)
+    assert future.state == FAILED
+    assert future.error == "engine down"
+    assert (
+        resolve_sampler_checkpoint(
+            service.config.checkpoint_root,
+            "tenant",
+            f"tinker://{model_id}/sampler_weights/1",
+            service.config.base_model,
+        )[0]
+        == f"{model_id}@1"
+    )
+    fb = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
+    assert (await await_settled(service, "tenant", fb)).state == DONE
 
 
-async def test_get_sampler_reports_base_model_and_path(service):
-    sid = service.create_sampling_session("tenant", {"base_model": "base"})
-    assert service.get_sampler("tenant", sid) == {"sampler_id": sid, "base_model": "base", "model_path": None}
-
-
-async def test_old_sampler_versions_are_retired(service):
-    service.config.sampler_versions_to_keep = 2
-    model_id = await created_model(service)
-    for seq_id in (1, 2, 3):
-        await _published(service, model_id, seq_id)
-
-    assert service.backend.named("unload_adapter") == [{"lora_name": f"{model_id}@1"}]
-    assert service.models[model_id].loaded_versions == {2, 3}
-    assert not os.path.exists(f"{service.config.checkpoint_root}/{model_id}/sampler_weights/1")
-    assert os.path.exists(f"{service.config.checkpoint_root}/{model_id}/sampler_weights/2/{SIDECAR_NAME}")
-    with pytest.raises(UserInputError, match="retired"):
-        service.submit_sample("tenant", _sample_payload(model_path=f"tinker://{model_id}/sampler_weights/1"))
-
-
-async def test_a_version_with_a_running_sample_is_not_retired(service):
-    service.config.sampler_versions_to_keep = 1
-    model_id = await created_model(service)
-    sampler_path = (await _published(service, model_id, 1))["path"]
-    gate = asyncio.Event()
-
-    async def slow_sample(payload, lora_name):
-        await gate.wait()
-        return {"sequences": []}
-
-    service.backend.sample = slow_sample
-    request_id, _ = service.submit_sample("tenant", _sample_payload(model_path=sampler_path))
-    await asyncio.sleep(0.01)
-    await _published(service, model_id, 2)
-    assert not service.backend.named("unload_adapter"), "an adapter with a sample in flight stays loaded"
-
-    gate.set()
-    await await_settled(service, "tenant", request_id)
-    await _published(service, model_id, 3)
-    assert {u["lora_name"] for u in service.backend.named("unload_adapter")} == {f"{model_id}@1", f"{model_id}@2"}
-
-
-async def test_a_failed_unload_keeps_the_version_resident(service):
-    service.config.sampler_versions_to_keep = 1
-    model_id = await created_model(service)
-    await _published(service, model_id, 1)
-
-    async def refusing_unload(lora_name):
-        raise RuntimeError("engine busy")
-
-    service.backend.unload_adapter = refusing_unload
-    await _published(service, model_id, 2)
-    assert service.models[model_id].loaded_versions == {1, 2}
-
-
-# -------- leases --------
-
-
-async def test_lease_expiry_reclaims_the_session(service):
-    session_id = service.create_session("tenant", {})
+async def test_lease_expiry_reclaims_the_tenant(service):
+    session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     slot = service.models[model_id].slot
     queued = service.submit("tenant", "optim_step", _optim_payload(model_id, 1))
     await await_settled(service, "tenant", queued)
-    sampler_path = (await _published(service, model_id, 2))["path"]
-    sid = service.create_sampling_session("tenant", {"session_id": session_id, "model_path": sampler_path})
-    stale = service.submit("tenant", "forward_backward", fb_payload(model_id, 4, [row()]))  # gapped: stays queued
+    stale = service.submit("tenant", "forward_backward", fb_payload(model_id, 3, [datum()]))  # gapped: stays queued
 
-    service.sessions[session_id]["last_heartbeat"] -= service.config.lease_timeout_s + 1
-    await service._sweep_once()
+    service.sessions[session_id].last_heartbeat -= service.config.lease_timeout_s + 1
+    await service._expire_sessions()
 
     assert model_id not in service.models
     assert slot in service.free_slots
-    assert service.backend.named("unload_adapter") == [{"lora_name": f"{model_id}@1"}]
     assert service.backend.named("unload_slot") == [{"slot": slot}]
-    assert service.retrieve("tenant", stale).state == FAILED
-    assert sid not in service.sampling_sessions and session_id not in service.sessions
-
-
-async def test_leases_are_per_session_not_per_tenant(service):
-    stale_session = service.create_session("tenant", {})
-    live_session = service.create_session("tenant", {})
-    stale_model = await created_model(service, session_id=stale_session)
-    live_model = await created_model(service, session_id=live_session)
-
-    service.sessions[stale_session]["last_heartbeat"] -= service.config.lease_timeout_s + 1
-    await service._sweep_once()
-
-    assert stale_model not in service.models, "a dead run's slot is reclaimed while its tenant is still active"
-    assert live_model in service.models
-
-
-async def test_a_stale_sampling_session_cancels_its_samples(service):
-    session_id = service.create_session("tenant", {})
-    sid = service.create_sampling_session("tenant", {"session_id": session_id, "base_model": "base"})
-    gate = asyncio.Event()
-
-    async def slow_sample(payload, lora_name):
-        await gate.wait()
-        return {"sequences": []}
-
-    service.backend.sample = slow_sample
-    request_id, _ = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid))
-    service.sessions[session_id]["last_heartbeat"] -= service.config.lease_timeout_s + 1
-    await service._sweep_once()
-
-    promise = await await_settled(service, "tenant", request_id)
-    assert (promise.state, promise.error) == (FAILED, "cancelled")
-    assert sid not in service.sampling_sessions
+    assert service.retrieve_future("tenant", stale).state == FAILED
 
 
 async def test_a_fresh_heartbeat_keeps_the_model(service):
-    session_id = service.create_session("tenant", {})
+    session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
 
-    service.heartbeat(session_id)
-    await service._sweep_once()
+    service.heartbeat("tenant", session_id)
+    await service._expire_sessions()
 
     assert model_id in service.models
 
 
-async def test_run_warms_the_backend_up_once(service):
-    await asyncio.sleep(0.01)
-    assert service.backend.named("warmup") == [{}]
-    assert service.backend.warmed_up
+@pytest.mark.parametrize("name", ["../evil", "a/b", "..", ".hidden"], ids=["parent", "slash", "dotdot", "hidden"])
+async def test_traversal_checkpoint_names_are_rejected(service, name):
+    model_id = await created_model(service)
+    request_id = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": name, "overwrite": False}
+    )
+    future = await await_settled(service, "tenant", request_id)
+    assert (future.state, future.error_category) == (FAILED, "user")
+    assert "invalid checkpoint path segment" in future.error
+    assert not service.backend.named("save_slot"), "nothing may touch the disk for a rejected name"
 
 
-async def test_a_failed_warmup_still_serves():
-    svc = make_service()
-    svc.backend.fail_next = RuntimeError("no engines yet")
-    run_task = asyncio.create_task(svc.run())
+async def test_traversal_sampler_paths_are_rejected(service):
+    model_id = await created_model(service)
+    with pytest.raises(UserInputError):
+        service.submit_sample(
+            "tenant",
+            {
+                "model_path": f"tinker://{model_id}/weights/../../etc",
+                "num_samples": 1,
+                "prompt_tokens": [1],
+                "sampling_params": {"max_tokens": 2},
+                "prompt_logprobs": False,
+                "topk_prompt_logprobs": 0,
+            },
+        )
+
+
+async def test_expired_result_on_resubmit_fails_instead_of_410(service, monkeypatch):
+    from miles.tinker.core import future as future_module
+
+    model_id = await created_model(service)
+    first = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    await await_settled(service, "tenant", first)
+    monkeypatch.setattr(future_module, "_FINISHED_TTL_S", -1.0)
+    assert service.retrieve_future("tenant", first) is None, "the result must have aged out"
+
+    resubmitted = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    assert resubmitted != first
+    monkeypatch.setattr(future_module, "_FINISHED_TTL_S", 3600.0)  # only the first result aged out
+    future = service.retrieve_future("tenant", resubmitted)
+    assert (future.state, future.error_category) == (FAILED, "user")
+    assert "expired" in future.error
+    assert len(service.backend.named("forward_backward")) == 1, "an executed command must never re-run"
+
+
+async def test_save_state_refuses_to_overwrite_unless_asked(service):
+    model_id = await created_model(service)
+    payload = {"model_id": model_id, "name": "ckpt", "overwrite": False}
+    first = service.submit("tenant", "save_state", payload | {"seq_id": 1})
+    assert (await await_settled(service, "tenant", first)).state == DONE
+
+    clobber = service.submit("tenant", "save_state", payload | {"seq_id": 2})
+    future = await await_settled(service, "tenant", clobber)
+    assert (future.state, future.error_category) == (FAILED, "user")
+    assert "overwrite" in future.error
+
+    replace = service.submit("tenant", "save_state", payload | {"seq_id": 3, "overwrite": True})
+    assert (await await_settled(service, "tenant", replace)).state == DONE
+
+
+async def test_checkpoints_outlive_the_lease(service):
+    session_id = service.create_session("tenant")
+    model_id = await created_model(service, session_id=session_id)
+    save = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "kept", "overwrite": False}
+    )
+    path = (await await_settled(service, "tenant", save)).result["path"]
+
+    service.sessions[session_id].last_heartbeat = -1e9
+    await service._expire_sessions()
+    assert model_id not in service.models, "the lease sweep must reclaim the model"
+
+    service.create_session("tenant")
+    fresh_id = await created_model(service)
+    load = service.submit("tenant", "load_state", {"model_id": fresh_id, "seq_id": 1, "path": path, "optimizer": True})
+    assert (await await_settled(service, "tenant", load)).state == DONE
+
+
+async def test_a_foreign_tenants_checkpoint_does_not_load(service):
+    model_id = await created_model(service)
+    save = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "mine", "overwrite": False}
+    )
+    path = (await await_settled(service, "tenant", save)).result["path"]
+
+    thief_model = await created_model(service, tenant="thief")
+    load = service.submit(
+        "thief", "load_state", {"model_id": thief_model, "seq_id": 1, "path": path, "optimizer": True}
+    )
+    future = await await_settled(service, "thief", load)
+    assert (future.state, future.error_category) == (FAILED, "user")
+    assert "belong" in future.error
+
+
+async def test_a_failed_batch_terminates_the_model_queue(service):
+    model_id = await created_model(service)
+    first = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum(), datum()]))
+    second = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
+    service.backend.fail_next = {"error": "batch input rejected"}
+    assert (await await_settled(service, "tenant", first)).state == FAILED
+    assert (
+        await await_settled(service, "tenant", second)
+    ).state == FAILED, "the failed accumulation terminates model training"
+    assert model_id not in service.models
+    assert service.backend.named("unload_slot")
+
+
+async def test_merged_optim_settles_each_slot_on_its_own(service):
+    model_a = await created_model(service)
+    model_b = await created_model(service)
+    slot_b = service.models[model_b].slot
+    service.backend.optim_outcomes[slot_b] = {"error": "boom"}
+
+    ok = service.submit("tenant", "optim_step", _optim_payload(model_a, 1))
+    bad = service.submit("tenant", "optim_step", _optim_payload(model_b, 1))
+    resolved = await await_settled(service, "tenant", ok)
+    failed = await await_settled(service, "tenant", bad)
+    assert resolved.state == DONE and "grad_norm" in resolved.result["metrics"]
+    assert (failed.state, failed.error_category) == (FAILED, "server") and "boom" in failed.error
+
+
+async def test_a_nonfinite_step_reports_the_skip(service):
+    model_id = await created_model(service)
+    slot = service.models[model_id].slot
+    service.backend.optim_outcomes[slot] = {"skipped_nonfinite": 1.0}
+    request_id = service.submit("tenant", "optim_step", _optim_payload(model_id, 1))
+    future = await await_settled(service, "tenant", request_id)
+    assert future.state == DONE
+    assert future.result["metrics"] == {"skipped_nonfinite": 1.0}
+
+
+async def test_num_samples_is_capped(service):
+    model_id = await created_model(service)
+    version = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    path = (await await_settled(service, "tenant", version)).result["path"]
+    with pytest.raises(UserInputError):
+        service.submit_sample(
+            "tenant",
+            {
+                "model_path": path,
+                "num_samples": service.config.max_samples_per_request + 1,
+                "prompt_tokens": [1],
+                "sampling_params": {"max_tokens": 2},
+                "prompt_logprobs": False,
+                "topk_prompt_logprobs": 0,
+            },
+        )
+
+
+async def test_malformed_loss_inputs_are_rejected_at_admission(service):
+    cases = {
+        "unknown loss_fn": {"loss_fn": "made_up", "datums": [datum()]},
+        "missing input": {"loss_fn": "importance_sampling", "datums": [datum()]},
+        "wrong length": {
+            "loss_fn": "importance_sampling",
+            "datums": [datum() | {"sampling_logprobs": [0.0], "advantages": [1.0, 2.0, 3.0, 4.0]}],
+        },
+        # datum() carries weights, which importance_sampling never reads
+        "unread input": {
+            "loss_fn": "importance_sampling",
+            "datums": [datum() | {"sampling_logprobs": [0.0] * 3, "advantages": [1.0] * 3}],
+        },
+    }
+    for payload in cases.values():
+        model_id = await created_model(service)
+        seq_id = 1
+        request_id = service.submit(
+            "tenant",
+            "forward_backward",
+            {"model_id": model_id, "seq_id": seq_id, "loss_fn_config": {}, **payload},
+        )
+        future = await await_settled(service, "tenant", request_id)
+        assert (future.state, future.error_category) == (FAILED, "user")
+    assert not service.backend.named("forward_backward"), "rejected datums must never reach the trainer"
+
+
+async def test_a_failed_window_stops_already_queued_training(service):
+    model_id = await created_model(service)
+    healthy = await created_model(service)
+    early = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    assert (await await_settled(service, "tenant", early)).state == DONE
+
+    service.backend.fail_next = {"error": "batch rejected"}
+    queued = [service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))]
+    queued.append(service.submit("tenant", "optim_step", _optim_payload(model_id, 3)))
+    queued.append(service.submit("tenant", "forward_backward", fb_payload(model_id, 4, [datum()])))
+    queued.append(service.submit("tenant", "optim_step", _optim_payload(model_id, 5)))
+    for request_id in queued:
+        assert (await await_settled(service, "tenant", request_id)).state == FAILED
+    assert service.retrieve_future("tenant", early).state == DONE
+    assert not service.backend.named("optim_step")
+    assert len(service.backend.named("forward_backward")) == 2
+    with pytest.raises(UserInputError, match="create a new model"):
+        service.submit("tenant", "optim_step", _optim_payload(model_id, 6))
+    step = service.submit("tenant", "optim_step", _optim_payload(healthy, 1))
+    assert (await await_settled(service, "tenant", step)).state == DONE
+
+
+async def test_unsupported_lora_configs_are_rejected(service):
+    for lora_config in ({"rank": 8, "seed": 7}, {"rank": 8, "train_unembed": True}, {"rank": 8, "train_mlp": False}):
+        with pytest.raises(UserInputError):
+            service.create_model("tenant", model_payload(service, lora_config=lora_config))
+    _, model_id = service.create_model(
+        "tenant",
+        model_payload(service, lora_config={"rank": 8, "train_attn": True, "train_mlp": True, "train_unembed": False}),
+    )
+    assert model_id in service.models
+
+
+@pytest.mark.parametrize("expire_lease", [False, True])
+async def test_sampler_paths_resolve_independently_of_the_lease(service, expire_lease):
+    session_id = service.create_session("tenant")
+    model_id = await created_model(service, session_id=session_id)
+    save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    path = (await await_settled(service, "tenant", save)).result["path"]
+
+    if expire_lease:
+        service.sessions[session_id].last_heartbeat = -1e9
+        await service._expire_sessions()
+        assert model_id not in service.models
+        service.create_session("tenant")
+    lora_name, lora_path = resolve_sampler_checkpoint(
+        service.config.checkpoint_root, "tenant", path, service.config.base_model
+    )
+    assert lora_name == f"{model_id}@1" and lora_path.endswith("/sampler_weights/1")
+    with pytest.raises((UserInputError, OwnershipError)):
+        resolve_sampler_checkpoint(service.config.checkpoint_root, "thief", path, service.config.base_model)
+    service.config.base_model = "other"
+    with pytest.raises(UserInputError, match="base_model"):
+        resolve_sampler_checkpoint(service.config.checkpoint_root, "tenant", path, service.config.base_model)
+
+
+async def test_an_unnamed_sampler_save_returns_a_sampling_session(service):
+    model_id = await created_model(service)
+    unnamed = service.submit(
+        "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1, "sampler_path": None}
+    )
+    result = (await await_settled(service, "tenant", unnamed)).result
+    session = service.sampling_sessions[result["sampling_session_id"]]
+    assert (session.tenant, session.model_path) == ("tenant", result["path"])
+
+    named = service.submit(
+        "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 2, "sampler_path": "ckpt"}
+    )
+    assert "sampling_session_id" not in (await await_settled(service, "tenant", named)).result
+
+
+async def test_weights_info_reads_the_checkpoint_not_the_lease(service):
+    model_id = await created_model(service)
+    save = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ck", "overwrite": False}
+    )
+    path = (await await_settled(service, "tenant", save)).result["path"]
+    del service.models[model_id]
+
+    info = service.weights_info("tenant", path)
+    assert info == {
+        "base_model": "base",
+        "is_lora": True,
+        "lora_rank": 8,
+        "train_attn": True,
+        "train_mlp": True,
+        "train_unembed": False,
+    }
+    with pytest.raises(OwnershipError):
+        service.weights_info("thief", path)
+
+
+async def test_a_failed_optim_step_retires_the_model(service):
+    model_id = await created_model(service)
+    slot = service.models[model_id].slot
+    service.backend.optim_outcomes[slot] = {"error": "slot update rejected"}
+
+    step = service.submit("tenant", "optim_step", _optim_payload(model_id, 1))
+    future = await await_settled(service, "tenant", step)
+    assert future.state == FAILED and "slot update rejected" in future.error
+    assert model_id not in service.models, "a half-applied step may have diverged the slot across ranks"
+    assert slot in service.free_slots
+    assert service.backend.named("unload_slot") == [{"slot": slot}]
+
+    with pytest.raises(UserInputError, match="restore from a checkpoint"):
+        service.submit("tenant", "optim_step", _optim_payload(model_id, 2))
+
+
+async def test_an_out_of_order_validation_failure_blocks_later_training(service):
+    model_id = await created_model(service)
+    step = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
+    rejected = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [], loss_fn="unknown"))
+    early = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    assert (await await_settled(service, "tenant", early)).state == DONE
+    assert (await await_settled(service, "tenant", rejected)).state == FAILED
+    assert (await await_settled(service, "tenant", step)).state == FAILED
+    assert len(service.backend.named("forward_backward")) == 1
+    assert not service.backend.named("optim_step")
+
+
+async def test_a_backend_level_optim_failure_retires_every_model_in_the_barrier(service):
+    model_a = await created_model(service)
+    model_b = await created_model(service)
+    service.backend.fail_on["optim_step"] = {"error": "slot updates rejected"}
+
+    first = service.submit("tenant", "optim_step", _optim_payload(model_a, 1))
+    second = service.submit("tenant", "optim_step", _optim_payload(model_b, 1))
+    for request_id in (first, second):
+        future = await await_settled(service, "tenant", request_id)
+        assert future.state == FAILED and "restore from a checkpoint" in future.error
+    assert model_a not in service.models and model_b not in service.models
+    assert len(service.backend.named("unload_slot")) == 2
+
+    fresh = await created_model(service)  # the dispatch loop survived the failure
+    assert fresh in service.models
+
+
+async def test_a_failed_unload_keeps_the_slot_out_of_the_free_pool(service):
+    session_id = service.create_session("tenant")
+    model_id = await created_model(service, session_id=session_id)
+    slot = service.models[model_id].slot
+    service.backend.fail_on["unload_slot"] = {"error": "engine gone"}
+
+    service.sessions[session_id].last_heartbeat -= service.config.lease_timeout_s + 1
+    await service._expire_sessions()
+
+    assert model_id not in service.models
+    assert slot not in service.free_slots, "a slot whose unload failed is dirty and must not be reused"
+    await service._expire_sessions()  # the sweep itself survived
+
+
+async def test_a_named_sampler_save_uses_the_name_and_rejects_reuse(service):
+    model_id = await created_model(service)
+    save = service.submit(
+        "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1, "sampler_path": "v1"}
+    )
+    result = (await await_settled(service, "tenant", save)).result
+    assert result["path"] == f"tinker://{model_id}/sampler_weights/v1"
+    assert "sampling_session_id" not in result
+
+    request_id, _ = service.submit_sample(
+        "tenant",
+        {
+            "model_path": result["path"],
+            "num_samples": 1,
+            "prompt_tokens": [1],
+            "sampling_params": {"max_tokens": 2},
+            "prompt_logprobs": False,
+            "topk_prompt_logprobs": 0,
+        },
+    )
+    await await_settled(service, "tenant", request_id)
+    assert service.backend.named("sample")[0]["lora_name"] == f"{model_id}@v1"
+
+    reuse = service.submit(
+        "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 2, "sampler_path": "v1"}
+    )
+    future = await await_settled(service, "tenant", reuse)
+    assert future.state == FAILED and "already exist" in future.error, "saved versions are immutable"
+
+
+async def test_checkpoint_meta_stores_a_digest_not_the_credential(service):
+    import json
+    import os
+
+    model_id = await created_model(service)
+    saved = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ck", "overwrite": False}
+    )
+    await await_settled(service, "tenant", saved)
+    meta_path = os.path.join(
+        resolve_checkpoint_dir(service.config.checkpoint_root, model_id, "weights", "ck"), "META.json"
+    )
+    meta = json.loads(open(meta_path).read())
+    assert "tenant" not in meta and meta["tenant_digest"] != "tenant", "the bearer credential must not be persisted"
+    info = service.weights_info("tenant", f"tinker://{model_id}/weights/ck")
+    assert (info["train_attn"], info["train_mlp"], info["train_unembed"]) == (True, True, False)
+
+
+async def test_a_checkpoint_saved_under_other_settings_does_not_load(service):
+    import json
+    import os
+
+    model_id = await created_model(service)
+    saved = service.submit(
+        "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ck", "overwrite": False}
+    )
+    path = (await await_settled(service, "tenant", saved)).result["path"]
+    meta_path = os.path.join(
+        resolve_checkpoint_dir(service.config.checkpoint_root, model_id, "weights", "ck"), "META.json"
+    )
+    meta = json.loads(open(meta_path).read())
+    meta["lora_alpha"] = meta["lora_alpha"] + 1  # the same tensors would be scaled differently
+    open(meta_path, "w").write(json.dumps(meta))
+
+    loaded = service.submit(
+        "tenant", "load_state", {"model_id": model_id, "seq_id": 2, "path": path, "optimizer": True}
+    )
+    future = await await_settled(service, "tenant", loaded)
+    assert (future.state, future.error_category) == (FAILED, "user") and "lora_alpha" in future.error
+    assert not service.backend.named("load_slot")[1:], "nothing may touch the slot on a mismatch"
+
+
+async def test_a_recycled_slot_belongs_to_a_fresh_model_queue(service):
+    session_id = service.create_session("tenant")
+    model_id = await created_model(service, session_id=session_id)
+    slot = service.models[model_id].slot
+    service.backend.fail_next = {"error": "batch input rejected"}
+    failed = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+    assert (await await_settled(service, "tenant", failed)).state == FAILED
+
+    service.sessions[session_id].last_heartbeat -= service.config.lease_timeout_s + 1
+    await service._expire_sessions()
+    assert slot in service.free_slots
+
+    assert session_id not in service.sessions, "the sweep takes the expired session with it"
+    fresh = await created_model(service)
+    assert service.models[fresh].slot == slot
+    step_after_fb = service.submit("tenant", "forward_backward", fb_payload(fresh, 1, [datum()]))
+    assert (await await_settled(service, "tenant", step_after_fb)).state == DONE
+    step = service.submit("tenant", "optim_step", _optim_payload(fresh, 2))
+    future = await await_settled(service, "tenant", step)
+    assert future.state == DONE, "a fresh model may use the successfully recycled slot"
+
+
+@pytest.mark.parametrize("source", ["handler", "worker", "create", "sweep", "export", "load"])
+async def test_an_unknown_failure_stops_the_dispatcher(tmp_path, source):
+    from tests.fast.tinker.harness import make_service
+
+    gateway = make_service(tmp_path)
+    run_task = asyncio.create_task(gateway.run())
+    error = (
+        OSError("checkpoint IO failed") if source in ("export", "load") else RuntimeError("fatal execution failure")
+    )
     try:
-        model_id = await created_model(svc)
-        request_id = svc.submit("tenant", "forward_backward", fb_payload(model_id, 1, [row()]))
-        assert (await await_settled(svc, "tenant", request_id)).state == DONE
+        model_id = await created_model(gateway)
+        if source == "export":
+            gateway.backend.fail_on["export_slot"] = error
+            gateway.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+        elif source == "load":
+            saved = gateway.submit(
+                "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ck", "overwrite": False}
+            )
+            path = (await await_settled(gateway, "tenant", saved)).result["path"]
+            gateway.backend.fail_on["load_slot"] = error
+            gateway.submit(
+                "tenant", "load_state", {"model_id": model_id, "seq_id": 2, "path": path, "optimizer": True}
+            )
+        elif source == "create":
+            gateway.backend.fail_on["load_slot"] = RuntimeError("fatal execution failure")
+            gateway.create_model("tenant", model_payload(gateway))
+        elif source == "sweep":
+            gateway.backend.fail_on["unload_slot"] = RuntimeError("fatal execution failure")
+            for session in gateway.sessions.values():
+                session.last_heartbeat -= gateway.config.lease_timeout_s + 1
+            task = asyncio.create_task(gateway._expire_sessions())
+            task.add_done_callback(gateway._observe_background_task)
+        else:
+            if source == "handler":
+
+                async def broken_handler(unit):
+                    raise RuntimeError("fatal execution failure")
+
+                gateway._run_barrier = broken_handler
+            else:
+                gateway.backend.fail_on["optim_step"] = RuntimeError("fatal execution failure")
+            gateway.submit("tenant", "optim_step", _optim_payload(model_id, 1))
+        with pytest.raises(type(error), match=str(error)):
+            await asyncio.wait_for(run_task, timeout=2)
     finally:
-        run_task.cancel()
+        if not run_task.done():
+            run_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await run_task
+
+
+async def test_a_dead_trainer_escapes_the_dispatch_loop(tmp_path, monkeypatch):
+    gateway = make_service(tmp_path)
+    run_task = asyncio.create_task(gateway.run())
+    try:
+        model_id = await created_model(gateway)
+
+        async def _dead() -> bool:
+            return True
+
+        monkeypatch.setattr(gateway.backend, "trainer_dead", _dead)
+        gateway.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
+        with pytest.raises(RuntimeError, match="trainer workers died"):
+            await asyncio.wait_for(run_task, timeout=2)
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await run_task
+
+
+async def test_a_retried_create_model_returns_the_first_allocation(service):
+    """A network retry must not occupy a second slot."""
+    payload = model_payload(service)
+    first = service.create_model("tenant", payload)
+    await await_settled(service, "tenant", first[0])
+    assert service.create_model("tenant", payload) == first
+    assert len(service.backend.named("load_slot")) == 1
+
+
+async def test_an_unknown_session_is_rejected(service):
+    with pytest.raises(UserInputError, match="unknown session"):
+        service.create_model("tenant", model_payload(service, session_id="session-gone"))
+
+
+async def test_a_retried_sampling_session_returns_the_same_id(service):
+    payload = {"session_id": service.create_session("tenant"), "sampling_session_seq_id": 1}
+    assert service.create_sampling_session("tenant", payload) == service.create_sampling_session("tenant", payload)
+
+
+async def test_a_retried_sample_does_not_sample_again(service):
+    model_id = await created_model(service)
+    save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
+    path = (await await_settled(service, "tenant", save)).result["path"]
+    sampling_session_id = service.create_sampling_session(
+        "tenant", {"session_id": service.create_session("tenant"), "sampling_session_seq_id": 1, "model_path": path}
+    )
+    payload = {
+        "sampling_session_id": sampling_session_id,
+        "seq_id": 1,
+        "num_samples": 1,
+        "prompt_tokens": [1],
+        "sampling_params": {"max_tokens": 2},
+    }
+    first = service.submit_sample("tenant", payload)
+    assert service.submit_sample("tenant", payload) == first, "the retry must reuse the request and sequence ids"
+    await await_settled(service, "tenant", first[0])
+    assert len(service.backend.named("sample")) == 1
+
+
+async def test_an_illegal_seq_id_is_rejected(service):
+    """seq_id 0 would never enter the ordered model queue; every future would pend."""
+    model_id = await created_model(service)
+    with pytest.raises(UserInputError, match="seq_id"):
+        service.submit("tenant", "optim_step", {"model_id": model_id, "seq_id": 0, "adam_params": dict(ADAM)})
+
+
+async def test_an_expired_lease_sweeps_its_sessions(service):
+    session_id = service.create_session("tenant")
+    service.sessions[session_id].last_heartbeat = -1e9
+    await service._expire_sessions()
+    with pytest.raises(UserInputError, match="unknown session"):
+        service.create_model("tenant", model_payload(service, session_id=session_id))
+
+
+async def test_a_sampling_session_for_another_base_model_is_rejected(service):
+    payload = {"session_id": service.create_session("tenant"), "sampling_session_seq_id": 1, "base_model": "other"}
+    with pytest.raises(UserInputError, match="serves"):
+        service.create_sampling_session("tenant", payload)
+
+
+async def test_a_read_only_batch_failure_preserves_queued_training(service):
+    model_id = await created_model(service)
+    service.backend.fail_on["forward_only"] = {"error": "request rejected"}
+    readonly = service.submit("tenant", "forward_only", fb_payload(model_id, 1, [datum()]))
+    backward = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
+    step = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
+    assert (await await_settled(service, "tenant", readonly)).state == FAILED
+    assert (await await_settled(service, "tenant", backward)).state == DONE
+    assert (await await_settled(service, "tenant", step)).state == DONE
+
+
+@pytest.mark.parametrize("shutdown", ["cancel", "failure"])
+async def test_dispatcher_shutdown_stops_model_creation_and_sampling(tmp_path, monkeypatch, shutdown):
+    gateway = make_service(tmp_path)
+    started = asyncio.Queue()
+    fail_sweep = asyncio.Event()
+
+    async def blocked_backend_call(*args):
+        started.put_nowait(asyncio.current_task())
+        await asyncio.Event().wait()
+
+    async def _run_lease_sweeper():
+        await fail_sweep.wait()
+        raise RuntimeError("lease sweeper failed")
+
+    monkeypatch.setattr(gateway.backend, "load_slot", blocked_backend_call)
+    monkeypatch.setattr(gateway.backend, "sample", blocked_backend_call)
+    monkeypatch.setattr(gateway, "_run_lease_sweeper", _run_lease_sweeper)
+    run_task = asyncio.create_task(gateway.run())
+    gateway.create_model("tenant", model_payload(gateway))
+    gateway.submit_sample("tenant", {"num_samples": 1, "prompt_tokens": [1]})
+    tasks = [run_task, *gateway._create_tasks, *(task for task, _ in gateway._sample_tasks.values())]
+    try:
+        backend_tasks = [await asyncio.wait_for(started.get(), timeout=2) for _ in range(2)]
+        if shutdown == "cancel":
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run_task, timeout=2)
+        else:
+            fail_sweep.set()
+            with pytest.raises(RuntimeError, match="lease sweeper failed"):
+                await asyncio.wait_for(run_task, timeout=2)
+        assert all(task.done() for task in backend_tasks), "backend tasks outlived the dispatcher"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

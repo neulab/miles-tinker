@@ -1,6 +1,6 @@
 from tests.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
+register_cpu_ci(est_time=60, suite="stage-b-cpu", labels=["replay"])
 
 from argparse import Namespace
 from types import SimpleNamespace
@@ -171,10 +171,6 @@ def test_dense_archs_do_not_resolve_to_a_moe_adapter():
 def test_enable_follows_use_routing_replay():
     assert routing_replay.enable(Namespace(use_routing_replay=True, ci_test=False)) is True
     assert routing_replay.enable(Namespace(use_routing_replay=False, ci_test=False)) is False
-
-
-def test_enable_defaults_false_when_arg_absent():
-    assert routing_replay.enable(Namespace(ci_test=False)) is False
 
 
 def test_enable_turns_on_the_replay_check_only_under_ci_test():

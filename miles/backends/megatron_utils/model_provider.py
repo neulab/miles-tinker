@@ -49,6 +49,10 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
     provider.variable_seq_lengths = args.variable_seq_lengths
 
+    # Match the non-bridge path: MTP must only train its own draft parameters.
+    if getattr(args, "enable_mtp_training", False):
+        provider.mtp_detach_heads = True
+
     # numerics (training infra, not model-defining)
     provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
     provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
@@ -78,6 +82,11 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # attention kernel selection
     provider.attention_backend = args.attention_backend
 
+    # The HF checkpoint can contain an MTP module even when this run trains only
+    # the target model. An explicit runtime value, including None, overrides it.
+    if hasattr(args, "mtp_num_layers"):
+        provider.mtp_num_layers = args.mtp_num_layers
+
     # MoE token dispatcher (same-name, always present)
     provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
 
@@ -93,8 +102,10 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     if getattr(args, "moe_aux_loss_coeff", None) is not None:
         provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
 
-    if hasattr(provider, "dsa_attention_backend"):
-        provider.dsa_attention_backend = getattr(args, "dsa_attention_backend", "megatron")
+    # Imported here: test_bridge_mtp_detachment.py exec()s this function's AST in a bare namespace (no module names).
+    from miles.utils.megatron_bridge_utils import apply_dsa_backend_args
+
+    apply_dsa_backend_args(provider, args)
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -331,6 +342,8 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        _maybe_freeze_native_dsa_indexer(args, model)
+
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
@@ -339,6 +352,15 @@ def get_model_provider_func(
         return model
 
     return model_provider
+
+
+def _maybe_freeze_native_dsa_indexer(args: argparse.Namespace, model: GPTModel) -> None:
+    if args.dsa_impl == "megatron" and model.config.dsa_indexer_loss_coeff == 0:
+        # Native DSA runs its indexer under no_grad without the auxiliary objective.
+        # Exclude these unused parameters from DDP and optimizer weight decay.
+        for name, parameter in model.named_parameters():
+            if ".self_attention.core_attention.indexer." in name:
+                parameter.requires_grad_(False)
 
 
 def _maybe_install_witness(
