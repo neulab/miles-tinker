@@ -3546,9 +3546,9 @@ def miles_validate_args(args):
         if args.over_sampling_batch_size is None:
             args.over_sampling_batch_size = args.rollout_batch_size
 
-        assert args.over_sampling_batch_size > 0, (
-            f"over_sampling_batch_size must be positive, got {args.over_sampling_batch_size}"
-        )
+        assert (
+            args.over_sampling_batch_size > 0
+        ), f"over_sampling_batch_size must be positive, got {args.over_sampling_batch_size}"
 
         if args.num_epoch is not None:
             if args.num_rollout is not None:
