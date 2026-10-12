@@ -1,4 +1,6 @@
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import typer
 
@@ -27,6 +29,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     data_dir: str = "/root/datasets"
     model_dir: str = "/root/models"
     megatron_path: str = "/root/Megatron-LM"
+    train_script: str = "train.py"
     extra_args: str = ""
 
     def __post_init__(self):
@@ -37,46 +40,45 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
-    U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
-    U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
-    U.hf_download_dataset("zhuzilin/dapo-math-17k", data_dir=args.data_dir)
-    U.convert_checkpoint(
-        model_name=args.model_name,
-        megatron_model_type=args.megatron_model_type,
-        num_gpus_per_node=args.num_gpus_per_node,
-        dir_dst=args.model_dir,
-        hf_checkpoint=f"{args.model_dir}/{args.model_name}",
-        megatron_path=args.megatron_path,
-    )
+    # One-off Hyperion comparison: reuse prepared artifacts and its HF shuffle.
+    # Keep the optional dataset dependency out of launcher imports.
+    from datasets import Dataset
+
+    source = Path(args.data_dir) / "dapo-math-17k/dapo-math-17k.jsonl"
+    with source.open() as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
+    indices = Dataset.from_dict({"index": list(range(len(rows)))})
+    indices = list(indices.shuffle(seed=42)["index"])
+    indices = indices[: len(indices) // 8 * 8]  # Hyperion drops incomplete prompt batches.
+    if not indices:
+        raise ValueError("Need at least eight prompts")
+    output = Path(args.output_dir) / args.run_id
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "dapo-hyperion-order.jsonl").open("w") as stream:
+        for index in indices:
+            stream.write(json.dumps(rows[index], ensure_ascii=False) + "\n")
 
 
 def execute(args: ScriptArgs):
-    load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
-
-    # --critic-load and --critic-lr fall back to --load and --lr. --critic-save falls back to
-    # --save with a '_critic' suffix, a sibling dir so the two models keep separate iteration
-    # trackers -- so none of the critic path flags need to be passed here.
+    # Fresh HF initialization for both models; no reference model or checkpoint saves.
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name}/ "
-        f"--ref-load {args.model_dir}/{args.model_name}_torch_dist "
-        f"--load {load_save_path} "
-        f"--save {load_save_path} "
-        "--save-interval 20 "
+        f"--load {args.model_dir}/{args.model_name} "
+        "--megatron-to-hf-mode bridge "
     )
 
     rollout_args = (
-        f"--prompt-data {args.data_dir}/dapo-math-17k/dapo-math-17k.jsonl "
+        f"--prompt-data {args.output_dir}/{args.run_id}/dapo-hyperion-order.jsonl "
         "--input-key prompt "
         "--label-key label "
         "--apply-chat-template "
-        "--rollout-shuffle "
         "--rm-type deepscaler "
         "--num-rollout 300 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 8192 "
-        "--rollout-temperature 0.8 "
-        "--global-batch-size 32 "
+        "--rollout-temperature 1.0 "
+        "--global-batch-size 64 "
         "--balance-data "
     )
 
@@ -97,10 +99,11 @@ def execute(args: ScriptArgs):
         "--critic-lr 1e-5 "  # the critic usually wants a larger lr than the actor
         "--num-critic-only-steps 1 "  # value-function warmup: actor frozen for this many steps
         "--normalize-advantages "
+        "--calculate-per-token-loss "
+        "--use-rollout-logprobs "
         # Reward-level KL (--kl-coef) is rejected with ppo: the critic trains before the actor and
         # never sees ref log probs, so its value targets would silently omit that penalty. Use
         # loss-level KL instead.
-        "--use-kl-loss "
         "--kl-loss-coef 0.00 "
         "--kl-loss-type k1 "
         "--kl-coef 0.00 "
@@ -154,6 +157,7 @@ def execute(args: ScriptArgs):
 
     U.execute_train(
         train_args=train_args,
+        train_script=args.train_script,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
         megatron_path=args.megatron_path,

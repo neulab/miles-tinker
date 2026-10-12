@@ -181,9 +181,11 @@ For server and client commands, see the [DAPO-Math-17K example](tinker-ppo-clien
 
 ## Critic-head initialization
 
-For a fresh critic, HF Bridge sets the linear head's weights and bias to zero;
-no checkpoint conversion is needed. The tested Qwen3-4B raw Megatron loading
-path also zeroes the head internally when starting from converted LM weights.
+For a fresh critic, HF Bridge initializes the linear head with mean-zero Gaussian
+weights, standard deviation `1 / (hidden_size + 1)`, and zero bias. For Qwen3-4B,
+the standard deviation is approximately `0.0003905`. No checkpoint conversion
+is needed. The legacy Qwen3-4B raw Megatron loading path still zeroes the head
+internally when starting from converted LM weights.
 In either mode, resuming a critic training checkpoint restores the saved head
 and optimizer state without resetting them.
 

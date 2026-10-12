@@ -21,7 +21,8 @@ Run setup once per GPU type, using the same root as the
 detect the current node's MI300 or MI350 GPUs. Setup installs
 the image and environment, runs the GPU doctor, and prepares Modal access.
 Qwen3-4B loads HF weights through Bridge; no checkpoint conversion is needed.
-Bridge initializes the new critic head's weights and bias to zero.
+Bridge initializes the new critic head with mean-zero Gaussian weights,
+standard deviation `1 / (hidden_size + 1)`, and zero bias.
 
 ```bash
 python3 tools/amd_tinker.py setup --root "$PPO_ROOT" --model-family qwen3
@@ -50,7 +51,7 @@ python3 tools/amd_tinker.py serve \
 | `--train-gpus 4 --rollout-gpus 4` | Shared actor/critic training pool and separate inference pool. Do not add `--colocate`. |
 | `--tp 1 --pp 1 --cp 1` | Data parallel training across the four training GPUs. |
 | `--offload-train` | Switch actor/critic residency automatically. |
-| `--megatron-to-hf-mode bridge` | Load HF weights directly; initialize the new critic head's weights and bias to zero. |
+| `--megatron-to-hf-mode bridge` | Load HF weights directly; initialize the critic head with small Gaussian weights and zero bias. |
 | `--rollout-temperature 0.8` | Must match the client's sampling temperature. |
 | `--balance-data` | Balance training sequences across ranks. |
 | `--keep-checkpoints 3` | Retain three checkpoints per model, including across resume. |
