@@ -18,8 +18,13 @@ class GroupLevelSubmission:
 
     sample_done_callback = None
 
+    def __init__(self, tail_prefetch_groups: int = 0):
+        if tail_prefetch_groups < 0:
+            raise ValueError("tail_prefetch_groups must be nonnegative")
+        self.tail_prefetch_groups = tail_prefetch_groups
+
     def has_capacity(self, *, pending_groups: int, group_budget: int) -> bool:
-        return pending_groups < group_budget
+        return group_budget > 0 and pending_groups < max(group_budget, self.tail_prefetch_groups)
 
     def on_submit(self, groups: list[list[Sample]]) -> None:
         pass
@@ -31,7 +36,10 @@ class GroupLevelSubmission:
 class SampleBackfillSubmission:
     """Each finished sample frees its own slot; a replacement group fits once ``group_size`` samples complete."""
 
-    def __init__(self, group_size: int):
+    def __init__(self, group_size: int, tail_prefetch_groups: int = 0):
+        if tail_prefetch_groups < 0:
+            raise ValueError("tail_prefetch_groups must be nonnegative")
+        self.tail_prefetch_groups = tail_prefetch_groups
         self.group_size = group_size
         self.samples_in_flight = 0
         self._sample_done = asyncio.Event()
@@ -46,7 +54,8 @@ class SampleBackfillSubmission:
             # a group returned without spawning its sample tasks, or a stub skipped the callback
             logger.warning(f"samples_in_flight={self.samples_in_flight} with no pending groups; resetting to 0")
             self.samples_in_flight = 0
-        if self.samples_in_flight + self.group_size <= group_budget * self.group_size:
+        capacity = max(group_budget, self.tail_prefetch_groups) if group_budget > 0 else 0
+        if self.samples_in_flight + self.group_size <= capacity * self.group_size:
             return True
         self._sample_done.clear()
         return False
@@ -66,6 +75,6 @@ class SampleBackfillSubmission:
 def make_submission_scheduler(args: Namespace, *, default: str) -> GroupLevelSubmission | SampleBackfillSubmission:
     granularity = args.rollout_submission_granularity or default
     if granularity == "group":
-        return GroupLevelSubmission()
+        return GroupLevelSubmission(getattr(args, "rollout_tail_prefetch_groups", 0))
     assert granularity == "sample", f"unknown submission granularity: {granularity}"
-    return SampleBackfillSubmission(args.n_samples_per_prompt)
+    return SampleBackfillSubmission(args.n_samples_per_prompt, getattr(args, "rollout_tail_prefetch_groups", 0))

@@ -656,6 +656,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
             # sampling
             parser.add_argument(
+                "--rollout-tail-prefetch-groups",
+                type=int,
+                default=0,
+                help=(
+                    "For the native inference rollout driver, maintain at least this many prompt-group "
+                    "slots while a batch is incomplete. Zero preserves demand-only submission. "
+                    "Surplus groups are aborted when the optimizer batch fills; the batch size is unchanged."
+                ),
+            )
+            parser.add_argument(
                 "--over-sampling-batch-size",
                 type=int,
                 default=None,
@@ -3544,6 +3554,7 @@ def miles_validate_args(args):
     if args.entry == "train":
         assert args.rollout_batch_size is not None, "please set --rollout-batch-size"
 
+        assert getattr(args, "rollout_tail_prefetch_groups", 0) >= 0, "rollout_tail_prefetch_groups must be nonnegative"
         if args.over_sampling_batch_size is None:
             args.over_sampling_batch_size = args.rollout_batch_size
 

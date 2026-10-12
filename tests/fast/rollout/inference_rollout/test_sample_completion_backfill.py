@@ -181,6 +181,35 @@ async def test_backfill_does_not_oversubmit_below_one_group(monkeypatch):
     assert len(output.samples) == 2
 
 
+@pytest.mark.parametrize("granularity", ["group", "sample"])
+async def test_tail_prefetch_fills_batch_without_waiting_for_a_straggler(monkeypatch, granularity):
+    harness = Harness(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=2,
+            rollout_submission_granularity=granularity,
+            rollout_tail_prefetch_groups=2,
+        ),
+    )
+    task = harness.run()
+    await asyncio.sleep(0)
+    assert harness.submitted_group_indices == [1, 2]
+    if granularity == "sample":
+        harness.finish_samples(0, GROUP_SIZE)
+    harness.finish_group(0)
+    await asyncio.sleep(0.01)
+    assert harness.submitted_group_indices == [1, 2, 3]
+    if granularity == "sample":
+        harness.finish_samples(2, GROUP_SIZE)
+    harness.finish_group(2)
+    output, _ = await asyncio.wait_for(task, timeout=1)
+    # Group 2 never finished. It is canceled rather than scored or replayed;
+    # the optimizer still receives exactly two complete original-sized groups.
+    assert [group[0].group_index for group in output.samples] == [1, 3]
+    assert all(len(group) == GROUP_SIZE for group in output.samples)
+    assert harness.state.reset_count == 1
+
+
 async def test_failed_sample_cancels_siblings_and_conserves_credits(monkeypatch):
     """One sample raising must not leave siblings running or credits unreturned."""
     from miles.rollout.inference_rollout import inference_rollout_common as common
@@ -195,9 +224,7 @@ async def test_failed_sample_cancels_siblings_and_conserves_credits(monkeypatch)
     fired = []
     state = FakeGenerateState(make_args())
     with pytest.raises(RuntimeError, match="sample failed"):
-        await common.generate_and_rm_group(
-            state, make_group(1), sampling_params={}, sample_done_callback=lambda: fired.append(1)
-        )
+        await common.generate_and_rm_group(state, make_group(1), sampling_params={}, sample_done_callback=lambda: fired.append(1))
     # every sample task settled (cancelled included) before the group raised
     assert len(fired) == GROUP_SIZE
 
@@ -250,6 +277,27 @@ class TestSubmissionSchedulers:
 
         scheduler.has_capacity(pending_groups=1, group_budget=2)
         assert scheduler.samples_in_flight == GROUP_SIZE
+
+    @pytest.mark.parametrize("granularity", ["group", "sample"])
+    def test_tail_prefetch_is_bounded_and_stops_for_a_complete_batch(self, granularity):
+        scheduler = make_submission_scheduler(
+            make_args(rollout_submission_granularity=granularity, rollout_tail_prefetch_groups=4),
+            default="group",
+        )
+        scheduler.on_submit([make_group(1)])
+        assert scheduler.has_capacity(pending_groups=1, group_budget=1)
+        scheduler.on_submit([make_group(2), make_group(3), make_group(4)])
+        assert not scheduler.has_capacity(pending_groups=4, group_budget=1)
+        assert not scheduler.has_capacity(pending_groups=4, group_budget=0)
+
+    @pytest.mark.parametrize("granularity", ["group", "sample"])
+    def test_prefetch_does_not_expand_a_large_initial_batch(self, granularity):
+        scheduler = make_submission_scheduler(
+            make_args(rollout_submission_granularity=granularity, rollout_tail_prefetch_groups=4),
+            default="group",
+        )
+        scheduler.on_submit([make_group(i) for i in range(32)])
+        assert not scheduler.has_capacity(pending_groups=32, group_budget=32)
 
     @pytest.mark.parametrize("scheduler_cls", [GroupLevelSubmission, lambda: SampleBackfillSubmission(GROUP_SIZE)])
     async def test_wait_for_progress_returns_on_group_completion(self, scheduler_cls):
