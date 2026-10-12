@@ -209,6 +209,12 @@ def _compute_perf_metrics_from_samples(args, samples, rollout_time):
     if max(non_generation_time) > 0:
         log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
 
+    if getattr(args, "fully_async", False):
+        # Generation continues outside this call. Its duration measures collection
+        # from a queue, so dividing a batch's tokens by it overstates throughput.
+        log_dict["async_batch_collection_time"] = rollout_time
+        return log_dict
+
     def token_perf(response_lengths, non_generation_time, key=""):
         max_response_length = max(response_lengths)
         if args.rollout_num_gpus:
