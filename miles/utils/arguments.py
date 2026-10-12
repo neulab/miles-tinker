@@ -748,6 +748,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--async-data-buffer-overflow-policy",
+                choices=["block", "drop_oldest"],
+                default="block",
+                help="When the async buffer is full: block production, or discard its oldest complete group to keep producing.",
+            )
+            parser.add_argument(
                 "--async-unused-samples-handler",
                 type=str,
                 choices=["retry", "drop"],

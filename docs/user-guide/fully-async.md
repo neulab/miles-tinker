@@ -367,3 +367,12 @@ forwards metrics elsewhere should return `False` and leave the built-in logging 
 place. To change which numbers the buffer reports in the first place, override
 `get_metrics()` on a custom buffer instead, as described in
 [Arguments: Buffer options](#arguments-buffer-options).
+
+For continuous production with bounded memory, set
+`--async-data-buffer-overflow-policy drop_oldest`. When the finished-group buffer
+is full, discard its oldest whole group through the unused-sample handler
+rather than blocking the producer. `block` remains the default. Monitor
+`rollout/fully_async/overflow_groups_dropped` to measure wasted generation.
+Leaving `--max-weight-staleness` unset allows policy lag. Weight publication
+still briefly pauses engines; increasing `--update-weights-interval` reduces
+its frequency while the dedicated evaluation fleet uses fresh actor snapshots.

@@ -112,6 +112,10 @@ class DefaultDataBuffer(DataBuffer):
         self._capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
         assert self._capacity >= 1
 
+        self._overflow_policy = getattr(args, "async_data_buffer_overflow_policy", "block")
+        if self._overflow_policy not in ("block", "drop_oldest"):
+            raise ValueError(f"Unsupported async buffer overflow policy: {self._overflow_policy}")
+        self._metric_overflow_groups = 0
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
@@ -136,7 +140,12 @@ class DefaultDataBuffer(DataBuffer):
 
         async with self._cond:
             while len(self._buffer) >= self._capacity:
-                await self._cond.wait()
+                if self._overflow_policy == "block":
+                    await self._cond.wait()
+                else:
+                    dropped = self._buffer.pop(0)
+                    self._metric_overflow_groups += 1
+                    self._unused_handler_fn(dropped.prompt_group)
             self._buffer.append(input)
             self._cond.notify_all()
 
@@ -167,6 +176,7 @@ class DefaultDataBuffer(DataBuffer):
             f"{prefix}queue_size": len(self._buffer),
             f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
             f"{prefix}stale_groups_filtered": self._metric_stale_groups,
+            f"{prefix}overflow_groups_dropped": self._metric_overflow_groups,
             **self._metric_gatherer.collect(),
         }
         if consumed := self._metric_consumed_staleness:
@@ -181,7 +191,7 @@ class DefaultDataBuffer(DataBuffer):
 
         self._metric_gatherer = MetricGatherer()
         self._metric_consumed_staleness = []
-        self._metric_aborted_groups = self._metric_stale_groups = 0
+        self._metric_aborted_groups = self._metric_stale_groups = self._metric_overflow_groups = 0
         return metrics
 
     @staticmethod
