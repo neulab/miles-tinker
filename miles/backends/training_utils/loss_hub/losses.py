@@ -337,10 +337,14 @@ def policy_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum(dtype=torch.float32)
 
-    train_scored_log_probs = old_log_probs
+    # Compare independent trainer scores, even when PPO uses rollout scores
+    # as its denominator. Without cached trainer scores, reuse this forward pass.
     train_rollout_logprob_abs_diff = None
     train_rollout_kl = None
     if rollout_old_log_probs:
+        train_scored_log_probs = (
+            torch.cat(trainer_scored_log_probs, dim=0) if trainer_scored_log_probs is not None else log_probs.detach()
+        )
         rollout_log_probs = torch.cat(rollout_old_log_probs, dim=0)
         abs_diff = (train_scored_log_probs - rollout_log_probs).abs()
         abs_diff = torch.where(

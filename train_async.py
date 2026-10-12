@@ -62,9 +62,13 @@ async def train(args):
 
     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
 
-    if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
+    if args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
-        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+        if args.start_rollout_id == 0:
+            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+        else:
+            # Evaluate the loaded actor, not the original pretrained weights.
+            await eval_dispatcher.dispatch(args.start_rollout_id - 1, force=True)
 
     async def save_training_model(model, rollout_id, force_sync):
         if args.use_critic and args.offload_train:
@@ -84,9 +88,13 @@ async def train(args):
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
 
-        # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
+        # Fully async already has a persistent producer. Drain only after
+        # publication so selection/checkpoint counters and staleness are not
+        # advanced by an additional untrained lookahead batch.
+        if not args.fully_async and rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+        elif args.fully_async:
+            rollout_data_next_future = None
 
         if args.use_critic:
             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
@@ -132,6 +140,9 @@ async def train(args):
                 rollout_id,
             )
             break
+
+        if args.fully_async and rollout_id + 1 < args.num_rollout:
+            rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
     await eval_dispatcher.drain()
     await rollout_executor.dispose.remote()

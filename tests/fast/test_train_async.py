@@ -24,6 +24,7 @@ def _make_args(**overrides: Any) -> SimpleNamespace:
         eval_overflow_policy="skip",
         eval_uses_snapshots=True,
         ft_components=[],
+        fully_async=False,
         hf_checkpoint=None,
         keep_old_actor=False,
         num_critic_only_steps=0,
@@ -172,3 +173,40 @@ class TestTerminalLifecycle:
             "executor_dispose",
             "inference_dispose",
         ]
+
+
+def test_resumed_initial_eval_exports_loaded_actor(monkeypatch):
+    async def run():
+        args = _make_args(start_rollout_id=20, num_rollout=20, eval_interval=5, hf_checkpoint="/pretrained/hf")
+        events = []
+        _install_driver_fakes(monkeypatch, args, events)
+        calls = []
+
+        class Dispatcher:
+            def __init__(self, *unused):
+                pass
+
+            async def dispatch(self, step, **kwargs):
+                calls.append((step, kwargs))
+
+            async def drain(self):
+                pass
+
+        monkeypatch.setattr(train_async_driver, "EvalDispatcher", Dispatcher)
+        await train_async_driver.train(args)
+        assert calls == [(19, {"force": True})]
+
+    asyncio.run(run())
+
+
+def test_fully_async_drains_next_batch_after_weight_publication(monkeypatch):
+    async def run():
+        args = _make_args(num_rollout=2, fully_async=True)
+        events = []
+        components = _install_driver_fakes(monkeypatch, args, events)
+        await train_async_driver.train(args)
+        assert events.index("actor_train:0") < events.index("generate_start:1")
+        assert events.index("update_weights:0") < events.index("generate_start:1")
+        assert components.actor_model.trained == [0, 1]
+
+    asyncio.run(run())
