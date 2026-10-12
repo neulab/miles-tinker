@@ -1,10 +1,10 @@
 # DAPO-Math-17K PPO through Tinker
 
 Run Qwen3-4B on one 8-GPU AMD node: actor and critic share four training
-GPUs with offloading; four dedicated GPUs serve inference. Use two Bash
+GPUs with both models resident; four dedicated GPUs serve inference. Use two Bash
 terminals on the allocated node, with Python 3.9+ and Apptainer available.
 Images, environments, models, and data are stored under `PPO_ROOT`.
-This synchronous PPO setup has been validated on both MI300 and MI350 using HF Bridge.
+PPO through HF Bridge has been validated on both MI300 and MI350.
 
 In **both terminals**, set the same paths and a fresh run name:
 
@@ -40,8 +40,8 @@ python3 tools/amd_tinker.py serve \
   --mem-fraction 0.9 --keep-checkpoints 3 \
   --checkpoint-root "$PPO_ROOT/runs/$PPO_RUN/checkpoints" -- \
   --bf16 --megatron-to-hf-mode bridge \
-  --tinker-enable-critic --offload-train --balance-data \
-  --rollout-temperature 0.8 --seed 1234 \
+  --tinker-enable-critic --no-offload-train --balance-data \
+  --seed 1234 \
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
 ```
 
@@ -50,9 +50,9 @@ python3 tools/amd_tinker.py serve \
 | `--tinker-enable-critic` | Adds the critic; the launcher already selects full-model training. |
 | `--train-gpus 4 --rollout-gpus 4` | Shared actor/critic training pool and separate inference pool. Do not add `--colocate`. |
 | `--tp 1 --pp 1 --cp 1` | Data parallel training across the four training GPUs. |
-| `--offload-train` | Switch actor/critic residency automatically. |
+| `--no-offload-train` | Keep both models resident on the shared training GPUs; both must fit in memory and execute sequentially. |
 | `--megatron-to-hf-mode bridge` | Load HF weights directly; initialize the critic head with small Gaussian weights and zero bias. |
-| `--rollout-temperature 0.8` | Must match the client's sampling temperature. |
+| `--rollout-temperature` omitted | Keep the server default of `1.0`; the client's sampling temperature must match. |
 | `--balance-data` | Balance training sequences across ranks. |
 | `--keep-checkpoints 3` | Retain three checkpoints per model, including across resume. |
 
@@ -114,7 +114,7 @@ curl --fail http://127.0.0.1:10613/health &&
   --model-path "$PPO_ROOT/models/Qwen3-4B" \
   --data "$PPO_ROOT/datasets/dapo-math-17k/dapo-math-17k.jsonl" \
   --output "$PPO_ROOT/runs/$PPO_RUN" \
-  --rollouts 300 --save-interval 10 \
+  --rollouts 300 --save-interval 10 --temperature 1.0 \
   --wandb-project miles-amd-ppo --wandb-entity 9998_team
 ```
 
@@ -123,9 +123,14 @@ run on the same node. `tml-local-ppo` is the local gateway's tenant identifier.
 W&B uses your home-directory credentials or forwarded `WANDB_API_KEY`.
 Metrics also go to the run's `metrics.jsonl`.
 
-Defaults preserve the reference recipe: 8 prompts × 8 responses per rollout,
-32 responses per optimizer step, maximum response length 8192, temperature
-0.8, actor/critic learning rates 1e-6/1e-5, GAE γ=λ=1, and clipping 0.2.
+The client command sets temperature `1.0` to match the server. The DAPO
+client's default remains `0.8`; to use it, pass `--temperature 0.8` to the
+client and `--rollout-temperature 0.8` after the server command's `--`.
+Sampling requests do not update the server's training-logit temperature.
+
+Other defaults preserve the reference recipe: 8 prompts × 8 responses per
+rollout, 32 responses per optimizer step, maximum response length 8192,
+actor/critic learning rates 1e-6/1e-5, GAE γ=λ=1, and clipping 0.2.
 Each rollout has two optimizer steps per model; the first trains only the critic.
 
 ## Async and resume options
