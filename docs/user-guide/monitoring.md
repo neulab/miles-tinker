@@ -48,7 +48,8 @@ should be supplied via Ray's `env_vars` rather than baked into the launch script
 
 When `--use-rollout-logprobs` is enabled, mismatch metrics still compare
 independently scored trainer probabilities with the recorded rollout probabilities.
-With `--skip-actor-forward-only`, they reuse the current training forward pass;
+Without cached trainer scores, including `--skip-actor-forward-only`, they reuse
+the current training forward pass without changing the policy loss or gradients;
 in async runs this difference includes policy staleness as well as numerical
 differences. `entropy_loss=0` is a placeholder when entropy observation and its
 coefficient are both disabled; enable `--observe-training-entropy` to measure it.
