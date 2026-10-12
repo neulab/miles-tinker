@@ -88,9 +88,13 @@ async def train(args):
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
 
-        # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
+        # Fully async already has a persistent producer. Drain only after
+        # publication so selection/checkpoint counters and staleness are not
+        # advanced by an additional untrained lookahead batch.
+        if not args.fully_async and rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+        elif args.fully_async:
+            rollout_data_next_future = None
 
         if args.use_critic:
             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
@@ -136,6 +140,9 @@ async def train(args):
                 rollout_id,
             )
             break
+
+        if args.fully_async and rollout_id + 1 < args.num_rollout:
+            rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
     await eval_dispatcher.drain()
     await rollout_executor.dispose.remote()

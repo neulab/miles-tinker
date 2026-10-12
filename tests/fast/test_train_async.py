@@ -24,6 +24,7 @@ def _make_args(**overrides: Any) -> SimpleNamespace:
         eval_overflow_policy="skip",
         eval_uses_snapshots=True,
         ft_components=[],
+        fully_async=False,
         hf_checkpoint=None,
         keep_old_actor=False,
         num_critic_only_steps=0,
@@ -194,5 +195,18 @@ def test_resumed_initial_eval_exports_loaded_actor(monkeypatch):
         monkeypatch.setattr(train_async_driver, "EvalDispatcher", Dispatcher)
         await train_async_driver.train(args)
         assert calls == [(19, {"force": True})]
+
+    asyncio.run(run())
+
+
+def test_fully_async_drains_next_batch_after_weight_publication(monkeypatch):
+    async def run():
+        args = _make_args(num_rollout=2, fully_async=True)
+        events = []
+        components = _install_driver_fakes(monkeypatch, args, events)
+        await train_async_driver.train(args)
+        assert events.index("actor_train:0") < events.index("generate_start:1")
+        assert events.index("update_weights:0") < events.index("generate_start:1")
+        assert components.actor_model.trained == [0, 1]
 
     asyncio.run(run())

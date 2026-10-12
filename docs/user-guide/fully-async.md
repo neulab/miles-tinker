@@ -367,3 +367,9 @@ forwards metrics elsewhere should return `False` and leave the built-in logging 
 place. To change which numbers the buffer reports in the first place, override
 `get_metrics()` on a custom buffer instead, as described in
 [Arguments: Buffer options](#arguments-buffer-options).
+
+The fully async driver drains each batch after the preceding weight publication.
+Its background producer still generates throughout actor updates; avoiding an
+extra prefetched drain keeps selected-group counters aligned with optimizer
+checkpoints and avoids adding another policy step to buffer staleness when publishing
+weights every update.
