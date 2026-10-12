@@ -33,7 +33,7 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
 from miles.utils.timer import timer
-from miles.utils.tracking_utils.tracking import init_tracking
+from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -109,6 +109,7 @@ class RolloutExecutor:
             self._metric_checker.dispose()
         if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
             self.eval_generate_rollout.dispose()
+        finish_tracking()
 
     # -------------------------- data generation -----------------------------
 

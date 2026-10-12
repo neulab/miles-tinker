@@ -20,6 +20,7 @@ from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
 from miles.utils.test_utils.fault_injector import inject_fault as _inject_fault
+from miles.utils.tracking_utils.tracking import finish_tracking
 
 if TYPE_CHECKING:
     from miles.ray.rollout.inference_controller import UpdatableEngines
@@ -152,6 +153,9 @@ class TrainRayActor(NodeProbeMixin):
 
     def kill_self(self) -> None:
         os._exit(1)
+
+    def finish_tracking(self) -> None:
+        finish_tracking()
 
     def clear_memory(self):
         print_memory("before TrainRayActor.clear_memory")

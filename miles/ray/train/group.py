@@ -156,6 +156,19 @@ class TrainerController:
         if (disposer := self._watcher_disposer) is not None:
             await disposer()
             self._watcher_disposer = None
+        # Flush secondary writers before the driver finishes its primary run.
+        # Fault termination still uses kill_self without waiting on logging.
+        results = await asyncio.gather(
+            *[
+                asyncio.wait_for(cell.execute("finish_tracking", kill_on_failure=False), timeout=30)
+                for cell in self._cells
+                if cell.is_alive
+            ],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("Trainer tracking shutdown failed: %r", result)
 
     # ------------------------ API :: train ------------------------
 
