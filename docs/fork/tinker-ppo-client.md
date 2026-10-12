@@ -37,7 +37,7 @@ python3 tools/amd_tinker.py serve \
   --root "$PPO_ROOT" --model-family qwen3 \
   --model-id Qwen/Qwen3-4B --model-type qwen3-4B \
   --train-gpus 4 --rollout-gpus 4 --tp 1 --pp 1 --cp 1 \
-  --mem-fraction 0.9 --keep-checkpoints 3 \
+  --mem-fraction 0.95 --keep-checkpoints 3 \
   --checkpoint-root "$PPO_ROOT/runs/$PPO_RUN/checkpoints" -- \
   --bf16 --megatron-to-hf-mode bridge \
   --tinker-enable-critic --no-offload-train --balance-data \
