@@ -37,7 +37,7 @@ python3 tools/amd_tinker.py serve \
   --root "$PPO_ROOT" --model-family qwen3 \
   --model-id Qwen/Qwen3-4B --model-type qwen3-4B \
   --train-gpus 4 --rollout-gpus 4 --tp 1 --pp 1 --cp 1 \
-  --mem-fraction 0.95 --keep-checkpoints 3 \
+  --mem-fraction 0.95 --keep-checkpoints 3 --modal-relay \
   --checkpoint-root "$PPO_ROOT/runs/$PPO_RUN/checkpoints" -- \
   --bf16 --megatron-to-hf-mode bridge \
   --tinker-enable-critic --no-offload-train --balance-data \
@@ -55,10 +55,16 @@ python3 tools/amd_tinker.py serve \
 | `--rollout-temperature` omitted | Keep the server default of `1.0`; the client's sampling temperature must match. |
 | `--balance-data` | Balance training sequences across ranks. |
 | `--keep-checkpoints 3` | Retain three checkpoints per model, including across resume. |
+| `--modal-relay` | Expose the endpoint through an authenticated Modal HTTPS relay. |
 
 BF16, activation recomputation, and inference memory fraction are retained from
 the tested launch. Request capacity uses the launcher's default of 128. Server logs are under
 `$PPO_ROOT/runs/$PPO_RUN/checkpoints/logs/`.
+
+For remote clients, use the `TINKER_BASE_URL` and `TINKER_API_KEY` printed by
+the launcher. Pass that URL as the client's `--base-url` and forward that key
+into its environment. The local client example below connects directly to
+`127.0.0.1` and uses a local tenant key.
 
 ## Client — terminal 2
 
