@@ -665,6 +665,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "operation of size over_sampling_batch_size will be triggered."
                     "Regardless of whether partial rollout is used or filters are applied, "
                     "the sampling granularity is always determined by this value. "
+                    "Any positive size is valid, including sizes smaller than rollout_batch_size. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
                 ),
             )
