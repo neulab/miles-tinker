@@ -62,9 +62,13 @@ async def train(args):
 
     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
 
-    if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
+    if args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
-        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+        if args.start_rollout_id == 0:
+            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+        else:
+            # Evaluate the loaded actor, not the original pretrained weights.
+            await eval_dispatcher.dispatch(args.start_rollout_id - 1, force=True)
 
     async def save_training_model(model, rollout_id, force_sync):
         if args.use_critic and args.offload_train:

@@ -74,11 +74,11 @@ def _patch_single_rank_loss_helpers(monkeypatch):
             torch.tensor([0.50, 1.00], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.0,
+            0.45,
         ),
     ],
 )
-def test_train_rollout_logprob_abs_diff_uses_policy_loss_reference_logprobs(
+def test_train_rollout_logprob_abs_diff_uses_independent_trainer_scores(
     monkeypatch,
     use_rollout_logprobs: bool,
     train_log_probs: torch.Tensor,
@@ -366,3 +366,27 @@ def test_masked_nonfinite_ppo_terms_do_not_poison_policy_loss(monkeypatch):
 
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["ppo_kl"])
+
+
+def test_skip_forward_mismatch_uses_current_scores_and_masks_tool_tokens(monkeypatch):
+    args = _make_args(use_rollout_logprobs=True)
+    args.skip_actor_forward_only = True
+    batch = _make_batch(
+        old_log_probs=torch.tensor([0.1, 0.2]),
+        rollout_log_probs=torch.tensor([0.4, 0.8]),
+    )
+    batch.pop("log_probs")
+    batch["loss_masks"] = [torch.tensor([1.0, 0.0])]
+    current = torch.tensor([0.7, 9.0], requires_grad=True)
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None)))
+    _patch_single_rank_loss_helpers(monkeypatch)
+    monkeypatch.setattr(loss_utils, "get_log_probs_and_entropy", lambda *a, **kw: {"log_probs": [current]})
+    _, metrics = loss_utils.policy_loss_function(
+        args,
+        batch,
+        logits=torch.zeros((1, 3, 8)),
+        sum_of_sample_mean=lambda value: value.float().sum(),
+    )
+    torch.testing.assert_close(metrics["train_rollout_logprob_abs_diff"], torch.tensor(0.3))
+    assert not metrics["train_rollout_logprob_abs_diff"].requires_grad
+    assert metrics["train_rollout_kl"] > 0

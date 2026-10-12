@@ -46,6 +46,13 @@ should be supplied via Ray's `env_vars` rather than baked into the launch script
 | `rollout_time` / `train_time` | Roughly balanced | One ≫ other → resource imbalance |
 | `train/pg_clipfrac` | < 0.2 | > 0.5 means policy is moving fast → drop LR |
 
+When `--use-rollout-logprobs` is enabled, mismatch metrics still compare
+independently scored trainer probabilities with the recorded rollout probabilities.
+With `--skip-actor-forward-only`, they reuse the current training forward pass;
+in async runs this difference includes policy staleness as well as numerical
+differences. `entropy_loss=0` is a placeholder when entropy observation and its
+coefficient are both disabled; enable `--observe-training-entropy` to measure it.
+
 Panel names follow what `loss.py` and the rollout logger emit; Miles's wandb metrics
 live under `train/`, `rollout/`, `perf/`, `multi_turn/`, `passrate/` namespaces.
 
