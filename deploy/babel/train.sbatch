@@ -1,6 +1,7 @@
 #!/bin/bash
 # Serve the gateway and train number-search against it in one job. Submit from the repository root:
-#   sbatch deploy/babel/train.sbatch [client options], e.g. --steps 2 for a smoke test.
+#   IMAGE=<sif> sbatch deploy/babel/train.sbatch [client options], e.g. --steps 2 for a smoke test.
+# IMAGE is a local SIF cached with deploy/babel/image.sbatch.
 # The only file that uses both deploy/babel/server.py and deploy/babel/client/.
 # Export WANDB_API_KEY before submission, or have an existing W&B login.
 #SBATCH --job-name=miles-babel
@@ -15,12 +16,13 @@
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
+IMAGE="${IMAGE:?set IMAGE to a local SIF cached with deploy/babel/image.sbatch}"
 WORK="${SLURM_SUBMIT_DIR}/.cache/babel"
 NAME="number-search-${SLURM_JOB_ID}"
 ENDPOINT="${WORK}/endpoints/${NAME}.endpoint"
 
 # Full fine-tuning of Qwen3-4B on two learner and two rollout GPUs.
-srun python deploy/babel/server.py --work-dir "${WORK}" --name "${NAME}" --use-fa2 \
+srun python deploy/babel/server.py --image "${IMAGE}" --work-dir "${WORK}" --name "${NAME}" --use-fa2 \
   --mode full --tp 1 --max-tokens-per-gpu 1024 \
   --extra-args "--chunked-optimizer-state-offload --optimizer-state-offload-chunk-size-mb 64 --sglang-device cuda" &
 SERVER=$!

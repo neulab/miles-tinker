@@ -1,6 +1,7 @@
 #!/bin/bash
 # Serve the Tinker gateway until the time limit or scancel. Submit from the repository root:
-#   sbatch deploy/babel/server.sbatch [server.py options] [gateway options]
+#   sbatch deploy/babel/server.sbatch --image <sif> [server.py options] [gateway options]
+# The SIF comes from deploy/babel/image.sbatch.
 # The endpoint appears in .cache/babel/endpoints/<name>.endpoint once the gateway is healthy.
 # Adjust the resource requests below; keep one task per node.
 #SBATCH --job-name=miles-gateway

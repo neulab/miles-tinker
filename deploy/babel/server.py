@@ -7,9 +7,10 @@ head and the gateway (``container/serve.py``). The other tasks wait for that
 venv and join as Ray workers. Once the gateway is healthy its URL is written to
 ``<work-dir>/endpoints/<name>.endpoint``; clients only need that URL.
 
-Requires ``apptainer`` on PATH and a shared ``--work-dir`` for multi-node jobs.
+Requires ``apptainer`` on PATH, a local SIF image (``--image``; cache the pinned
+image with ``image.py`` first) and a shared ``--work-dir`` for multi-node jobs.
 
-Usage: python deploy/babel/server.py [options] [gateway options]
+Usage: python deploy/babel/server.py --image <sif> [options] [gateway options]
 Unrecognised options go to ``container/serve.py`` and ``container/gateway.py``,
 e.g. ``--mode full --model-name Qwen/Qwen3-1.7B --megatron-model-type qwen3-1.7B``.
 """
@@ -31,13 +32,13 @@ CONTAINER_WORK = "/run/miles"
 CONTAINER_VENV = f"{CONTAINER_WORK}/venv"
 CONTAINER_SCRIPTS = f"{CONTAINER_REPO}/deploy/babel/container"
 WORK_SUBDIRS = ("home", "models", "data", "output", "endpoints")
-# radixark/miles:latest (CUDA 13) that this fork's SGLang integration was tested against. The tag
-# moves daily; a newer SGLang can break the gateway, so update the digest deliberately.
-DEFAULT_IMAGE = "docker://radixark/miles@sha256:37945072c6cfd99cedb4368a2f14bf72a9bafd032bb9ba33e5c5f0add444febe"
 
 
 def main() -> None:
-    args, serve_args = _parser().parse_known_args()
+    parser = _parser()
+    args, serve_args = parser.parse_known_args()
+    if not Path(args.image).is_file():
+        parser.error(f"--image must be a local SIF file; {args.image} is not. Cache one with deploy/babel/image.py.")
     work = args.work_dir.resolve()
     node_tmp = _node_tmp()
     apptainer, env = _apptainer_prefix(work=work, node_tmp=node_tmp, image=args.image)
@@ -67,10 +68,10 @@ def main() -> None:
 def _parser() -> argparse.ArgumentParser:
     job = os.environ.get("SLURM_JOB_ID")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--image", default=DEFAULT_IMAGE, help="Miles image URI or local SIF path.")
+    parser.add_argument("--image", required=True, help="Local Miles SIF (deploy/babel/image.py).")
     parser.add_argument("--work-dir", type=Path, default=Path("/tmp") / f"miles-{os.getuid()}")
     parser.add_argument("--name", default=f"gateway-{job or 'local'}", help="Endpoint file and output directory name.")
-    parser.add_argument("--port", type=int, help="Gateway port; defaults to 20000 + job id % 20000, or a free port.")
+    parser.add_argument("--port", type=int, help="Gateway port; defaults to 20000 + job id %% 20000, or a free port.")
     parser.add_argument("--use-fa2", action="store_true", help="Use FlashAttention 2 in Transformer Engine on SM8x.")
     parser.add_argument("--dry-run", action="store_true", help="Print the container commands and exit.")
     return parser
@@ -113,8 +114,6 @@ def _apptainer_prefix(*, work: Path, node_tmp: Path, image: str) -> tuple[list[s
         argv += ["--bind", f"{work / name}:{destination}"]
     if Path("/dev/infiniband").exists():
         argv += ["--bind", "/dev/infiniband"]
-    if "://" not in image:
-        image = str(Path(image).resolve())
     settings = {
         "PYTHONPATH": f"{CONTAINER_REPO}:/root/Megatron-LM",
         "PYTHONNOUSERSITE": "1",
@@ -127,10 +126,9 @@ def _apptainer_prefix(*, work: Path, node_tmp: Path, image: str) -> tuple[list[s
     }
     # Inherit the launch environment, including GPU selection and network settings.
     env = os.environ.copy()
-    env.setdefault("APPTAINER_CACHEDIR", str(work / "apptainer-cache"))
     for key, value in settings.items():
         env.setdefault(f"APPTAINERENV_{key}", os.environ.get(key, value))
-    return [*argv, image], env
+    return [*argv, str(Path(image).resolve())], env
 
 
 def _prepare_venv(setup: list[str], *, env: dict[str, str], ready: Path, timeout: float = 3600) -> None:

@@ -96,7 +96,7 @@ G8, G11, G12, G13, G16, G17 and G19.
 | `tests/fast/fork/` | tests for the sync tool and the ABCI launcher | no |
 | `.claude/skills/upstream-sync/` | Claude Code skill wrapping the sync tool and the conflict policy | no |
 | `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node, `CLIENT_SCRIPT` runs the client on the head node and the job ends when it exits), `clients/*.sh` ready-made client scripts, `pull_image.pbs`, `smoke_container.pbs`, README runbook; still pinned to the pre-sync image | no |
-| `deploy/babel/` | Babel Tinker gateway (Slurm + Apptainer, one or more nodes) and a separable Platoon client | no |
+| `deploy/babel/` | Babel Tinker gateway (Slurm + Apptainer, one or more nodes) run from a SIF cached by `image.py`, and a separable Platoon client | no |
 | `deploy/clients/` | client launchers (refuse login nodes via `hostguard`; run them through `CLIENT_SCRIPT`): cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | ABCI's launcher for the gateway (lora/full) on 8 + 8 GPUs; still calls the pre-sync `command_utils.execute_train` and needs porting to `create_backend().execute_train` (see `deploy/babel/container/gateway.py`) | maybe (as `examples/tinker/`) once FFT lands upstream |
 | `docs/fork/` | fork overview, full fine-tuning semantics, acceptance procedure | no |

@@ -2,8 +2,9 @@
 
 The deployment has two independent parts that only share an HTTP URL:
 
+- **Image** (`image.py`, `image.sbatch`): caches the pinned Miles Apptainer image as a local SIF.
 - **Server** (`server.py`, `server.sbatch`, `container/`): the Miles Tinker gateway on one or
-  more GPU nodes, inside the Miles Apptainer image.
+  more GPU nodes, inside that SIF.
 - **Client** (`client/`): Platoon number-search training against any gateway URL. It needs no
   GPU, no container and nothing else from this repository; delete the directory, and
   `train.sbatch`, if you do not need it.
@@ -17,10 +18,22 @@ The deployment has two independent parts that only share an HTTP URL:
 - Export `WANDB_API_KEY` before submitting a client, or have an existing W&B login; batch
   jobs cannot answer login prompts.
 
+## Cache the image
+
+```bash
+sbatch deploy/babel/image.sbatch --output /path/to/miles.sif
+```
+
+Pulls the image pinned in `image.py` (`IMAGE`). The download, unpacking and conversion happen in
+a temporary directory under `--scratch` (default `/scratch/$USER`, local disk), which is deleted
+once the finished SIF has been moved to `--output`. The server only runs
+from a local SIF; put it where every GPU node can read it. The `latest` tag moves daily and newer
+SGLang releases can break the gateway, so change the pin deliberately; `--image` pulls another URI.
+
 ## One job: serve and train
 
 ```bash
-sbatch deploy/babel/train.sbatch            # 100 steps; --steps 2 for a smoke test
+IMAGE=/path/to/miles.sif sbatch deploy/babel/train.sbatch   # 100 steps; --steps 2 for a smoke test
 ```
 
 One node with four GPUs fully fine-tunes Qwen3-4B-Instruct-2507 (two learner and two rollout
@@ -30,7 +43,7 @@ exits. Logs: `babel-<jobid>.log`; outputs: `.cache/babel/output/`.
 ## Serve only
 
 ```bash
-sbatch deploy/babel/server.sbatch --use-fa2 --mode full --max-tokens-per-gpu 1024
+sbatch deploy/babel/server.sbatch --image /path/to/miles.sif --use-fa2 --mode full --max-tokens-per-gpu 1024
 ```
 
 The gateway serves until the time limit or `scancel`. Once it is healthy its URL is written to
@@ -45,9 +58,8 @@ Server options (`python deploy/babel/server.py --help`):
   A6000, L40S). The image's FlashAttention 4 has no backward pass there, so training needs this
   flag on those GPUs; newer GPUs keep their backend.
 - `--port`: defaults to `20000 + jobid % 20000`.
-- `--image`: defaults to a pinned `radixark/miles` digest (`DEFAULT_IMAGE` in `server.py`). The
-  `latest` tag moves daily and newer SGLang releases can break the gateway, so change the pin
-  deliberately. A local SIF path also works and skips the pull.
+- `--image` (required): the local SIF from [Cache the image](#cache-the-image). Anything else,
+  including a `docker://` URI, is rejected.
 - `--work-dir`, `--dry-run`.
 
 Every other option configures the gateway (`container/gateway.py`):
@@ -67,7 +79,7 @@ Every other option configures the gateway (`container/gateway.py`):
 Edit `#SBATCH --nodes` in `server.sbatch`, or override it:
 
 ```bash
-sbatch --nodes=2 deploy/babel/server.sbatch --use-fa2 --mode lora
+sbatch --nodes=2 deploy/babel/server.sbatch --image /path/to/miles.sif --use-fa2 --mode lora
 ```
 
 The first task builds the server venv and runs the Ray head and the gateway; the others join
