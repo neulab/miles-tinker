@@ -114,6 +114,10 @@ def _apptainer_prefix(*, work: Path, node_tmp: Path, image: str) -> tuple[list[s
         argv += ["--bind", f"{work / name}:{destination}"]
     if Path("/dev/infiniband").exists():
         argv += ["--bind", "/dev/infiniband"]
+    # A host UV_CACHE_DIR is passed through below; bind it at the same path so it resolves inside.
+    if uv_cache := os.environ.get("UV_CACHE_DIR"):
+        Path(uv_cache).mkdir(parents=True, exist_ok=True)
+        argv += ["--bind", str(Path(uv_cache).resolve())]
     settings = {
         "PYTHONPATH": f"{CONTAINER_REPO}:/root/Megatron-LM",
         "PYTHONNOUSERSITE": "1",
