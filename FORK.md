@@ -68,6 +68,7 @@ the rationale column of this table, so keep one row per file or directory
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
 | `miles/backends/megatron_utils/full/` | full fine-tuning (E7): `actor.py` (`FullTinkerTrainRayActor`, the multi-LoRA actor's command surface) and `model.py` (deferred `finalize_model_grads` to optim_step, AdamParams per step, non-finite veto, Megatron dist-ckpt save/load with `META.json`, reset to base, forward-only scoring) | yes |
+| `miles/backends/megatron_utils/model.py` | `get_optimizer_param_scheduler` returns `None` under `serve`: the gateway has no iteration schedule (AdamParams arrive per optim_step) and no `num_rollout` / `rollout_batch_size`. Upstream only needs it for the multi-LoRA path, which returns before the scheduler; full fine-tuning builds the pool optimizer and reaches it | yes |
 | `miles/backends/megatron_utils/adam_params.py` | per-step AdamParams, clip and veto helpers for the full model | yes |
 | `miles/backends/megatron_utils/tinker_perf.py` | per optim window MFU bookkeeping (`actor_train_*`) from `Timer().seq_lens` | yes |
 | `miles/backends/megatron_utils/lora/model.py`, `miles/backends/megatron_utils/lora/actor.py` | training passes and optimizer steps timed under `actor_train`; optim_step attaches the window's perf metrics (E5) | yes |

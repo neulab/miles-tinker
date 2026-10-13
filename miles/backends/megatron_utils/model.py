@@ -86,6 +86,9 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     Returns:
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
+    if args.entry == "serve":
+        # no iteration schedule in the gateway; AdamParams arrive per optim_step
+        return None
     # Iteration-based training.
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     if args.lr_decay_iters is None:
