@@ -55,6 +55,8 @@ def _config(args, layer: str, cp: int, mode: str | None) -> TransformerConfig:
         hidden_size=args.hidden,
         num_attention_heads=16,
         num_query_groups=4,
+        attention_dropout=0.0,  # as the gateway trains (--attention-dropout 0.0 --hidden-dropout 0.0)
+        hidden_dropout=0.0,
         cp_partition_mode="zigzag",
         context_parallel_size=cp,
         normalization="RMSNorm",
