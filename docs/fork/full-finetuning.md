@@ -318,6 +318,17 @@ grad_norm ratio of 2 or more. Use the default natural-text datums. On random
 tokens the gradient norm moves 8% just from TP1 to TP2, which hides real
 differences.
 
+Give the CP=1 reference the candidate's row budget per microbatch,
+`--max-tokens-per-gpu` = CP x the candidate's per-rank budget (8448 against
+the CP2 recipe above, whose per-rank default is 4224; the CP=1 default is
+8193), so that both runs pack the datum set alike. The packing moves the
+numbers even at CP=1. Going from 8193 to 8448 puts each DP rank's share of
+the datum set in one microbatch instead of two, so the short datums share a
+microbatch with a long row, and the step-1 grad_norm moves by 0.31%. Forward
+logprobs move by mean 9e-4 overall and by up to 0.29 on rows of 512 tokens
+or fewer, while the rows of 1000 tokens and up and the datums sent alone
+agree to 1e-6.
+
 Boundaries depend on the layer type. Ring attention and the MRoPE positions
 see each datum's zigzag chunk boundaries. Chunkwise GatedDeltaNet layers see a
 contiguous split of the whole packed row into CP parts, where the recurrent
@@ -354,8 +365,21 @@ Validation (Qwen3.5-4B, v25 image, one H200 node training + one engine node,
 | GatedDeltaNet split windows (lone datums, chunkwise) | mean abs delta at the splits 3.6e-5 (CP2) and 4.3e-4 (CP4) against 8.6e-3 and 6.9e-3 elsewhere in those rows: no handoff error |
 | GatedDeltaNet layer probe (`tools/fork/gdn_cp_grad_probe.py`, CP 2/4/8, loss after the CP split) | every parameter gradient and the pre-split input gradients match no CP at cosine >= 0.99996 in both modes; pre-split input-gradient norm ratio 0.9995-0.9996 chunkwise, 0.9999-1.0000 headwise |
 | Attention layer probe (ring attention p2p, CP 2/4/8, logit std 1 and 8) | every gradient and the outputs match no CP at cosine >= 0.99994, norm ratios within 0.06% |
-| Step-1 `cross_entropy` grad_norm vs CP1 (same weights) | TP2 1.000004; headwise CP2 1.0023, CP4 1.0016, CP8 1.0019; chunkwise CP2 1.0030, CP4 1.0020 |
-| Open | the step-1 grad_norm sits 0.16-0.30% above CP1 at every CP size and in both GDN modes, far above TP2's 0.0004% but well inside the 2% gate. Neither layer type shows it on its own (the probes above), so it comes from elsewhere in the CP model; finding it needs a per-parameter gradient comparison of the full model |
+| Step-1 `cross_entropy` grad_norm vs CP1 (same weights) | TP2 1.000004; headwise CP2 1.0023, CP4 1.0016, CP8 1.0019; chunkwise CP2 1.0030, CP4 1.0020 (against a CP1 reference packed at 8193 tokens per microbatch; see the third round) |
+
+Third round (head 14025130; jobs 2635003 = CP1/DP8 at `--max-tokens-per-gpu
+8448` and 2635004 = CP2/DP4 headwise at 4224, run at the same time; both
+under `cp-v3-4b-*`). The CP>1 runs of round two had packed 8448 to 9216
+tokens per microbatch, while their CP1 reference used 8193.
+
+| Check | Result |
+|---|---|
+| `compare <cp1> <cp2>` (no noise run) | PASS. Forward mean abs 3.3e-3, p99 0.059, trimmed KL 7.8e-5, short rows max 0.23; step-1 per-datum loss within 0.021 (sum 89.649 vs 89.644); logprobs after the three steps mean abs 7.8e-3, KL 4.7e-4 |
+| Step-1 grad_norm at the same weights, CP2/CP1 | 0.9993 on the parity datums, 0.9996 on the on-policy probe's datums, 0.9995 on the SDK smoke's datums. Steps 2 and 3 of the parity probe: 0.932 and 0.980 (CP1 alone moved 8.4% at step 2 between the two packings) |
+| Step-1 grad_norm offset of round two | Packing, not CP. Against the 8448 reference, round two's chunkwise CP2 dump is at 0.9999. The CP4 and CP8 runs (8704 and 9216 tokens per microbatch) are at 0.9984-0.9989: below this reference, where they had been above the 8193 one, and within the 0.31% that the packing moves CP1. TP2 at 8193 keeps the short datums apart from the long rows, as its CP1 reference does, hence its 1.000004. A rerun of the CP2 config reproduced the forward logprobs to 1e-6 and the step-1 grad_norm to 1.4e-4 |
+| Boundary windows | the pooled window/interior ratio is 3.87 (gate 4). Per row, each window matches its own row's interior (for example 2.0e-2 vs 2.2e-2 at 127 tokens, 2.6e-5 vs 2.6e-3 at 8191), and nothing peaks at the boundary token. The pooled ratio puts the windows of the short rows, where deltas are larger, against the interior of the long rows |
+| Sampler vs trainer, SDK smoke, weight push | KL 2.9e-4 (CP1) and 2.8e-4 (CP2); 0 failed SDK checks on both, including named `save_state` and resume with optimizer; `--check-weight-update-equal` at CP2: all 8 engines equal |
+| Peak memory per rank (`perf.jsonl`, maximum over ranks) | 44.3 GiB allocated / 46.7 GiB reserved at CP1 with 8448 tokens; 39.9 / 41.9 GiB at CP2 with 4224 tokens per rank |
 
 Thresholds of `compare` are calibrated so that correct layouts on natural
 text pass with and without `--noise`: mean abs 0.03, p99 0.2, trimmed KL

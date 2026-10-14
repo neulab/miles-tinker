@@ -6,6 +6,8 @@
 # multiplier and model id come from head.log; PARITY_OUT (default $JOBDIR/parity-cp<N>.json) receives the dump.
 # Compare the dumps of a CP=1, a CP=N and a TP2 (noise reference) gateway with
 #   python3 deploy/clients/tinker_cp_parity.py compare <cp1.json> <cpN.json> --noise <tp2.json>
+# Give the CP=1 gateways --max-tokens-per-gpu = N x the CP=N per-rank budget (8448 against CP2 at
+# --context-len 8192): the packing alone moves the step-1 grad_norm 0.3% (docs/fork/full-finetuning.md).
 set -euo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true; module load python/3.12/3.12.9 2>/dev/null || true
 PY=${COOKBOOK_PYTHON:-/home/aci18912it/miles-tinker/cookbook-venv/bin/python}
