@@ -279,3 +279,67 @@ def test_serve_side_flags_are_rejected_by_the_typer_cli(launcher, monkeypatch):
     result, captured = _invoke_serve(launcher, monkeypatch, ["--check-weight-update-equal", "--tinker-r3-check"])
     assert result.exit_code == 2 and "No such option: --tinker-r3-check" in result.output
     assert not captured, "execute_train must not run"
+
+
+# --- context parallelism (--cp) and the Qwen3.5-4B recipe ----------------------------------------
+
+
+def test_cp_sizes_the_per_rank_budget(launcher, monkeypatch):
+    argv = _serve_argv(launcher, monkeypatch, cp=2)
+    assert _flag(argv, "--context-parallel-size") == "2"
+    # one 65537-token row: 2 * ceil(65537 / 4) = 32770 tokens per rank, padded to 128
+    assert _flag(argv, "--max-tokens-per-gpu") == "32896"
+    assert "--linear-cp-mode" not in argv, "the bridge provider keeps Megatron's chunkwise default"
+    argv = _serve_argv(
+        launcher, monkeypatch, cp=8, context_len=131072, max_tokens_per_datum=131073, linear_cp_mode="headwise"
+    )
+    assert _flag(argv, "--max-tokens-per-gpu") == "16512" and _flag(argv, "--linear-cp-mode") == "headwise"
+    assert _flag(argv, "--tinker-max-tokens-per-datum") == "131073"
+
+
+@pytest.mark.parametrize(
+    "variant, tp, cp, expected", [("27b", 4, 2, 66048), ("27b", 4, 4, 33280), ("35b-a3b", 1, 8, 16512)]
+)
+def test_cp_budgets_for_128k_rows(launcher, variant, tp, cp, expected):
+    """docs/fork/full-finetuning.md: the per-rank budgets of the H100 layouts for 131073-token rows."""
+    args = launcher.ScriptArgs(model_variant=variant, tp=tp, cp=cp, context_len=131072)
+    assert args.max_tokens_per_gpu == expected
+
+
+def test_cp_rejects_a_budget_that_cannot_hold_one_row(launcher):
+    with pytest.raises(AssertionError, match="cannot hold the --cp 2 shard of one 65537-token row"):
+        launcher.ScriptArgs(cp=2, max_tokens_per_gpu=32768)
+    launcher.ScriptArgs(cp=2, max_tokens_per_gpu=32896)
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(cp=0)
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(linear_cp_mode="ringwise")
+
+
+def test_qwen35_4b_recipe(launcher, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(
+        hf_checkpoint="/x/hf",
+        checkpoint_root="/x/ckpt",
+        model_variant="4b",
+        cp=2,
+        context_len=8192,
+        max_tokens_per_datum=8193,
+        actor_num_nodes=1,
+        rollout_num_gpus=8,
+    )
+    assert captured["megatron_model_type"] == "qwen3.5-4B"
+    argv = shlex.split(captured["train_args"])
+    assert _flag(argv, "--tinker-base-model") == "Qwen/Qwen3.5-4B"
+    # tied embeddings: the standard head scores, and the engines keep their default head to match it
+    assert "--fused-lm-head-logprobs" not in argv and _flag(argv, "--log-probs-chunk-size") == "2048"
+    assert "--sglang-enable-fp32-lm-head" not in argv and "--use-rollout-routing-replay" not in argv
+    assert _flag(argv, "--rollout-num-gpus-per-engine") == "1" and _flag(argv, "--sglang-ep-size") == "1"
+    assert _flag(argv, "--tensor-model-parallel-size") == "1" and _flag(argv, "--context-parallel-size") == "2"
+    assert _flag(argv, "--max-tokens-per-gpu") == "4224"  # 2 * ceil(8193 / 4) = 4098, padded to 128
+    assert _flag(argv, "--mtp-num-layers") == "0" and "--freeze-vision-model" in argv
+    fields = _server_args_fields()
+    assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+    with pytest.raises(AssertionError, match="no expert routes"):
+        launcher.ScriptArgs(model_variant="4b", routing_replay=True)

@@ -49,6 +49,7 @@ def validate_tinker_serve_args(args) -> None:
     assert (
         args.context_parallel_size == 1
     ), "the Tinker gateway returns per-datum logprobs; context parallelism is not supported"
+    _validate_datum_token_cap(args)
     assert (
         args.rollout_temperature == 1.0
     ), "the Tinker gateway scores logprobs at --rollout-temperature; Tinker semantics are untempered (keep 1.0)"
@@ -62,9 +63,57 @@ def validate_tinker_serve_args(args) -> None:
         _validate_fused_lm_head(args)
 
 
+def _validate_datum_token_cap(args) -> None:
+    """A datum trains as one sequence, so one microbatch of ``--max-tokens-per-gpu`` must hold
+    this rank's share of the longest one.
+
+    Under CP each rank keeps two equal zigzag chunks, padded to a multiple of
+    TP*``--data-pad-size-multiplier`` (get_batch), so the longest datum is
+    ``CP * floor(max_tokens_per_gpu / pad) * pad`` (the cap of radixark/miles #3320); the
+    budget is per rank and easy to leave at its CP=1 value, so a longer cap is an error. At
+    CP=1 rows up to the budget have always run (their padding block on top), so only a cap
+    above the budget itself is reported, as a warning.
+    """
+    max_tokens_per_gpu = getattr(args, "max_tokens_per_gpu", None)
+    max_tokens_per_datum = getattr(args, "tinker_max_tokens_per_datum", None)
+    if max_tokens_per_gpu is None or max_tokens_per_datum is None:
+        return
+    cp = args.context_parallel_size
+    if cp == 1:
+        if max_tokens_per_datum > max_tokens_per_gpu:
+            logger.warning(
+                f"--tinker-max-tokens-per-datum {max_tokens_per_datum} exceeds --max-tokens-per-gpu "
+                f"{max_tokens_per_gpu}: such a datum trains alone in an oversized microbatch"
+            )
+        return
+    pad = args.tensor_model_parallel_size * getattr(args, "data_pad_size_multiplier", 128)
+    limit = max_datum_tokens(max_tokens_per_gpu, cp, pad)
+    assert max_tokens_per_datum <= limit, (
+        f"--tinker-max-tokens-per-datum {max_tokens_per_datum} exceeds the {limit} tokens one microbatch of "
+        f"--max-tokens-per-gpu {max_tokens_per_gpu} holds per rank at --context-parallel-size {cp} (two zigzag "
+        f"chunks padded to a multiple of {pad}); a full-length datum needs --max-tokens-per-gpu >= "
+        f"{cp_shard_tokens(max_tokens_per_datum, cp, pad)}"
+    )
+
+
+def cp_shard_tokens(row_tokens: int, cp: int, pad: int) -> int:
+    """Tokens one CP rank holds for a ``row_tokens`` row: two equal zigzag chunks, padded to a multiple of ``pad``."""
+    shard = 2 * -(-row_tokens // (2 * cp))
+    return -(-shard // pad) * pad
+
+
+def max_datum_tokens(max_tokens_per_gpu: int, cp: int, pad: int) -> int:
+    """The longest row whose CP shard fits one microbatch of ``max_tokens_per_gpu`` tokens per rank."""
+    return cp * (max_tokens_per_gpu // pad * pad)
+
+
 def _validate_routing_replay(args) -> None:
     """R3 through the gateway: the routing cache stores one expert id per (token, layer, slot)."""
     assert getattr(args, "num_experts", None), "--use-rollout-routing-replay needs an MoE model (--num-experts)"
+    assert not getattr(args, "moe_router_fusion", False), (
+        "--use-rollout-routing-replay replays the rollout routing through the unfused MoE top-k; with "
+        "--moe-router-fusion the fused kernel returns before the replay hook and the routing is ignored"
+    )
     assert not getattr(args, "sglang_speculative_algorithm", None), (
         "--use-rollout-routing-replay through the Tinker gateway does not support speculative decoding "
         "(the engines' routed-experts capture is target-only and its buffer ignores verify tokens); "
@@ -80,9 +129,9 @@ def _validate_routing_replay(args) -> None:
 
 def _validate_fused_lm_head(args) -> None:
     """The fused chunked head only yields target-token logprobs of the policy loss."""
-    assert not getattr(args, "use_rollout_entropy", False), (
-        "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
-    )
+    assert not getattr(
+        args, "use_rollout_entropy", False
+    ), "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
     assert (
         getattr(args, "loss_type", "policy_loss") == "policy_loss"
     ), f"--fused-lm-head-logprobs serves policy_loss only, got --loss-type {args.loss_type!r}"

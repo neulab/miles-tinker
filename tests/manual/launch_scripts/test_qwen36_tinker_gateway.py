@@ -14,7 +14,7 @@ from tests.fast.launch_scripts.sh_harness import REPO_ROOT, assert_matches_snaps
 _LAUNCHER = "examples/tinker/run_qwen3_6_35b_a3b_gateway.py"
 
 
-@pytest.mark.parametrize("variant", ["35b-a3b", "27b"])
+@pytest.mark.parametrize("variant", ["35b-a3b", "27b", "4b"])
 @pytest.mark.parametrize("entrypoint", ["prepare", "serve"])
 def test_qwen36_gateway_recipe(monkeypatch, tmp_path: Path, variant: str, entrypoint: str):
     freeze_environment(monkeypatch)

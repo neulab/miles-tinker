@@ -69,7 +69,9 @@ def test_lora_mode_warns_about_tp_ep_marked_grad_double_sum(caplog):
 def test_full_mode_overrides_in_place_pausing(caplog):
     from miles.utils.tinker_args import validate_tinker_serve_args
 
-    args = _serve_args(tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="in_place")
+    args = _serve_args(
+        tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="in_place"
+    )
     validate_tinker_serve_args(args)
     assert args.pause_generation_mode == "retract"
 
@@ -110,6 +112,13 @@ def test_r3_warns_about_mtp_layers(caplog):
     with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
         arguments.validate_tinker_serve_args(_r3_args(mtp_num_layers=0))
     assert not caplog.messages
+
+
+def test_r3_rejects_the_fused_router():
+    """The fused top-k returns before the replay hook: the rollout routing would be ignored."""
+    with pytest.raises(AssertionError, match="moe-router-fusion"):
+        arguments.validate_tinker_serve_args(_r3_args(moe_router_fusion=True))
+    arguments.validate_tinker_serve_args(_r3_args(moe_router_fusion=False))
 
 
 def test_r3_off_ignores_the_moe_requirements():
@@ -158,3 +167,49 @@ def test_fused_head_rejects_per_token_loss_before_the_head_check():
 
 def test_fused_head_off_skips_its_checks():
     arguments.validate_tinker_serve_args(_fused_args(fused_lm_head_logprobs=False, mtp_num_layers=1))
+
+
+# -------- per-datum token cap against the per-rank budget (CP-aware, from radixark/miles #3320) --------
+
+
+def test_datum_cap_at_cp1_warns_only_above_the_budget(caplog):
+    with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
+        arguments.validate_tinker_serve_args(
+            _serve_args(tensor_model_parallel_size=4, max_tokens_per_gpu=131073, tinker_max_tokens_per_datum=131073)
+        )
+    assert not caplog.messages, "the v25 128k rows (budget == datum cap) have always run"
+    with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
+        arguments.validate_tinker_serve_args(_serve_args(max_tokens_per_gpu=16384, tinker_max_tokens_per_datum=32768))
+    assert any("oversized microbatch" in message for message in caplog.messages)
+
+
+@pytest.mark.parametrize(
+    "tp, cp, budget, longest",
+    [(4, 2, 66048, 132096), (4, 4, 33280, 133120), (1, 8, 16512, 132096), (1, 2, 4224, 8448)],
+)
+def test_datum_cap_at_cp_holds_the_zigzag_shard(tp, cp, budget, longest):
+    """Each rank keeps two zigzag chunks padded to TP*128: the longest datum is cp * floor(budget/pad) * pad."""
+    common = dict(context_parallel_size=cp, tensor_model_parallel_size=tp, data_pad_size_multiplier=128)
+    arguments._validate_datum_token_cap(
+        _serve_args(**common, max_tokens_per_gpu=budget, tinker_max_tokens_per_datum=longest)
+    )
+    with pytest.raises(AssertionError, match=f"needs --max-tokens-per-gpu >= {budget + tp * 128}"):
+        arguments._validate_datum_token_cap(
+            _serve_args(**common, max_tokens_per_gpu=budget, tinker_max_tokens_per_datum=longest + 1)
+        )
+
+
+def test_datum_cap_rejects_a_cp1_budget_left_in_place():
+    args = _serve_args(
+        context_parallel_size=2,
+        tensor_model_parallel_size=4,
+        max_tokens_per_gpu=65537,
+        tinker_max_tokens_per_datum=131073,
+    )
+    with pytest.raises(AssertionError, match="131072 tokens .* needs --max-tokens-per-gpu >= 66048"):
+        arguments._validate_datum_token_cap(args)
+
+
+def test_datum_cap_is_skipped_without_both_limits():
+    arguments._validate_datum_token_cap(_serve_args(context_parallel_size=2, max_tokens_per_gpu=None))
+    arguments._validate_datum_token_cap(_serve_args(context_parallel_size=2, tinker_max_tokens_per_datum=None))
