@@ -252,11 +252,11 @@ def test_a_noise_run_widens_the_zigzag_windows_by_its_own_ratio(parity, tmp_path
         return shift
 
     ref = _dump(parity)
-    cand = _dump(parity, cp=2, shift=at_boundaries(0.006))  # window/interior ratio 4
+    cand = _dump(parity, cp=2, shift=at_boundaries(0.008))  # window/interior ratio 5: over the default 4
     assert _compare(parity, tmp_path, ref, cand) == 1
-    noise = _dump(parity, shift=at_boundaries(0.004))  # a correct layout at ratio 3
+    noise = _dump(parity, shift=at_boundaries(0.006))  # a correct layout at ratio 4
     assert _compare(parity, tmp_path, ref, cand, noise=noise) == 0
-    worse = _dump(parity, cp=2, shift=at_boundaries(0.02))  # ratio 11: over 1.5 x the noise run's 3
+    worse = _dump(parity, cp=2, shift=at_boundaries(0.02))  # ratio 11: over 1.5 x the noise run's 4
     assert _compare(parity, tmp_path, ref, worse, noise=noise) == 1
     assert "near chunk boundaries" in capsys.readouterr().out
 
