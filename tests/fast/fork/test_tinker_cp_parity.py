@@ -57,20 +57,23 @@ def test_zigzag_layout_marks_chunks_and_boundaries(parity):
     assert near[24:40].all() and not near[:24].any() and not near[40:56].any()
 
 
-def _dump(parity, *, cp=1, shift=None, grad_scale=1.0, loss_shift=0.0):
+LONE = [399, 799]  # small stand-ins for the 3999/7999-token lone datums: CP2/TP1 splits them at rows 256 and 512
+
+
+def _dump(parity, *, cp=1, shift=None, grad_scale=1.0, loss_shift=0.0, lone_shift=None, after_shift=None):
     lengths = parity.datum_lengths(max_cp=2, max_len=1024)
 
-    def vectors(offset):
+    def vectors(offset, lens=lengths, shift=shift):
         out = []
-        for n in lengths:
+        for n in lens:
             lp = -np.abs(np.linspace(0.1, 3.0, n)) - offset
             if shift is not None:
                 lp = lp + shift(n)
             out.append(lp.tolist())
         return out
 
-    def outputs(offset, loss=0.0):
-        logprobs = vectors(offset)
+    def outputs(offset, loss=0.0, lens=lengths, shift=shift):
+        logprobs = vectors(offset, lens, shift)
         return {"logprobs": logprobs, "losses": [loss + 0.01 * i for i in range(len(logprobs))], "metrics": {}}
 
     steps = [
@@ -82,15 +85,19 @@ def _dump(parity, *, cp=1, shift=None, grad_scale=1.0, loss_shift=0.0):
         }
         for i, loss_fn in enumerate(parity.LOSSES)
     ]
+    steps[0]["forward_backward_single"] = outputs(0.0, lens=[lengths[2]])
+    steps[0]["forward_backward_lone"] = outputs(0.0, lens=LONE, shift=lone_shift)
     return {
-        "meta": {"cp": cp, "label": f"cp{cp}"},
+        "meta": {"cp": cp, "tp": 1, "pad_multiplier": 128, "label": f"cp{cp}"},
         "lengths": lengths,
         "single_length": lengths[2],
+        "lone_lengths": LONE,
         "forward_before": outputs(0.0),
         "forward_before_permuted": outputs(0.0),
         "forward_single": {"logprobs": [vectors(0.0)[2]], "losses": [0.0], "metrics": {}},
+        "forward_lone": outputs(0.0, lens=LONE, shift=lone_shift),
         "steps": steps,
-        "forward_after": outputs(0.05),
+        "forward_after": outputs(0.05, shift=after_shift if after_shift is not None else shift),
     }
 
 
@@ -163,3 +170,93 @@ def test_different_datum_sets_are_refused(parity, tmp_path):
     cand["lengths"] = cand["lengths"][:-1]
     with pytest.raises(AssertionError, match="different datum sets"):
         _compare(parity, tmp_path, _dump(parity), cand)
+    old = _dump(parity, cp=2)  # a dump from before the lone long datums
+    del old["lone_lengths"]
+    with pytest.raises(AssertionError, match="different datum sets"):
+        _compare(parity, tmp_path, _dump(parity), old)
+
+
+# -------- GatedDeltaNet chunkwise splits and short rows --------
+
+
+@pytest.mark.parametrize(
+    "n, cp, tp, pad, rows",
+    [
+        (7999, 2, 1, 128, [4096]),  # 8000 tokens: zigzag boundaries at 2000/4000/6000, the GDN split at 4096
+        (3999, 2, 1, 128, [2048]),
+        (7999, 4, 1, 128, [2048, 4096, 6144]),
+        (7999, 2, 4, 128, [4096]),  # 4000 per rank, padded to 512
+        (3999, 4, 4, 128, [1024, 2048, 3072]),
+        (10, 2, 1, 128, []),  # a short lone datum sits inside rank 0's part: no handoff to check
+    ],
+)
+def test_gdn_split_rows_follow_the_padded_contiguous_split(parity, n, cp, tp, pad, rows):
+    assert parity.gdn_split_rows(n, cp, tp, pad) == rows
+
+
+def test_lone_rows_put_their_weight_on_the_second_half(parity):
+    lengths, rows = parity.lone_rows(max_len=8192, seed=2)
+    assert lengths == [3999, 7999]
+    for n, row in zip(lengths, rows, strict=True):
+        assert not any(row["weights"][: n // 2]) and sum(row["weights"]) == pytest.approx(1.0)
+    assert parity.lone_rows(max_len=4096, seed=2)[0] == [3999]
+
+
+def _after_split(delta, split=None):
+    """A handoff error: ``delta`` on the 3 rows after each CP2/TP1 GatedDeltaNet split of a lone datum."""
+
+    def shift(n):
+        out = np.zeros(n)
+        for row in [split] if split is not None else [256 if n == 399 else 512]:
+            out[row : row + 3] = delta
+        return out
+
+    return shift
+
+
+def test_an_error_at_the_gdn_split_fails(parity, tmp_path, capsys):
+    assert _compare(parity, tmp_path, _dump(parity), _dump(parity, cp=2, lone_shift=_after_split(0.1))) == 1
+    assert "near the GatedDeltaNet CP splits" in capsys.readouterr().out
+    # the same error away from the split and from the zigzag boundaries (100-row and 200-row chunks)
+    assert _compare(parity, tmp_path, _dump(parity), _dump(parity, cp=2, lone_shift=_after_split(0.1, 150))) == 0
+
+
+def test_a_noise_run_widens_the_gdn_windows(parity, tmp_path):
+    """A flip on an ambiguous repeat can land in a split window under any layout; the noise run measures it there."""
+    ref, cand = _dump(parity), _dump(parity, cp=2, lone_shift=_after_split(0.1))
+    noise = _dump(parity, lone_shift=_after_split(-0.08))
+    assert _compare(parity, tmp_path, ref, cand, noise=noise) == 0
+
+
+def test_short_rows_are_gated_one_by_one_before_the_first_step(parity, tmp_path, capsys):
+    def one_token_of_tiny_rows(delta):
+        """The last token of the 2- and 3-token rows (the lone short datum is the 4-token one)."""
+
+        def shift(n):
+            out = np.zeros(n)
+            if n <= 2:
+                out[-1] = delta
+            return out
+
+        return shift
+
+    assert _compare(parity, tmp_path, _dump(parity), _dump(parity, cp=2, shift=one_token_of_tiny_rows(0.2))) == 0
+    assert _compare(parity, tmp_path, _dump(parity), _dump(parity, cp=2, shift=one_token_of_tiny_rows(0.35))) == 1
+    assert "max |d| 0.35 > 0.3" in capsys.readouterr().out
+    # the same error after the first optimizer step only: post-update vectors are not gated per datum
+    cand = _dump(parity, cp=2, after_shift=one_token_of_tiny_rows(0.35))
+    assert _compare(parity, tmp_path, _dump(parity), cand) == 0
+    # a noise run with a 0.2 deviation on those rows allows twice that
+    noise = _dump(parity, shift=one_token_of_tiny_rows(-0.2))
+    cand = _dump(parity, cp=2, shift=one_token_of_tiny_rows(0.35))
+    assert _compare(parity, tmp_path, _dump(parity), cand, noise=noise) == 0
+
+
+def test_the_kl_trim_never_drops_a_short_row(parity):
+    long_row = np.zeros(2000)
+    ref = [long_row.tolist(), [0.0, 0.0]]
+    cand = [long_row.tolist(), [0.0, -1.0]]  # one bad token of a short row: in the top 0.1% of all deltas
+    report = parity.vector_report(ref, cand, [2000, 2], cp=2)
+    assert report["kl"] > 0 and report["short_max_abs"] == pytest.approx(1.0)
+    flipped = parity.vector_report([[0.0] * 2000], [[0.0] * 1999 + [-3.0]], [2000], cp=2)
+    assert flipped["kl"] == 0.0 < flipped["kl_all"], "a long row's single flip is trimmed"
