@@ -107,6 +107,22 @@ Operator docs: `docs/fork/r3.md`, `docs/fork/r3-trainer.md`,
 | `tests/fast/backends/training_utils/test_fused_lm_head.py` | CPU tests for the fused head: fp32 reference at 1e-6, gradients, chunk sizes 1/5/64, fake 2-shard TP with and without sequence parallelism, both weight-grad paths, install guards, wrapper, dispatch | yes |
 | `tests/fast/utils/test_flops_layer_types.py` | dense/MoE goldens unchanged, GDN + 64k hand formulas, 2.2-2.6 ratio band, MTP term, `ensure_hf_layer_pattern` on fake configs | yes |
 
+### Context parallelism for full fine-tuning - 128k rows on 80 GB GPUs
+
+Operator docs: `docs/fork/full-finetuning.md` (section "Context parallelism").
+
+| File | Rationale | Upstream-worthy? |
+|---|---|---|
+| `miles/backends/training_utils/loss_hub/tinker_losses.py` (CP) | ported from upstream #3320 (radixark/miles 3d8b5284) onto the fork's recorder: weights/advantages/masks sliced to the rank's zigzag shard per call, padding gate on the full mask, `_gather_per_datum_outputs` (one CP all-reduce per microbatch, full-length outputs on every rank, `output_key` for value heads), empty-rank loss `logits[..., :0].sum(dtype=fp32)`, outputs recorded once under `--recompute-loss-function` | yes (keep upstream's names: a later sync can take upstream's file) |
+| `miles/backends/training_utils/cp_utils.py` (`gather_cp_response_values`) | batched CP gather of per-sample response vectors plus per-sample scalars: zero-filled full-length vectors summed over the CP group, one device-to-host copy; shared by the Tinker losses and `forward_only_logprobs` | yes |
+| `miles/backends/megatron_utils/actor.py` (`forward_only_logprobs`, CP) | full-length logprobs at CP>1 through the same gather (the gateway kept the first CP rank's shard) | yes |
+| `miles/backends/megatron_utils/cp_model_config.py`, `miles/backends/megatron_utils/model_provider.py`, `miles/backends/megatron_utils/model.py` | bridge Qwen3-VL/3.5-VL providers force `calculate_per_token_loss` at CP>1 (gradients x num_microbatches x DP*CP): reset on every config and the routers' cached copy after `provide()`, invariant check after `get_model` (config flag, DDP `gradient_scaling_factor == 1/(DP*CP)`, unfused router with R3); MRoPE patch required at CP>1; `--cp-comm-type` / `--linear-cp-mode` onto the provider | yes |
+| `miles/utils/arguments.py` (`--linear-cp-mode`), `miles/utils/tinker_args.py` (CP) | GatedDeltaNet CP mode flag; serve validation: CP>1 for full mode only, thd only, no `--allgather-cp`, per-rank datum cap (#3320), R3 rejects `--moe-router-fusion` | yes |
+| `miles_plugins/models/qwen3_vl.py` (`is_packed_mrope_patch_installed`) | lets the model build check that the packed-MRoPE patch is installed | yes |
+| `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` (CP, `4b`) | `--cp`, `--linear-cp-mode`, per-rank `--max-tokens-per-gpu` default (zigzag shard of one row), `--model-variant 4b` (Qwen3.5-4B parity recipe: standard head, TP1 engines) | maybe |
+| `deploy/clients/tinker_cp_parity.py`, `deploy/abci/clients/cp_parity.sh` | CP parity probe (`run` dumps forward/forward_backward/optim results for a seeded datum set, `compare` reports per-chunk and boundary deltas, loss deltas, grad_norm ratios with thresholds) and its CLIENT_SCRIPT | no |
+| `tests/fast/backends/training_utils/loss/test_tinker_loss_cp_consistency.py`, `cpu_cross_entropy.py`, `tests/fast/backends/megatron_utils/test_cp_model_config.py`, `tests/fast/fork/test_tinker_cp_parity.py`, `tests/fast/tinker/server/test_cp_parity_client.py` | gloo CP 1/2/4 loss and gather tests (the stand-in replaces Megatron's fused CE on CPU), fake-provider per-token-loss reset and invariant tests, parity client tests | yes (the loss test: upstream's file name) |
+
 ### Fork-only tooling, deployment and docs
 
 | File | Rationale | Upstream-worthy? |
