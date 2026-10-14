@@ -123,24 +123,47 @@ def test_restore_per_token_loss_accepts_a_plain_object_model():
 # ---------------------------------------------------------------------------
 
 
+def _cp_args(cp=2, **kw):
+    return SimpleNamespace(context_parallel_size=cp, **kw)
+
+
 def test_cp_modes_copy_onto_the_provider():
     provider = SimpleNamespace(cp_comm_type=None, linear_cp_mode="chunkwise")
-    cp_model_config.apply_context_parallel_modes(
-        provider, SimpleNamespace(cp_comm_type=["p2p"], linear_cp_mode="headwise")
-    )
+    cp_model_config.apply_context_parallel_modes(provider, _cp_args(cp_comm_type=["p2p"], linear_cp_mode="headwise"))
     assert provider.cp_comm_type == "p2p" and provider.linear_cp_mode == "headwise"
 
     per_layer = SimpleNamespace(cp_comm_type=None, linear_cp_mode="chunkwise")
-    cp_model_config.apply_context_parallel_modes(per_layer, SimpleNamespace(cp_comm_type=["p2p", "a2a"]))
+    cp_model_config.apply_context_parallel_modes(per_layer, _cp_args(cp_comm_type=["p2p", "a2a"]))
     assert per_layer.cp_comm_type == ["p2p", "a2a"] and per_layer.linear_cp_mode == "chunkwise"
+
+
+def test_megatrons_default_comm_type_keeps_a_providers_own_choice():
+    """--cp-comm-type defaults to ["p2p"]: it must not override e.g. the Mistral provider's a2a for sliding windows."""
+    provider = SimpleNamespace(cp_comm_type="a2a", linear_cp_mode="chunkwise")
+    cp_model_config.apply_context_parallel_modes(provider, _cp_args(cp_comm_type=["p2p"]))
+    assert provider.cp_comm_type == "a2a"
+    cp_model_config.apply_context_parallel_modes(provider, _cp_args(cp_comm_type=["all_gather"]))
+    assert provider.cp_comm_type == "all_gather", "a non-default --cp-comm-type is an explicit request"
 
 
 def test_cp_modes_leave_the_provider_alone_when_unset_and_reject_unknown_fields():
     provider = SimpleNamespace(cp_comm_type="a2a", linear_cp_mode="chunkwise")
-    cp_model_config.apply_context_parallel_modes(provider, SimpleNamespace())
+    cp_model_config.apply_context_parallel_modes(provider, _cp_args())
     assert provider.cp_comm_type == "a2a" and provider.linear_cp_mode == "chunkwise"
+    # a provider without linear-attention CP modes is fine as long as none is asked for
+    cp_model_config.apply_context_parallel_modes(SimpleNamespace(), _cp_args(cp_comm_type=["p2p"]))
     with pytest.raises(ValueError, match="has no linear_cp_mode"):
-        cp_model_config.apply_context_parallel_modes(SimpleNamespace(), SimpleNamespace(linear_cp_mode="headwise"))
+        cp_model_config.apply_context_parallel_modes(SimpleNamespace(), _cp_args(linear_cp_mode="headwise"))
+
+
+def test_cp_modes_do_nothing_without_context_parallelism():
+    provider = SimpleNamespace(cp_comm_type="a2a", linear_cp_mode="chunkwise")
+    cp_model_config.apply_context_parallel_modes(
+        provider, _cp_args(cp=1, cp_comm_type=["all_gather"], linear_cp_mode="headwise")
+    )
+    assert provider.cp_comm_type == "a2a" and provider.linear_cp_mode == "chunkwise"
+    # an older Megatron/bridge without linear_cp_mode builds at CP=1 whatever the flag says
+    cp_model_config.apply_context_parallel_modes(SimpleNamespace(), _cp_args(cp=1, linear_cp_mode="headwise"))
 
 
 def test_bridge_runtime_config_carries_the_cp_modes(provider_module):  # noqa: F811  (the imported fixture)
@@ -149,6 +172,9 @@ def test_bridge_runtime_config_carries_the_cp_modes(provider_module):  # noqa: F
         provider, _args(mtp_num_layers=0, context_parallel_size=2, cp_comm_type=["p2p"], linear_cp_mode="headwise")
     )
     assert (provider.context_parallel_size, provider.cp_comm_type, provider.linear_cp_mode) == (2, "p2p", "headwise")
+    unset = _Provider(cp_comm_type=None, linear_cp_mode="chunkwise")
+    provider_module._apply_bridge_runtime_config(unset, _args(mtp_num_layers=0, context_parallel_size=2))
+    assert unset.linear_cp_mode == "chunkwise", "no --linear-cp-mode: the provider keeps its own"
 
 
 # ---------------------------------------------------------------------------
@@ -193,59 +219,63 @@ def test_mrope_check_ignores_other_models():
 # ---------------------------------------------------------------------------
 
 
-def _ddp_chunk(
-    *, per_token=False, factor=0.25, expert_factor=None, dp_cp=4, average_in_collective=False, fusion=False
-):
+@pytest.fixture
+def loss_scale_group(monkeypatch):
+    """miles' parallel state as loss.py sees it: the loss is multiplied by intra_dp_cp.size."""
+    state = SimpleNamespace(intra_dp_cp=SimpleNamespace(size=4))
+    monkeypatch.setattr(cp_model_config, "get_parallel_state", lambda: state)
+    return state
+
+
+def _ddp_chunk(*, per_token=False, dp_cp=4, fusion=False):
     config = SimpleNamespace(calculate_per_token_loss=per_token, moe_router_fusion=fusion)
-    buffers = [SimpleNamespace(gradient_scaling_factor=factor)]
-    expert = [] if expert_factor is None else [SimpleNamespace(gradient_scaling_factor=expert_factor)]
-    return SimpleNamespace(
-        config=config,
-        ddp_config=SimpleNamespace(average_in_collective=average_in_collective),
-        buffers=buffers,
-        expert_parallel_buffers=expert,
-        dp_cp_group=SimpleNamespace(size=lambda: dp_cp),
-    )
+    return SimpleNamespace(config=config, dp_cp_group=SimpleNamespace(size=lambda: dp_cp))
 
 
 def _run_args(**kw):
     return SimpleNamespace(**{"calculate_per_token_loss": False, "use_rollout_routing_replay": False, **kw})
 
 
-def test_invariants_accept_the_fixed_model():
-    cp_model_config.check_loss_scaling_invariants([_ddp_chunk(expert_factor=0.25)], _run_args())
-    # DP2 x CP4 = 8
-    cp_model_config.check_loss_scaling_invariants([_ddp_chunk(factor=0.125, dp_cp=8)], _run_args())
+def test_invariants_accept_the_fixed_model(loss_scale_group):
+    cp_model_config.check_loss_scaling_invariants([_ddp_chunk(), _ddp_chunk()], _run_args())
+    loss_scale_group.intra_dp_cp.size = 8  # DP2 x CP4
+    cp_model_config.check_loss_scaling_invariants([_ddp_chunk(dp_cp=8)], _run_args())
 
 
-def test_invariants_catch_the_bridge_bug():
+def test_invariants_catch_the_bridge_bug(loss_scale_group):
     with pytest.raises(AssertionError, match="disagrees with --calculate-per-token-loss"):
-        cp_model_config.check_loss_scaling_invariants([_ddp_chunk(per_token=True, factor=1.0)], _run_args())
+        cp_model_config.check_loss_scaling_invariants([_ddp_chunk(per_token=True)], _run_args())
 
 
-def test_invariants_catch_a_wrong_buffer_scale():
-    with pytest.raises(AssertionError, match="gradient_scaling_factor=1.0, expected 1/4"):
-        cp_model_config.check_loss_scaling_invariants([_ddp_chunk(factor=1.0)], _run_args())
-    with pytest.raises(AssertionError, match="expected 1/4"):
-        cp_model_config.check_loss_scaling_invariants([_ddp_chunk(expert_factor=0.5)], _run_args())
+def test_invariants_catch_a_reduction_group_the_loss_scale_does_not_cancel(loss_scale_group):
+    """DDP pre-scales by 1/|its DP*CP group| (asserted by its own constructor); loss.py multiplies by
+    intra_dp_cp: the two must be the same size or the sum over DP*CP is off by their ratio."""
+    with pytest.raises(AssertionError, match="group of 2 ranks .* intra_dp_cp=4"):
+        cp_model_config.check_loss_scaling_invariants([_ddp_chunk(dp_cp=2)], _run_args())
 
 
-def test_invariants_skip_buffer_factors_when_the_collective_averages_or_per_token_loss():
-    cp_model_config.check_loss_scaling_invariants([_ddp_chunk(factor=1.0, average_in_collective=True)], _run_args())
+def test_invariants_skip_the_group_check_with_per_token_loss(loss_scale_group):
     cp_model_config.check_loss_scaling_invariants(
-        [_ddp_chunk(per_token=True, factor=1.0)], _run_args(calculate_per_token_loss=True)
+        [_ddp_chunk(per_token=True, dp_cp=2)], _run_args(calculate_per_token_loss=True)
     )
 
 
-def test_invariants_find_the_config_through_wrappers_and_skip_non_ddp_chunks():
+def test_invariants_find_the_config_through_wrappers_and_skip_non_ddp_chunks(loss_scale_group):
     inner = SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=False))
     cp_model_config.check_loss_scaling_invariants([SimpleNamespace(module=SimpleNamespace(module=inner))], _run_args())
 
 
-def test_r3_requires_the_unfused_router():
+def test_r3_requires_the_unfused_router(loss_scale_group):
     with pytest.raises(AssertionError, match="unfused MoE router"):
         cp_model_config.check_loss_scaling_invariants(
             [_ddp_chunk(fusion=True)], _run_args(use_rollout_routing_replay=True)
         )
     cp_model_config.check_loss_scaling_invariants([_ddp_chunk(fusion=True)], _run_args())
     cp_model_config.check_loss_scaling_invariants([_ddp_chunk()], _run_args(use_rollout_routing_replay=True))
+
+
+def test_the_per_step_flag_check():
+    """full/executor.forward_backward re-checks the config the schedule reads on every call."""
+    cp_model_config.check_per_token_loss_flag(SimpleNamespace(calculate_per_token_loss=False), _run_args())
+    with pytest.raises(AssertionError, match="config calculate_per_token_loss=True disagrees"):
+        cp_model_config.check_per_token_loss_flag(SimpleNamespace(calculate_per_token_loss=True), _run_args())

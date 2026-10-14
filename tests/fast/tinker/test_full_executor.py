@@ -86,7 +86,7 @@ def _module(name: str, **attrs) -> types.ModuleType:
 def rig(monkeypatch):
     """Import the executor against stubs and expose the calls it makes."""
     log: list[str] = []
-    config = SimpleNamespace(finalize_model_grads_func=None)
+    config = SimpleNamespace(finalize_model_grads_func=None, calculate_per_token_loss=False)
 
     def run_forward_backward_pass(args, dumper, data_iterator, model, num_microbatches, num_rollouts):
         log.append("fwd_bwd")
@@ -156,11 +156,26 @@ def rig(monkeypatch):
     from miles.utils.timer import Timer
 
     Timer().seq_lens = [3, 3]
-    args = Namespace(overlap_grad_reduce=False, overlap_param_gather=False, load="/base", mfu_peak_tflops=None)
+    args = Namespace(
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        load="/base",
+        mfu_peak_tflops=None,
+        calculate_per_token_loss=False,
+    )
     rig = SimpleNamespace(executor=executor, log=log, config=config, args=args, model=[FakeModelChunk()])
     yield rig
     for name in (EXECUTOR, "miles.backends.megatron_utils.full"):
         sys.modules.pop(name, None)
+
+
+def test_a_unit_refuses_a_model_config_on_per_token_loss(rig):
+    """The schedule reads calculate_per_token_loss from the config on every call; a bridge VL config that
+    turned it back on (CP>1) would scale the unit's gradients by num_microbatches * |DP*CP|."""
+    rig.config.calculate_per_token_loss = True
+    with pytest.raises(AssertionError, match="disagrees with --calculate-per-token-loss"):
+        rig.executor.forward_backward(rig.args, 1, rig.model, FakeOptimizer(), {})
+    assert "fwd_bwd" not in rig.log
 
 
 def test_units_defer_finalize_and_optim_step_runs_it_once(rig):
