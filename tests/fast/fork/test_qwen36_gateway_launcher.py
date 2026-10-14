@@ -289,7 +289,7 @@ def test_cp_sizes_the_per_rank_budget(launcher, monkeypatch):
     assert _flag(argv, "--context-parallel-size") == "2"
     # one 65537-token row: 2 * ceil(65537 / 4) = 32770 tokens per rank, padded to 128
     assert _flag(argv, "--max-tokens-per-gpu") == "32896"
-    # chunkwise GatedDeltaNet CP is opt-in until its gradients are validated
+    # headwise GatedDeltaNet CP unless chunkwise is requested
     assert _flag(argv, "--linear-cp-mode") == "headwise"
     argv = _serve_argv(launcher, monkeypatch, cp=8, context_len=131072, max_tokens_per_datum=131073)
     assert _flag(argv, "--max-tokens-per-gpu") == "16512" and _flag(argv, "--linear-cp-mode") == "headwise"

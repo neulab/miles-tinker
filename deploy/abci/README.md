@@ -102,9 +102,10 @@ Every knob is a `qsub -v` variable: `MODE`, `RUN_NAME`, `TRAIN_NODES`, `SERVICES
 
 `--cp N` in `LAUNCHER_ARGS` splits every datum over N trainer ranks (zigzag chunks;
 DP becomes GPUs / (TP * N)). `--max-tokens-per-gpu` is then a per-rank budget and
-defaults to the shard of one `--context-len + 1` row; `--linear-cp-mode headwise`
-switches the GatedDeltaNet layers off the default chunkwise mode. The two-node
-Qwen3.5-4B parity gateway (`--model-variant 4b`, a bridge VL model with GDN layers):
+defaults to the shard of one `--context-len + 1` row. The GatedDeltaNet layers run
+headwise unless `--linear-cp-mode chunkwise` is given (headwise needs TP*CP to
+divide the 16 linear key heads). The two-node Qwen3.5-4B parity gateway
+(`--model-variant 4b`, a bridge VL model with GDN layers):
 
 ```bash
 qsub -v MODE=full,GATEWAY_LAUNCHER=examples/tinker/run_qwen3_6_35b_a3b_gateway.py,HF_SNAPSHOT=$(ls -d /groups/gai51740/aci18912it/rasp/cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*),LAUNCHER_ARGS="--model-variant 4b --cp 2 --context-len 8192 --max-tokens-per-datum 8193" deploy/abci/tinker_gateway.pbs

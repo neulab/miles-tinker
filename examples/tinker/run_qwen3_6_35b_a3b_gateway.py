@@ -16,9 +16,11 @@ into 2N zigzag chunks, two per CP rank, and DP shrinks to GPUs / (TP*CP).
 for one ``context_len + 1`` row (``ceil((context_len + 1) / 2N) * 2`` rounded up
 to a multiple of TP * ``--data-pad-size-multiplier``, 128 unless ``--extra-args``
 sets it). The GatedDeltaNet layers default to ``--linear-cp-mode headwise``
-(full sequences on 1/CP of the linear heads, which TP*CP must divide); the
-chunkwise mode (sequence-sharded fla CP kernels, Megatron's default) is opt-in
-until its gradients are validated. See docs/fork/full-finetuning.md.
+(full sequences on 1/CP of the linear heads, which TP*CP must divide): its
+numerics do not depend on the packing and stay closest to CP=1. The chunkwise
+mode (sequence-sharded fla CP kernels, Megatron's default) passes the same
+checks and covers layouts whose TP*CP does not divide the heads. See
+docs/fork/full-finetuning.md.
 
 Serves ``serve_tinker.py`` disaggregated: ``actor_num_nodes`` x 8 GPUs train
 (Megatron, TP1 / EP8 / ETP1, distributed optimizer, full uniform recompute) and
@@ -186,7 +188,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     ep: int | None = None
     etp: int = 1
     # Context parallelism (full fine-tuning): DP = GPUs / (TP * CP). --linear-cp-mode for the GDN layers
-    # (None: headwise at cp > 1; chunkwise is opt-in until its gradients are validated).
+    # (None: headwise at cp > 1, packing-independent and closest to CP=1; chunkwise on request).
     cp: int = 1
     linear_cp_mode: str | None = None
 
