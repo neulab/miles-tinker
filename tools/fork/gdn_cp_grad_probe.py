@@ -4,7 +4,9 @@ One Megatron ``GatedDeltaNet`` layer (Qwen3.5-4B linear-attention sizes by defau
 packed THD row laid out as miles' ``get_batch`` lays it out: every datum zigzag-sharded over the
 CP ranks, each rank's share padded to a multiple of 128, ``cu_seqlens`` of the full row. It runs
 once without CP (the reference, on every rank) and once per ``linear_cp_mode``, with the same
-weights and inputs, for each CP size.
+weights and inputs, for each CP size. ``--layers attention`` probes a Qwen3.5-4B full-attention
+layer (TE attention, qk layernorm, output gate, no rotary) the same way, once per
+``--attention-modes`` (``cp_comm_type``).
 
 The loss weights only the part after the first contiguous CP split of the datum that straddles
 it (``chunkwise`` mode hands the recurrent state and the conv halo to the next rank there), so
@@ -18,6 +20,7 @@ term shows as a low cosine or a norm ratio away from 1, first on the pre-split i
 Run on one node inside the miles image (Megatron-LM and fla from the image):
 
   torchrun --nproc_per_node 8 tools/fork/gdn_cp_grad_probe.py --cp 2 4 8 --modes chunkwise headwise
+  torchrun --nproc_per_node 8 tools/fork/gdn_cp_grad_probe.py --cp 2 4 --layers gdn attention
 
 Exit status 1 when a layout falls below ``--min-cosine`` or outside ``--max-norm-error``.
 """
@@ -35,29 +38,23 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.spec_utils import build_module
 
 PAD_SIZE = 128  # TP1 * miles' --data-pad-size-multiplier
 
 
-def _config(args, cp: int, mode: str | None) -> TransformerConfig:
-    return TransformerConfig(
+def _config(args, layer: str, cp: int, mode: str | None) -> TransformerConfig:
+    common = dict(
         num_layers=1,
         hidden_size=args.hidden,
         num_attention_heads=16,
         num_query_groups=4,
-        linear_conv_kernel_dim=4,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_num_key_heads=args.key_heads,
-        linear_num_value_heads=args.value_heads,
-        experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=[1],
-        linear_cp_mode=mode or "chunkwise",
         cp_partition_mode="zigzag",
         context_parallel_size=cp,
         normalization="RMSNorm",
@@ -69,14 +66,38 @@ def _config(args, cp: int, mode: str | None) -> TransformerConfig:
         gradient_accumulation_fusion=False,
         transformer_impl="transformer_engine",
     )
+    if layer == "attention":
+        return TransformerConfig(
+            **common,
+            kv_channels=256,
+            qk_layernorm=True,
+            attention_output_gate=True,
+            attention_softmax_in_fp32=True,
+            attention_backend=AttnBackend.flash,
+            cp_comm_type=mode or "p2p",
+        )
+    return TransformerConfig(
+        **common,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=args.key_heads,
+        linear_num_value_heads=args.value_heads,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        linear_cp_mode=mode or "chunkwise",
+    )
 
 
-def _build_layer(args, cp: int, mode: str | None):
+def _build_layer(args, layer: str, cp: int, mode: str | None):
     parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
     model_parallel_cuda_manual_seed(args.seed)
-    config = _config(args, cp, mode)
-    spec = get_experimental_attention_variant_module_spec(config)
+    config = _config(args, layer, cp, mode)
+    if layer == "attention":
+        spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True).submodules.self_attention
+    else:
+        spec = get_experimental_attention_variant_module_spec(config)
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     return build_module(spec, config=config, layer_number=1, pg_collection=pg_collection)
 
@@ -105,10 +126,10 @@ def _local_positions(cu: list[int], cp: int, rank: int) -> torch.Tensor:
     return torch.cat(positions)
 
 
-def _forward_backward(args, cp: int, mode: str | None, state: dict, row, probe, loss_mask, cu: list[int]):
+def _forward_backward(args, layer_type: str, cp: int, mode, state: dict, row, probe, loss_mask, cu: list[int]):
     """One layout's forward/backward. Returns (parameter gradients summed over the CP group, the
     global positions of this rank's rows, their input gradients, their outputs)."""
-    layer = _build_layer(args, cp, mode).cuda()
+    layer = _build_layer(args, layer_type, cp, mode).cuda()
     layer.load_state_dict(state)
     positions = _local_positions(cu, cp, parallel_state.get_context_parallel_rank()).cuda()
     cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda")
@@ -147,19 +168,21 @@ def _tensor_stats(cand: torch.Tensor, ref: torch.Tensor) -> dict:
     return {"cosine": float(F.cosine_similarity(cand, ref, dim=0)), "norm_ratio": float(cand.norm() / ref.norm())}
 
 
-def _initial_state(args) -> dict:
-    """Weights every layout loads. Half the value heads remember ~1000 tokens (A ~ 1e-3), so the
-    recurrent state matters across the split; the rest keep their initialization (fast decays)."""
+def _initial_state(args, layer: str) -> dict:
+    """Weights every layout loads. GatedDeltaNet: half the value heads remember ~1000 tokens
+    (A ~ 1e-3), so the recurrent state matters across the split; the rest keep their
+    initialization (fast decays)."""
     torch.manual_seed(args.seed)
-    layer = _build_layer(args, 1, None)
-    state = {key: value.detach().cpu().clone() for key, value in layer.state_dict().items()}
-    a_log = state["A_log"].clone()
-    a_log[: a_log.numel() // 2] = math.log(1e-3)
-    state["A_log"] = a_log
+    built = _build_layer(args, layer, 1, None)
+    state = {key: value.detach().cpu().clone() for key, value in built.state_dict().items()}
+    if "A_log" in state:
+        a_log = state["A_log"].clone()
+        a_log[: a_log.numel() // 2] = math.log(1e-3)
+        state["A_log"] = a_log
     return state
 
 
-def _probe_cp(args, cp: int, state: dict, probe: torch.Tensor) -> list[dict]:
+def _probe_cp(args, layer: str, modes: list[str], cp: int, state: dict, probe: torch.Tensor) -> list[dict]:
     cu = _global_cu(args.lengths, cp)
     total, split = cu[-1], cu[-1] // cp
     datum = next(i for i in range(len(args.lengths)) if cu[i] < split < cu[i] + args.lengths[i])
@@ -170,13 +193,16 @@ def _probe_cp(args, cp: int, state: dict, probe: torch.Tensor) -> list[dict]:
     loss_mask[split:end] = 1.0  # the straddling datum after the split only
     region = torch.zeros(total, dtype=torch.long, device="cuda")
     region[start:split], region[split:end] = 1, 2
-    ref_grads, _, ref_input_grad, ref_out = _forward_backward(args, 1, None, state, row, probe, loss_mask, cu)
+    ref_grads, _, ref_input_grad, ref_out = _forward_backward(args, layer, 1, None, state, row, probe, loss_mask, cu)
     records = []
-    for mode in args.modes:
-        grads, positions, input_grad, output = _forward_backward(args, cp, mode, state, row, probe, loss_mask, cu)
+    for mode in modes:
+        grads, positions, input_grad, output = _forward_backward(
+            args, layer, cp, mode, state, row, probe, loss_mask, cu
+        )
         local_region, ref_in = region[positions], ref_input_grad[positions]
         records.append(
             {
+                "layer": layer,
                 "cp": cp,
                 "mode": mode,
                 "straddling_datum": {"index": datum, "tokens": args.lengths[datum], "split_row": split - start},
@@ -192,7 +218,7 @@ def _probe_cp(args, cp: int, state: dict, probe: torch.Tensor) -> list[dict]:
 def _report(results: list[dict], args) -> list[str]:
     failures = []
     for record in results:
-        label = f"cp{record['cp']} {record['mode']}"
+        label = f"{record['layer']} cp{record['cp']} {record['mode']}"
         datum = record["straddling_datum"]
         print(
             f"== {label}: datum {datum['index']} ({datum['tokens']} tokens), CP split at its row {datum['split_row']}"
@@ -213,7 +239,9 @@ def _report(results: list[dict], args) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cp", type=int, nargs="+", default=[2, 4])
+    parser.add_argument("--layers", nargs="+", default=["gdn"], choices=["gdn", "attention"])
     parser.add_argument("--modes", nargs="+", default=["chunkwise", "headwise"], choices=["chunkwise", "headwise"])
+    parser.add_argument("--attention-modes", nargs="+", default=["p2p"], choices=["p2p", "a2a", "all_gather"])
     # the datums (tokens) of one packed row: the 8000-token one straddles the first CP split
     parser.add_argument("--lengths", type=int, nargs="+", default=[1000, 8000, 3000])
     parser.add_argument("--hidden", type=int, default=2560)
@@ -230,9 +258,12 @@ def main() -> int:
     world = dist.get_world_size()
     assert all(world % cp == 0 for cp in args.cp), f"every --cp must divide the {world} ranks"
 
-    state = _initial_state(args)
     probe = torch.randn(args.hidden, generator=torch.Generator().manual_seed(args.seed + 100)).cuda()
-    results = [record for cp in args.cp for record in _probe_cp(args, cp, state, probe)]
+    results = []
+    for layer in args.layers:
+        state = _initial_state(args, layer)
+        modes = args.attention_modes if layer == "attention" else args.modes
+        results += [record for cp in args.cp for record in _probe_cp(args, layer, modes, cp, state, probe)]
 
     failures = _report(results, args) if dist.get_rank() == 0 else []
     if dist.get_rank() == 0 and args.json_out:
