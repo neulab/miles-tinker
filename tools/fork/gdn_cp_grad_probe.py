@@ -71,7 +71,8 @@ def _config(args, layer: str, cp: int, mode: str | None) -> TransformerConfig:
             **common,
             kv_channels=256,
             qk_layernorm=True,
-            attention_output_gate=True,
+            add_bias_linear=False,  # Qwen3.5: --disable-bias-linear
+            attention_output_gate=not args.no_attention_gate,
             attention_softmax_in_fp32=True,
             attention_backend=AttnBackend.flash,
             cp_comm_type=mode or "p2p",
@@ -217,9 +218,28 @@ def _probe_cp(args, layer: str, modes: list[str], cp: int, state: dict, probe: t
                 "input_grad_after_split": _rows_stats(input_grad[local_region == 2], ref_in[local_region == 2], cp),
                 "output": _rows_stats(output, ref_out[positions], cp),
                 "params": {name: _tensor_stats(grads[name], ref_grads[name]) for name in sorted(ref_grads)},
+                "output_rows_off": _rows_off(output, ref_out[positions], positions, cu, cp),
             }
         )
     return records
+
+
+def _rows_off(output: torch.Tensor, ref: torch.Tensor, positions: torch.Tensor, cu: list[int], cp: int) -> dict:
+    """Where the outputs disagree: rows whose cosine against the reference is below 0.99, counted per
+    (segment, zigzag chunk) over the whole CP group, with the first few global positions."""
+    off = positions[F.cosine_similarity(output, ref, dim=1) < 0.99].tolist()
+    gathered = [off]
+    if cp > 1:
+        gathered = [None] * cp
+        dist.all_gather_object(gathered, off, group=parallel_state.get_context_parallel_group())
+    rows = sorted(row for part in gathered for row in part)
+    by_chunk: dict[str, int] = {}
+    for row in rows:
+        segment = max(i for i in range(len(cu) - 1) if cu[i] <= row)
+        chunk = (row - cu[segment]) // ((cu[segment + 1] - cu[segment]) // (2 * cp))
+        key = f"segment{segment}/chunk{chunk}"
+        by_chunk[key] = by_chunk.get(key, 0) + 1
+    return {"count": len(rows), "of": cu[-1], "by_segment_chunk": by_chunk, "first": rows[:16]}
 
 
 def _report(results: list[dict], args) -> list[str]:
@@ -238,6 +258,10 @@ def _report(results: list[dict], args) -> list[str]:
             print(f"  {name:48s} cosine {stats['cosine']:.6f}  norm ratio {stats['norm_ratio']:.5f}{mark}")
             if bad:
                 failures.append(f"{label} {name}: cosine {stats['cosine']:.6f}, norm ratio {stats['norm_ratio']:.5f}")
+        off = record["output_rows_off"]
+        print(
+            f"  output rows below cosine 0.99: {off['count']} of {off['of']} {off['by_segment_chunk']} first {off['first']}"
+        )
     print("PASS" if not failures else "FAIL:\n  " + "\n  ".join(failures))
     sys.stdout.flush()
     return failures
@@ -250,6 +274,7 @@ def main() -> int:
     parser.add_argument("--modes", nargs="+", default=["chunkwise", "headwise"], choices=["chunkwise", "headwise"])
     parser.add_argument("--attention-modes", nargs="+", default=["p2p"], choices=["p2p", "a2a", "all_gather"])
     parser.add_argument("--attention-sharpness", type=float, default=1.0, help="std of the attention logits")
+    parser.add_argument("--no-attention-gate", action="store_true", help="drop Qwen3.5's attention output gate")
     # the datums (tokens) of one packed row: the 8000-token one straddles the first CP split
     parser.add_argument("--lengths", type=int, nargs="+", default=[1000, 8000, 3000])
     parser.add_argument("--hidden", type=int, default=2560)
