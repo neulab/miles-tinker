@@ -419,6 +419,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "every step. Ignored for text-only providers."
                 ),
             )
+            reset_arg(
+                parser,
+                "--linear-cp-mode",
+                choices=["chunkwise", "headwise"],
+                default="chunkwise",
+                help=(
+                    "Context-parallel mode of linear-attention (GatedDeltaNet) layers at --context-parallel-size > 1 "
+                    "(Megatron's TransformerConfig.linear_cp_mode): 'chunkwise' keeps every head and shards the "
+                    "sequence (fla CP kernels); 'headwise' all-to-alls to full sequences on a 1/CP slice of the heads "
+                    "(needs the linear heads divisible by TP*CP). Attention layers follow --cp-comm-type."
+                ),
+            )
             parser.add_argument(
                 "--dsa-attention-backend",
                 choices=["megatron", "tilelang"],

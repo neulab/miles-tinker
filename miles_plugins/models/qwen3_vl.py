@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 import threading
 from typing import NamedTuple
 
@@ -25,6 +26,12 @@ def install_qwen3_vl_packed_mrope_patch() -> None:
     _patch_rotary_signature()
     _patch_model_forward_and_rope_index()
     _patch_allgather_vision_embeddings_kwarg()
+
+
+def is_packed_mrope_patch_installed(model_cls: type) -> bool:
+    """Whether the bridge's ``Qwen3VLModel`` class and its module's ``get_rope_index`` carry this patch."""
+    module = sys.modules.get(model_cls.__module__)
+    return bool(getattr(module, _PATCHED, False)) and bool(model_cls.__dict__.get(_PATCHED, False))
 
 
 def _patch_allgather_vision_embeddings_kwarg() -> None:

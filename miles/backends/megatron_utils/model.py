@@ -25,6 +25,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from miles.backends.megatron_utils.cp_model_config import check_loss_scaling_invariants
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
@@ -177,6 +178,7 @@ def setup_model_and_optimizer(
 
             provider_func = wrap_model_provider_with_inkling_lora(provider_func, args)
         model = get_model(provider_func, ModelType.encoder_or_decoder)
+        check_loss_scaling_invariants(model, args)
 
     for manager in all_replay_managers:
         registered = len(manager.replays)
