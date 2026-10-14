@@ -93,6 +93,7 @@ def _patch_model_forward_and_rope_index() -> None:
     def patched_get_rope_index(*args, **kwargs):
         pending = getattr(_tls, "packed_positions", None)
         if pending is not None:
+            _tls.packed_positions_used = True
             return pending, None
         return orig_get_rope_index(*args, **kwargs)
 
@@ -122,16 +123,33 @@ def _patch_model_forward_and_rope_index() -> None:
     def patched_forward(self, *args, **kwargs):
         parsed = _parse_packed_thd(args, kwargs)
         packed = _build_packed_positions(self, parsed, kwargs, orig_get_rope_index)
+        pre_sharded = _is_cp_pre_sharded(parsed)
+        if pre_sharded and packed is None:
+            # the bridge's dense get_rope_index would number this rank's zigzag chunks as one sequence
+            raise RuntimeError(
+                "qwen3_vl packed mRoPE: a CP-sharded THD row "
+                f"(cu_seqlens_q[-1]={parsed.cu[-1]}, local length {parsed.local_len}, cp={parsed.cp_size}) "
+                "got no rank-local MRoPE positions"
+            )
         ctx = _prepare_cp_local_context(parsed)
         if packed is not None:
             _tls.packed_positions = packed
         if ctx is not None:
             _tls.cp_local = ctx
+        _tls.packed_positions_used = False
         try:
-            return orig_forward(self, *args, **kwargs)
+            output = orig_forward(self, *args, **kwargs)
+            if pre_sharded and not _tls.packed_positions_used:
+                raise RuntimeError(
+                    "qwen3_vl packed mRoPE: the bridge's Qwen3VLModel.forward never asked get_rope_index for "
+                    "positions of a CP-sharded THD row, so miles' rank-local MRoPE positions went unused "
+                    "(a megatron-bridge build this patch does not cover)"
+                )
+            return output
         finally:
             _tls.packed_positions = None
             _tls.cp_local = None
+            _tls.packed_positions_used = False
 
     Qwen3VLModel.forward = patched_forward
     setattr(Qwen3VLModel, _PATCHED, True)
@@ -184,6 +202,12 @@ def _parse_packed_thd(args, kwargs):
     flat = input_ids.reshape(-1)
     cp_size, cp_rank = _cp_size_rank()
     return _PackedTHD(psp, flat, cu_t.detach().cpu().tolist(), cu_t, flat.numel(), cp_size, cp_rank)
+
+
+def _is_cp_pre_sharded(parsed) -> bool:
+    """A THD row that holds only this rank's share of a CP-split packed row (cu_seqlens_q describes
+    the full row): MRoPE positions must then come from miles' patch, never the dense path."""
+    return parsed is not None and parsed.cp_size > 1 and parsed.cu[-1] != parsed.local_len
 
 
 def _prepare_cp_local_context(parsed):
