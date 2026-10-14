@@ -78,6 +78,13 @@ def _validate_context_parallel(args) -> None:
         "--allgather-cp splits the packed row contiguously; the Tinker losses and gathers expect the zigzag "
         "layout of --context-parallel-size without --allgather-cp"
     )
+    if getattr(args, "use_rollout_routing_replay", False) and not getattr(args, "tinker_r3_check", False):
+        # the fill slices routing rows exactly like the tokens (tests/fast/backends/training_utils/
+        # test_replay_data_cp.py), but no GPU run has checked R3 under CP yet
+        logger.warning(
+            f"--use-rollout-routing-replay at --context-parallel-size {args.context_parallel_size} has CPU tests "
+            "only: run this layout once with --tinker-r3-check (replayed vs rollout routing) before relying on it"
+        )
 
 
 def _validate_datum_token_cap(args) -> None:
@@ -146,9 +153,9 @@ def _validate_routing_replay(args) -> None:
 
 def _validate_fused_lm_head(args) -> None:
     """The fused chunked head only yields target-token logprobs of the policy loss."""
-    assert not getattr(
-        args, "use_rollout_entropy", False
-    ), "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
+    assert not getattr(args, "use_rollout_entropy", False), (
+        "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
+    )
     assert (
         getattr(args, "loss_type", "policy_loss") == "policy_loss"
     ), f"--fused-lm-head-logprobs serves policy_loss only, got --loss-type {args.loss_type!r}"

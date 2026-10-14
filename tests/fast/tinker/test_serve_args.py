@@ -259,3 +259,15 @@ def test_cp_with_r3_and_the_fused_head_is_allowed_but_not_with_a_fused_router():
     arguments.validate_tinker_serve_args(_fused_args(context_parallel_size=2))
     with pytest.raises(AssertionError, match="moe-router-fusion"):
         arguments.validate_tinker_serve_args(_r3_args(context_parallel_size=2, moe_router_fusion=True))
+
+
+def test_r3_under_cp_warns_until_a_run_checks_it(caplog):
+    """The R3 fill under CP has CPU alignment tests only (test_replay_data_cp.py): ask for --tinker-r3-check."""
+    with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
+        arguments.validate_tinker_serve_args(_r3_args(context_parallel_size=2))
+    assert any("CPU tests only" in message for message in caplog.messages)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="miles.utils.tinker_args"):
+        arguments.validate_tinker_serve_args(_r3_args(context_parallel_size=2, tinker_r3_check=True))
+        arguments.validate_tinker_serve_args(_r3_args())
+    assert not any("CPU tests only" in message for message in caplog.messages)
