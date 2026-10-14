@@ -456,10 +456,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             )
             outputs = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=unit_id)
-        if not get_parallel_state().is_pp_last_stage:
+        parallel_state = get_parallel_state()
+        if not parallel_state.is_pp_last_stage:
             return None
         # Each CP rank scored its zigzag shard of every datum: reassemble full-length vectors (one
-        # CP all-reduce for the unit) so every rank returns what the gateway keeps for a sample.
+        # CP all-reduce for the unit, which every CP rank joins).
         log_probs, _ = gather_cp_response_values(
             outputs["log_probs"],
             rollout_data["total_lengths"],
@@ -467,6 +468,8 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.qkv_format,
             rollout_data.get("max_seq_lens", None),
         )
+        if parallel_state.cp.rank != 0 or parallel_state.tp.rank != 0:
+            return None  # the vectors of CP/TP rank 0 of this DP rank: one copy per DP rank in the object store
         return Box(ray.put({"sample_indices": rollout_data["sample_indices"], "logprobs": log_probs}))
 
     @with_logs
