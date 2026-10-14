@@ -18,6 +18,7 @@
 # Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for presets):
 #   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
 #   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
+#   (context parallelism: LAUNCHER_ARGS="--cp N [--max-tokens-per-gpu <per-rank>]" with run_qwen3_6_35b_a3b_gateway.py)
 #   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
 #   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
 #   SERVICE_ENVIRONMENT=toolathlon|swe_rebench|frontier_cs  SWE_ENV  FRONTIER_ENV

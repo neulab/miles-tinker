@@ -18,6 +18,7 @@ from miles.backends.megatron_utils.full import executor as full_executor
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
 from miles.backends.megatron_utils.lora import executor as lora_executor
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
+from miles.backends.training_utils.cp_utils import gather_cp_response_values
 from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.specs.train import compute_trainer_pool_id
@@ -455,16 +456,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             )
             outputs = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=unit_id)
-        if not get_parallel_state().is_pp_last_stage:
+        parallel_state = get_parallel_state()
+        if not parallel_state.is_pp_last_stage:
             return None
-        return Box(
-            ray.put(
-                {
-                    "sample_indices": rollout_data["sample_indices"],
-                    "logprobs": [t.cpu() for t in outputs["log_probs"]],
-                }
-            )
+        # Each CP rank scored its zigzag shard of every datum: reassemble full-length vectors (one
+        # CP all-reduce for the unit, which every CP rank joins).
+        log_probs, _ = gather_cp_response_values(
+            outputs["log_probs"],
+            rollout_data["total_lengths"],
+            rollout_data["response_lengths"],
+            self.args.qkv_format,
+            rollout_data.get("max_seq_lens", None),
         )
+        if parallel_state.cp.rank != 0 or parallel_state.tp.rank != 0:
+            return None  # the vectors of CP/TP rank 0 of this DP rank: one copy per DP rank in the object store
+        return Box(ray.put({"sample_indices": rollout_data["sample_indices"], "logprobs": log_probs}))
 
     @with_logs
     def load_slot(

@@ -51,6 +51,7 @@ from megatron.core.optimizer import MegatronOptimizer
 from miles.backends.megatron_utils import tinker_perf
 from miles.backends.megatron_utils.adam_params import apply_adam_params, set_clip_grad, should_veto_step
 from miles.backends.megatron_utils.checkpoint import load_checkpoint
+from miles.backends.megatron_utils.cp_model_config import check_per_token_loss_flag
 from miles.backends.megatron_utils.lora.optimizer import reset_grad_metadata_keep_grads
 from miles.backends.megatron_utils.model import (
     _has_loadable_ckpt,
@@ -111,6 +112,9 @@ def forward_backward(
     for model_chunk in model:
         model_chunk.train()
     config = setup_train_iteration_config(args, model, optimizer, disable_optimizer=False)
+    # the schedule reads the flag from the config on every call; a reset that did not hold (or a later
+    # rebuild that turned it back on) would scale this unit's gradients by num_microbatches * |DP*CP|
+    check_per_token_loss_flag(config, args)
     config.finalize_model_grads_func = _deferred_finalize
     reset_grad_metadata_keep_grads(model)
 

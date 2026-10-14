@@ -46,9 +46,9 @@ def validate_tinker_serve_args(args) -> None:
                 "every forward_backward call, so a multi-call optim window double-counts them; prefer TP=1, EP=1."
             )
     assert not args.calculate_per_token_loss, "Tinker losses are exact sums; drop --calculate-per-token-loss"
-    assert (
-        args.context_parallel_size == 1
-    ), "the Tinker gateway returns per-datum logprobs; context parallelism is not supported"
+    if args.context_parallel_size > 1:
+        _validate_context_parallel(args)
+    _validate_datum_token_cap(args)
     assert (
         args.rollout_temperature == 1.0
     ), "the Tinker gateway scores logprobs at --rollout-temperature; Tinker semantics are untempered (keep 1.0)"
@@ -62,9 +62,82 @@ def validate_tinker_serve_args(args) -> None:
         _validate_fused_lm_head(args)
 
 
+def _validate_context_parallel(args) -> None:
+    """CP>1 (docs/fork/full-finetuning.md): the Tinker losses, the forward-only and per-datum
+    gathers, the bridge's pre-sharded input detection and the R3 fill all assume miles' zigzag
+    THD layout (get_batch's slice_with_cp), and only the full fine-tuning executor is wired."""
+    assert args.tinker_train_mode == "full", (
+        "the Tinker LoRA gateway requires --context-parallel-size 1: its adapter token spans and slot "
+        "executor are untested under CP; use --tinker-train-mode full"
+    )
+    assert getattr(args, "qkv_format", "thd") == "thd", (
+        f"--context-parallel-size {args.context_parallel_size} through the Tinker gateway needs --qkv-format thd "
+        "(the per-datum zigzag layout the losses and gathers slice)"
+    )
+    assert not getattr(args, "allgather_cp", False), (
+        "--allgather-cp splits the packed row contiguously; the Tinker losses and gathers expect the zigzag "
+        "layout of --context-parallel-size without --allgather-cp"
+    )
+    if getattr(args, "use_rollout_routing_replay", False) and not getattr(args, "tinker_r3_check", False):
+        # the fill slices routing rows exactly like the tokens (tests/fast/backends/training_utils/
+        # test_replay_data_cp.py), but no GPU run has checked R3 under CP yet
+        logger.warning(
+            f"--use-rollout-routing-replay at --context-parallel-size {args.context_parallel_size} has CPU tests "
+            "only: run this layout once with --tinker-r3-check (replayed vs rollout routing) before relying on it"
+        )
+
+
+def _validate_datum_token_cap(args) -> None:
+    """A datum trains as one sequence, so one microbatch of ``--max-tokens-per-gpu`` must hold
+    this rank's share of the longest one.
+
+    Under CP each rank keeps two equal zigzag chunks, padded to a multiple of
+    TP*``--data-pad-size-multiplier`` (get_batch), so the longest datum is
+    ``CP * floor(max_tokens_per_gpu / pad) * pad`` (the cap of radixark/miles #3320); the
+    budget is per rank and easy to leave at its CP=1 value, so a longer cap is an error. At
+    CP=1 rows up to the budget have always run (their padding block on top), so only a cap
+    above the budget itself is reported, as a warning.
+    """
+    max_tokens_per_gpu = getattr(args, "max_tokens_per_gpu", None)
+    max_tokens_per_datum = getattr(args, "tinker_max_tokens_per_datum", None)
+    if max_tokens_per_gpu is None or max_tokens_per_datum is None:
+        return
+    cp = args.context_parallel_size
+    if cp == 1:
+        if max_tokens_per_datum > max_tokens_per_gpu:
+            logger.warning(
+                f"--tinker-max-tokens-per-datum {max_tokens_per_datum} exceeds --max-tokens-per-gpu "
+                f"{max_tokens_per_gpu}: such a datum trains alone in an oversized microbatch"
+            )
+        return
+    pad = args.tensor_model_parallel_size * getattr(args, "data_pad_size_multiplier", 128)
+    limit = max_datum_tokens(max_tokens_per_gpu, cp, pad)
+    assert max_tokens_per_datum <= limit, (
+        f"--tinker-max-tokens-per-datum {max_tokens_per_datum} exceeds the {limit} tokens one microbatch of "
+        f"--max-tokens-per-gpu {max_tokens_per_gpu} holds per rank at --context-parallel-size {cp} (two zigzag "
+        f"chunks padded to a multiple of {pad}); a full-length datum needs --max-tokens-per-gpu >= "
+        f"{cp_shard_tokens(max_tokens_per_datum, cp, pad)}"
+    )
+
+
+def cp_shard_tokens(row_tokens: int, cp: int, pad: int) -> int:
+    """Tokens one CP rank holds for a ``row_tokens`` row: two equal zigzag chunks, padded to a multiple of ``pad``."""
+    shard = 2 * -(-row_tokens // (2 * cp))
+    return -(-shard // pad) * pad
+
+
+def max_datum_tokens(max_tokens_per_gpu: int, cp: int, pad: int) -> int:
+    """The longest row whose CP shard fits one microbatch of ``max_tokens_per_gpu`` tokens per rank."""
+    return cp * (max_tokens_per_gpu // pad * pad)
+
+
 def _validate_routing_replay(args) -> None:
     """R3 through the gateway: the routing cache stores one expert id per (token, layer, slot)."""
     assert getattr(args, "num_experts", None), "--use-rollout-routing-replay needs an MoE model (--num-experts)"
+    assert not getattr(args, "moe_router_fusion", False), (
+        "--use-rollout-routing-replay replays the rollout routing through the unfused MoE top-k; with "
+        "--moe-router-fusion the fused kernel returns before the replay hook and the routing is ignored"
+    )
     assert not getattr(args, "sglang_speculative_algorithm", None), (
         "--use-rollout-routing-replay through the Tinker gateway does not support speculative decoding "
         "(the engines' routed-experts capture is target-only and its buffer ignores verify tokens); "

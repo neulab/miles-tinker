@@ -15,7 +15,24 @@ LOSSES = "miles.backends.training_utils.loss_hub.tinker_losses"
 
 @pytest.fixture
 def losses(monkeypatch):
-    """Import the losses against a scorer that returns per-token logprobs from the batch itself."""
+    """Import the losses against a scorer that returns per-token logprobs from the batch itself (CP=1)."""
+    from miles.backends.training_utils import parallel
+
+    trivial = parallel.GroupInfo(rank=0, size=1, group=None)
+    monkeypatch.setattr(
+        parallel,
+        "_parallel_state",
+        parallel.ParallelState(
+            intra_dp=trivial,
+            intra_dp_cp=trivial,
+            cp=trivial,
+            tp=trivial,
+            pp=trivial,
+            ep=trivial,
+            etp=trivial,
+            indep_dp=trivial,
+        ),
+    )
 
     def get_log_probs_and_entropy(logits, *, args, unconcat_tokens, total_lengths, response_lengths, **kwargs):
         return {"log_probs": list(logits.split(response_lengths))}
@@ -52,9 +69,7 @@ def test_cross_entropy_is_the_weighted_sum_of_datums(losses):
 def test_masked_out_datums_contribute_nothing_under_dro(losses):
     """DRO's divergence penalty does not vanish with advantage 0; the mask must remove the pad row."""
     real = _batch([[-1.0]], [[1]], rollout_log_probs=[[-1.5]], advantages=[[0.7]])
-    padded = _batch(
-        [[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]]
-    )
+    padded = _batch([[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]])
     losses.start_per_datum_outputs()
     loss_real, _ = losses.dro_loss_function(Namespace(), *real, None)
     loss_padded, _ = losses.dro_loss_function(Namespace(), *padded, None)

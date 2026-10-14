@@ -17,6 +17,11 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from miles.backends.megatron_utils.cp_model_config import (
+    apply_context_parallel_modes,
+    check_qwen_vl_mrope_patch,
+    restore_per_token_loss,
+)
 from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.replay_base import routing_replay_manager
@@ -44,9 +49,11 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
     provider.sequence_parallel = args.sequence_parallel
     provider.context_parallel_size = args.context_parallel_size
+    apply_context_parallel_modes(provider, args)
 
-    # loss / sequence handling
-    provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
+    # loss / sequence handling. Qwen3-VL/3.5-VL providers turn calculate_per_token_loss back on in
+    # finalize() at CP>1; the wrapped provider resets it on the built model (restore_per_token_loss).
+    provider.calculate_per_token_loss = args.calculate_per_token_loss
     provider.variable_seq_lengths = args.variable_seq_lengths
 
     # numerics (training infra, not model-defining)
@@ -218,6 +225,8 @@ def get_model_provider_func(
             provider.share_embeddings_and_output_weights = False
         provider.finalize()
         _check_bridge_mtp_depth(provider, args)
+        # what the provider's own __init__ asserts may differ from args (see restore_per_token_loss)
+        finalized_per_token_loss = provider.calculate_per_token_loss
 
         def wrapped_bridge_provider(
             pre_process: bool = True,
@@ -232,7 +241,15 @@ def get_model_provider_func(
             # caller's pg_collection here, those code paths hit AttributeError.
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
+            # the provider is the model's config: a previous chunk's reset must not trip this build's assert
+            provider.calculate_per_token_loss = finalized_per_token_loss
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            if changed := restore_per_token_loss(model, args):
+                logger.info(
+                    f"bridge: reset calculate_per_token_loss={args.calculate_per_token_loss} on {changed} "
+                    f"config(s) of {type(model).__name__} (the provider's finalize() changed it)"
+                )
+            check_qwen_vl_mrope_patch(model, args)
             _check_model_mtp(model, args)
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(

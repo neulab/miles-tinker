@@ -236,6 +236,163 @@ MoE routers train on the experts that produced the tokens.
 Full details: `docs/fork/r3.md` (gateway) and `docs/fork/r3-trainer.md`
 (trainer).
 
+## Context parallelism (128k rows on 80 GB GPUs)
+
+`--context-parallel-size N` (launcher: `run_qwen3_6_35b_a3b_gateway.py --cp N`)
+splits every datum over N trainer ranks in Megatron's zigzag layout: the row is
+padded to 2N equal chunks and rank r keeps chunks r and 2N-1-r, so every rank
+does the same attention work. DP becomes GPUs / (TP * CP). Full fine-tuning
+only: the LoRA gateway stays at CP=1.
+
+What the gateway does under CP:
+
+- **Losses** (ported from upstream #3320, radixark/miles 3d8b5284): each rank
+  slices the datum's full-length weights, advantages and loss mask to its
+  shard (`rollout_log_probs` arrive pre-sliced) and returns the sum over its
+  shard; the DP*CP gradient reduction adds the shards up. A rank with no
+  response token of a microbatch (short datums, pad-only microbatches) returns
+  `logits[..., :0].sum()`, a zero that still runs the shared backward.
+- **Per-datum outputs and `forward`**: one CP all-reduce per microbatch
+  (`forward_backward`) or per unit (`forward`) rebuilds full-length logprobs and
+  whole-datum losses, identical on every rank
+  (`cp_utils.gather_cp_response_values`); `forward` returns them from CP/TP
+  rank 0 of each DP rank only.
+- **Bridge VL models** (Qwen3.5/3.6/3.8): their providers turn
+  `calculate_per_token_loss` on at CP>1. Megatron's DDP, schedule and
+  `finalize_model_grads` read that flag while miles' loss scaling reads args.
+  Through the gateway, whose deferred finalize passes no token count, every
+  gradient came out num_microbatches * DP*CP too large. Elsewhere Megatron's
+  finalize divides by the summed loss normalizer, which cancels that for the
+  main loss, but the MoE aux/z-loss and the MTP loss were scaled per token
+  (about tokens/CP times their per-microbatch scale). The model build resets
+  the flag for every entry point. After `get_model` a check stops the run
+  unless the flag matches args and each DDP chunk reduces over a DP*CP group
+  the size of loss.py's `intra_dp_cp` factor, and every `forward_backward`
+  re-checks the flag.
+- **MRoPE**: miles' packed-MRoPE patch (`miles_plugins/models/qwen3_vl.py`)
+  all-gathers each row, rebuilds the per-datum positions and slices them like
+  the tokens; the v25 image's bridge (megatron-bridge 0.5.0+582783a0) detects
+  the pre-sharded input and uses it. A CP>1 model build fails if the patch is
+  missing, and a forward on a CP-sharded row fails unless the patch built the
+  positions and the bridge asked for them. Newer bridge builds (the 2026-10-10
+  dev image) require explicit rank-local position ids for pre-sharded input and
+  fail at the first forward: CP needs the v25 image for now.
+- **GatedDeltaNet layers**: `--linear-cp-mode headwise` (the launcher's default
+  at `--cp` > 1: an all-to-all gives each rank full sequences on 1/CP of the
+  heads, so TP*CP must divide the 16 linear key heads) or `chunkwise` (fla CP
+  kernels that pass the recurrent state between ranks; Megatron's default when
+  serve_tinker.py gets no `--linear-cp-mode`). Both pass the parity and
+  layer-gradient checks below. Headwise is the launcher's default because its
+  numerics do not depend on how datums are packed and stay closest to CP=1;
+  chunkwise covers layouts where TP*CP does not divide the heads. Check memory
+  at the target row length for either. Attention layers follow
+  `--cp-comm-type`; Megatron's default `p2p` does not override a provider's own
+  choice.
+- **R3**: routing rows are sliced exactly like the tokens (CPU-tested over CP
+  1-8, TP/SP 1-4 and three pad multipliers); serve validation rejects a fused
+  MoE router (it skips the replay hook) and warns at CP>1 until a run with
+  `--tinker-r3-check` has checked the layout on GPU, which none has yet.
+
+Knobs and limits:
+
+| | |
+|---|---|
+| Launcher | `--cp N`, `--linear-cp-mode` (headwise at `--cp` > 1 unless chunkwise is given), `--max-tokens-per-gpu` (per rank; default: the shard of one `--context-len + 1` row, `2 * ceil(row / 2N)` rounded up to a multiple of TP * `--data-pad-size-multiplier`, 128 unless `--extra-args` sets it) |
+| Headwise layouts | TP*CP must divide the linear key and value heads (16 and 32; 16 and 48 for the 27B): TP4/CP2, TP4/CP4, TP1/CP8 fit; TP4/CP8 needs chunkwise |
+| Memory | `actor_peak_mem_{alloc,reserved}_gib_all_ranks` in the optim metrics and `perf.jsonl`: the window's peak over all trainer ranks (the plain keys are rank 0's) |
+| Per-rank budget for 131073-token rows | TP4/CP2 66048, TP4/CP4 33280, TP4/CP8 16896, TP1/CP8 16512 |
+| Serve validation | CP>1 only with `--tinker-train-mode full`, `--qkv-format thd`, no `--allgather-cp`; `--tinker-max-tokens-per-datum <= CP * floor(budget / (TP*128)) * TP*128` |
+| Checkpoints | the distributed optimizer shards over DP*CP: resume with optimizer state at the same TP/EP/DP*CP layout (a CP1 save into a CP2 run is untested) |
+| Images | v25 `miles-latest-cu13.sif` (see MRoPE above) |
+
+ABCI example (two nodes, the Qwen3.5-4B parity recipe; `deploy/abci/README.md`):
+`LAUNCHER_ARGS="--model-variant 4b --cp 2 --context-len 8192 --max-tokens-per-datum 8193"`.
+
+Parity check: `deploy/clients/tinker_cp_parity.py run` (the CLIENT_SCRIPT
+`deploy/abci/clients/cp_parity.sh`) against a CP=1 and a CP>1 gateway of the
+same snapshot, plus a correct alternative CP=1 layout (TP2) as the noise
+reference, then `tinker_cp_parity.py compare <cp1.json> <cpN.json> --noise
+<tp2.json>`. It reports per-chunk and near-boundary logprob deltas, per-datum
+loss deltas and grad_norm ratios. The per-token-loss bug above would show as a
+grad_norm ratio of 2 or more. Use the default natural-text datums. On random
+tokens the gradient norm moves 8% just from TP1 to TP2, which hides real
+differences.
+
+Give the CP=1 reference the candidate's row budget per microbatch,
+`--max-tokens-per-gpu` = CP x the candidate's per-rank budget (8448 against
+the CP2 recipe above, whose per-rank default is 4224; the CP=1 default is
+8193), so that both runs pack the datum set alike. The packing moves the
+numbers even at CP=1. Going from 8193 to 8448 puts each DP rank's share of
+the datum set in one microbatch instead of two, so the short datums share a
+microbatch with a long row, and the step-1 grad_norm moves by 0.31%. Forward
+logprobs move by mean 9e-4 overall and by up to 0.29 on rows of 512 tokens
+or fewer, while the rows of 1000 tokens and up and the datums sent alone
+agree to 1e-6.
+
+Boundaries depend on the layer type. Ring attention and the MRoPE positions
+see each datum's zigzag chunk boundaries. Chunkwise GatedDeltaNet layers see a
+contiguous split of the whole packed row into CP parts, where the recurrent
+state and the conv halo pass between ranks, so its position depends on the
+packing. The probe therefore also sends a 4000- and an 8000-token datum alone
+(`forward`, and `forward_backward` in the first window with the loss on the
+second half) and gates windows at their split rows,
+`k * roundup(2 * ceil(L / 2CP), TP * 128)` (TP and the pad multiplier come
+from the gateway's `head.log`). Rows of up to 512 tokens are also gated one at
+a time on their largest delta before the first optimizer step, and are never
+trimmed out of the KL, so an error confined to the short datums cannot hide
+among the 8K-token rows. `tools/fork/gdn_cp_grad_probe.py` checks the
+GatedDeltaNet backward directly: one layer on a packed row, each CP layout
+against no CP, per-parameter and pre-split input gradients with the loss after
+the split.
+
+Validation (Qwen3.5-4B, v25 image, one H200 node training + one engine node,
+`--context-len 8192`, natural-text datums of 2-8192 tokens plus the lone
+4000- and 8000-token datums; reference CP1, noise reference TP2 at CP1; jobs
+2633902-2634333 under `/groups/gai51740/aci18912it/platoon-next/jobs/cp-v2-4b-*`
+(the GatedDeltaNet probe ran in 2634092, the attention probe in 2634717 under
+`cp-v2-attnprobe-*`); the first round, 2632317-2633025 under
+`cp-{par,txt}-4b-*`, had no lone datums):
+
+| Check | Result |
+|---|---|
+| Bridge per-token-loss reset | fired on all 8 ranks at CP2, CP4 and CP8 in both GDN modes, never at CP1/TP2; the post-`get_model` check passed; the provider logged `linear_cp_mode=headwise` (or `chunkwise` when requested) |
+| Weight push (`--check-weight-update-equal`) | all engines equal at CP1 and CP2 (first round) and at CP2 headwise |
+| SDK smoke at CP2 headwise (fwd/bwd, optim, sampler push + sample, named `save_state`, resume with optimizer) | 0 failed checks (first round: also 0 at CP2 chunkwise) |
+| Sampler vs trainer (on-policy probe) | KL 2.9e-4 CP1, 3.2e-4 TP2, 2.6e-4 CP2 headwise, 2.8e-4 CP4 headwise, 3.5e-4 CP8 headwise, 3.1e-4 CP2 chunkwise, 2.9e-4 CP4 chunkwise |
+| `compare <cp1> <cand> --noise <tp2>` | PASS for CP2/CP4/CP8 headwise and CP2/CP4 chunkwise |
+| Forward logprobs vs CP1: mean abs / trimmed KL | TP2 6.7e-3 / 2.7e-4; headwise CP2 3.5e-3 / 8.1e-5, CP4 4.8e-3 / 1.4e-4, CP8 5.6e-3 / 1.8e-4; chunkwise CP2 6.4e-3 / 2.2e-4, CP4 6.8e-3 / 2.3e-4 |
+| Same forward, datums packed in another order | bit-stable at CP1 and with headwise (max 1e-6); chunkwise changes a row's numerics with where it straddles the contiguous split (mean 1.2e-3 to 1.7e-3, a few multi-nat flips on repeated text, as between TP1 and TP2) |
+| GatedDeltaNet split windows (lone datums, chunkwise) | mean abs delta at the splits 3.6e-5 (CP2) and 4.3e-4 (CP4) against 8.6e-3 and 6.9e-3 elsewhere in those rows: no handoff error |
+| GatedDeltaNet layer probe (`tools/fork/gdn_cp_grad_probe.py`, CP 2/4/8, loss after the CP split) | every parameter gradient and the pre-split input gradients match no CP at cosine >= 0.99996 in both modes; pre-split input-gradient norm ratio 0.9995-0.9996 chunkwise, 0.9999-1.0000 headwise |
+| Attention layer probe (ring attention p2p, CP 2/4/8, logit std 1 and 8) | every gradient and the outputs match no CP at cosine >= 0.99994, norm ratios within 0.06% |
+| Step-1 `cross_entropy` grad_norm vs CP1 (same weights) | TP2 1.000004; headwise CP2 1.0023, CP4 1.0016, CP8 1.0019; chunkwise CP2 1.0030, CP4 1.0020 (against a CP1 reference packed at 8193 tokens per microbatch; see the third round) |
+
+Third round (head 14025130; jobs 2635003 = CP1/DP8 at `--max-tokens-per-gpu
+8448` and 2635004 = CP2/DP4 headwise at 4224, run at the same time; both
+under `cp-v3-4b-*`). The CP>1 runs of round two had packed 8448 to 9216
+tokens per microbatch, while their CP1 reference used 8193.
+
+| Check | Result |
+|---|---|
+| `compare <cp1> <cp2>` (no noise run) | PASS. Forward mean abs 3.3e-3, p99 0.059, trimmed KL 7.8e-5, short rows max 0.23; step-1 per-datum loss within 0.021 (sum 89.649 vs 89.644); logprobs after the three steps mean abs 7.8e-3, KL 4.7e-4 |
+| Step-1 grad_norm at the same weights, CP2/CP1 | 0.9993 on the parity datums, 0.9996 on the on-policy probe's datums, 0.9995 on the SDK smoke's datums. Steps 2 and 3 of the parity probe: 0.932 and 0.980 (CP1 alone moved 8.4% at step 2 between the two packings) |
+| Step-1 grad_norm offset of round two | Packing, not CP. Against the 8448 reference, round two's chunkwise CP2 dump is at 0.9999. The CP4 and CP8 runs (8704 and 9216 tokens per microbatch) are at 0.9984-0.9989: below this reference, where they had been above the 8193 one, and within the 0.31% that the packing moves CP1. TP2 at 8193 keeps the short datums apart from the long rows, as its CP1 reference does, hence its 1.000004. A rerun of the CP2 config reproduced the forward logprobs to 1e-6 and the step-1 grad_norm to 1.4e-4 |
+| Boundary windows | the pooled window/interior ratio is 3.87 (gate 4). Per row, each window matches its own row's interior (for example 2.0e-2 vs 2.2e-2 at 127 tokens, 2.6e-5 vs 2.6e-3 at 8191), and nothing peaks at the boundary token. The pooled ratio puts the windows of the short rows, where deltas are larger, against the interior of the long rows |
+| Sampler vs trainer, SDK smoke, weight push | KL 2.9e-4 (CP1) and 2.8e-4 (CP2); 0 failed SDK checks on both, including named `save_state` and resume with optimizer; `--check-weight-update-equal` at CP2: all 8 engines equal |
+| Peak memory per rank (`perf.jsonl`, maximum over ranks) | 44.3 GiB allocated / 46.7 GiB reserved at CP1 with 8448 tokens; 39.9 / 41.9 GiB at CP2 with 4224 tokens per rank |
+
+Thresholds of `compare` are calibrated so that correct layouts on natural
+text pass with and without `--noise`: mean abs 0.03, p99 0.2, trimmed KL
+1e-3, per short row 0.3, step-1 per-datum loss within 2% (+1e-3), step-1
+grad_norm within 2%, later steps within 25% (the first Adam steps turn gradient
+noise into sign flips), boundary windows up to 4x the interior. `--noise
+<tp2.json>` widens them to twice the noise run's deviation (boundary windows:
+1.5x its own window/interior ratio). With the noise run, a 1-token error at
+each rank boundary fails from 0.05-0.15 nats, a 3-token one from 0.05, and a
+single bad token in every tiny datum from 0.3-0.5. The lone datums' loss is
+reported but not gated: it averages ~4000 tokens of repeated text, where a few
+flips move it by percents under any layout (5% for TP2).
+
 ## Log-probs at 64k context: the fused fp32 head
 
 With `--fused-lm-head-logprobs` the trainer never materializes the `[T, V]`
