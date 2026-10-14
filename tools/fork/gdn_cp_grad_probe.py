@@ -171,7 +171,10 @@ def _tensor_stats(cand: torch.Tensor, ref: torch.Tensor) -> dict:
 def _initial_state(args, layer: str) -> dict:
     """Weights every layout loads. GatedDeltaNet: half the value heads remember ~1000 tokens
     (A ~ 1e-3), so the recurrent state matters across the split; the rest keep their
-    initialization (fast decays)."""
+    initialization (fast decays). Attention: the q/k layernorm gains scale the logits'
+    standard deviation to ``--attention-sharpness`` (1 at initialization spreads each query over
+    thousands of keys, unlike a trained model, and turns bf16 rounding of the near-cancelling
+    partial results into large relative errors)."""
     torch.manual_seed(args.seed)
     built = _build_layer(args, layer, 1, None)
     state = {key: value.detach().cpu().clone() for key, value in built.state_dict().items()}
@@ -179,6 +182,10 @@ def _initial_state(args, layer: str) -> dict:
         a_log = state["A_log"].clone()
         a_log[: a_log.numel() // 2] = math.log(1e-3)
         state["A_log"] = a_log
+    gain = math.sqrt(args.attention_sharpness)  # q and k each: logits scale with the product
+    for key in ("q_layernorm.weight", "k_layernorm.weight"):
+        if key in state:  # zero-centered gamma: the weight stores gain - 1
+            state[key] = state[key] + (gain - 1.0)
     return state
 
 
@@ -242,6 +249,7 @@ def main() -> int:
     parser.add_argument("--layers", nargs="+", default=["gdn"], choices=["gdn", "attention"])
     parser.add_argument("--modes", nargs="+", default=["chunkwise", "headwise"], choices=["chunkwise", "headwise"])
     parser.add_argument("--attention-modes", nargs="+", default=["p2p"], choices=["p2p", "a2a", "all_gather"])
+    parser.add_argument("--attention-sharpness", type=float, default=1.0, help="std of the attention logits")
     # the datums (tokens) of one packed row: the 8000-token one straddles the first CP split
     parser.add_argument("--lengths", type=int, nargs="+", default=[1000, 8000, 3000])
     parser.add_argument("--hidden", type=int, default=2560)
