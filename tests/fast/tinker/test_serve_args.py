@@ -43,7 +43,8 @@ def test_full_mode_accepts_the_recipe_and_disables_the_ddp_nan_check():
         dict(offload_train=True),
         dict(use_dynamic_batch_size=False),
         dict(use_precision_aware_optimizer=True),
-        dict(context_parallel_size=2),
+        dict(context_parallel_size=2, qkv_format="bshd"),
+        dict(context_parallel_size=2, allgather_cp=True),
         dict(rollout_temperature=0.7),
         dict(calculate_per_token_loss=True),
     ],
@@ -213,3 +214,48 @@ def test_datum_cap_rejects_a_cp1_budget_left_in_place():
 def test_datum_cap_is_skipped_without_both_limits():
     arguments._validate_datum_token_cap(_serve_args(context_parallel_size=2, max_tokens_per_gpu=None))
     arguments._validate_datum_token_cap(_serve_args(context_parallel_size=2, tinker_max_tokens_per_datum=None))
+
+
+# -------- context parallelism (full fine-tuning only) --------
+
+
+@pytest.mark.parametrize("cp", [2, 4, 8])
+def test_full_mode_accepts_zigzag_context_parallelism(cp):
+    arguments.validate_tinker_serve_args(_serve_args(context_parallel_size=cp, qkv_format="thd", allgather_cp=False))
+    # the per-rank budget of one 131073-token row at TP4 (docs/fork/full-finetuning.md)
+    budget = {2: 66048, 4: 33280, 8: 16896}[cp]
+    arguments.validate_tinker_serve_args(
+        _serve_args(
+            context_parallel_size=cp,
+            tensor_model_parallel_size=4,
+            data_pad_size_multiplier=128,
+            max_tokens_per_gpu=budget,
+            tinker_max_tokens_per_datum=131073,
+        )
+    )
+
+
+def test_cp_keeps_the_datum_cap_per_rank():
+    with pytest.raises(AssertionError, match="needs --max-tokens-per-gpu >= 66048"):
+        arguments.validate_tinker_serve_args(
+            _serve_args(
+                context_parallel_size=2,
+                tensor_model_parallel_size=4,
+                max_tokens_per_gpu=65537,
+                tinker_max_tokens_per_datum=131073,
+            )
+        )
+
+
+def test_lora_mode_stays_at_cp1():
+    with pytest.raises(AssertionError, match="LoRA gateway requires --context-parallel-size 1"):
+        arguments.validate_tinker_serve_args(
+            _serve_args(tinker_train_mode="lora", multi_lora_n_adapters=2, lora_rank=8, context_parallel_size=2)
+        )
+
+
+def test_cp_with_r3_and_the_fused_head_is_allowed_but_not_with_a_fused_router():
+    arguments.validate_tinker_serve_args(_r3_args(context_parallel_size=2))
+    arguments.validate_tinker_serve_args(_fused_args(context_parallel_size=2))
+    with pytest.raises(AssertionError, match="moe-router-fusion"):
+        arguments.validate_tinker_serve_args(_r3_args(context_parallel_size=2, moe_router_fusion=True))

@@ -46,9 +46,8 @@ def validate_tinker_serve_args(args) -> None:
                 "every forward_backward call, so a multi-call optim window double-counts them; prefer TP=1, EP=1."
             )
     assert not args.calculate_per_token_loss, "Tinker losses are exact sums; drop --calculate-per-token-loss"
-    assert (
-        args.context_parallel_size == 1
-    ), "the Tinker gateway returns per-datum logprobs; context parallelism is not supported"
+    if args.context_parallel_size > 1:
+        _validate_context_parallel(args)
     _validate_datum_token_cap(args)
     assert (
         args.rollout_temperature == 1.0
@@ -61,6 +60,24 @@ def validate_tinker_serve_args(args) -> None:
         _validate_routing_replay(args)
     if getattr(args, "fused_lm_head_logprobs", False):
         _validate_fused_lm_head(args)
+
+
+def _validate_context_parallel(args) -> None:
+    """CP>1 (docs/fork/full-finetuning.md): the Tinker losses, the forward-only and per-datum
+    gathers, the bridge's pre-sharded input detection and the R3 fill all assume miles' zigzag
+    THD layout (get_batch's slice_with_cp), and only the full fine-tuning executor is wired."""
+    assert args.tinker_train_mode == "full", (
+        "the Tinker LoRA gateway requires --context-parallel-size 1: its adapter token spans and slot "
+        "executor are untested under CP; use --tinker-train-mode full"
+    )
+    assert getattr(args, "qkv_format", "thd") == "thd", (
+        f"--context-parallel-size {args.context_parallel_size} through the Tinker gateway needs --qkv-format thd "
+        "(the per-datum zigzag layout the losses and gathers slice)"
+    )
+    assert not getattr(args, "allgather_cp", False), (
+        "--allgather-cp splits the packed row contiguously; the Tinker losses and gathers expect the zigzag "
+        "layout of --context-parallel-size without --allgather-cp"
+    )
 
 
 def _validate_datum_token_cap(args) -> None:
