@@ -105,6 +105,9 @@ DEFAULT_THRESHOLDS = {
     "kl": 1e-3,  # mean(exp(d) - 1 - d) without the top 0.1% |d| (a few flips on ambiguous repeats dominate the mean)
     "p99_abs": 0.2,  # 99th percentile |dlogprob| (the max is one token on an improbable target)
     "boundary_excess": 3.0,  # mean |d| within +-8 of a boundary <= this x interior mean + 1e-3
+    # with --noise: or this x the noise run's own window/interior ratio at the same rows (it has no boundary
+    # there; windows sit near the start of the short rows, which differ more under any layout change)
+    "boundary_noise_margin": 1.5,
     "per_datum_max_abs": 0.3,  # max |d| of each short row before the first optimizer step (all layouts <= 0.24)
     "loss_rtol": 0.02,  # step 1 per-datum losses (same weights in both runs)
     "loss_atol": 1e-3,
@@ -424,28 +427,31 @@ def vector_failures(
         if report[key] > limits[key]:
             failures.append(f"{name}: {key} {report[key]:.3g} > {limits[key]:.3g}")
     interior = report["interior"]
-    excess = thresholds["boundary_excess"]
-    near = report["near_boundary"]
-    # short datums lie entirely within the window of some boundary: no interior to compare against
-    if near["tokens"] and interior["tokens"] and near["mean_abs"] > excess * interior["mean_abs"] + 1e-3:
-        failures.append(
-            f"{name}: mean |d| near chunk boundaries {near['mean_abs']:.3g} vs interior {interior['mean_abs']:.3g}"
-        )
-    split = report["near_gdn_split"]
-    if split["tokens"] and interior["tokens"]:
-        # a window of a few dozen tokens: a correct layout's flip on an ambiguous repeat can land in it,
-        # so the noise run (no split there) widens the limit
-        allowed = excess * interior["mean_abs"] + 1e-3
-        if noise is not None:
-            allowed = max(allowed, factor * noise["near_gdn_split"]["mean_abs"])
-        if split["mean_abs"] > allowed:
+    for key, label in (("near_boundary", "chunk boundaries"), ("near_gdn_split", "the GatedDeltaNet CP splits")):
+        window = report[key]
+        # short datums lie entirely within the window of some boundary: no interior to compare against
+        if not window["tokens"] or not interior["tokens"]:
+            continue
+        allowed = _window_ratio_limit(thresholds, noise, key) * interior["mean_abs"] + 1e-3
+        if window["mean_abs"] > allowed:
             failures.append(
-                f"{name}: mean |d| near the GatedDeltaNet CP splits {split['mean_abs']:.3g} > {allowed:.3g} "
+                f"{name}: mean |d| near {label} {window['mean_abs']:.3g} > {allowed:.3g} "
                 f"(interior {interior['mean_abs']:.3g})"
             )
     if pre_update:
         failures.extend(_short_row_failures(name, report, thresholds, lengths, noise, factor))
     return failures
+
+
+def _window_ratio_limit(thresholds: dict, noise: dict | None, key: str) -> float:
+    """How many times the interior mean |d| a boundary window may reach: ``boundary_excess``, or
+    ``boundary_noise_margin`` x the ratio a correct layout (the noise run, without that boundary)
+    shows at the same rows."""
+    ratio = thresholds["boundary_excess"]
+    if noise is not None and noise[key]["tokens"] and noise["interior"]["mean_abs"] > 0:
+        noise_ratio = noise[key]["mean_abs"] / noise["interior"]["mean_abs"]
+        ratio = max(ratio, thresholds["boundary_noise_margin"] * noise_ratio)
+    return ratio
 
 
 def _short_row_failures(

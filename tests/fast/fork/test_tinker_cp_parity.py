@@ -221,11 +221,44 @@ def test_an_error_at_the_gdn_split_fails(parity, tmp_path, capsys):
     assert _compare(parity, tmp_path, _dump(parity), _dump(parity, cp=2, lone_shift=_after_split(0.1, 150))) == 0
 
 
+def _with_background(shift, level=2e-3):
+    """``shift`` on top of a uniform ``level`` delta everywhere (an interior to compare the windows with)."""
+    return lambda n: shift(n) + level
+
+
 def test_a_noise_run_widens_the_gdn_windows(parity, tmp_path):
-    """A flip on an ambiguous repeat can land in a split window under any layout; the noise run measures it there."""
-    ref, cand = _dump(parity), _dump(parity, cp=2, lone_shift=_after_split(0.1))
-    noise = _dump(parity, lone_shift=_after_split(-0.08))
+    """A flip on an ambiguous repeat can land in a split window under any layout; the noise run measures the
+    window/interior ratio a correct layout shows there."""
+    ref = _dump(parity)
+    cand = _dump(parity, cp=2, lone_shift=_with_background(_after_split(0.1)))
+    assert _compare(parity, tmp_path, ref, cand) == 1
+    noise = _dump(parity, lone_shift=_with_background(_after_split(-0.08)))
     assert _compare(parity, tmp_path, ref, cand, noise=noise) == 0
+    quiet_noise = _dump(parity, lone_shift=_with_background(lambda n: np.zeros(n)))
+    assert _compare(parity, tmp_path, ref, cand, noise=quiet_noise) == 1
+
+
+def test_a_noise_run_widens_the_zigzag_windows_by_its_own_ratio(parity, tmp_path, capsys):
+    """Windows near the start of short rows differ more under any layout: a correct layout without boundaries
+    (TP2) shows the window/interior ratio a candidate may reach (x1.5), not an absolute deviation."""
+
+    def at_boundaries(delta):
+        def shift(n):
+            out = np.full(n, 2e-3)
+            _, near = parity.zigzag_layout(n, cp=2)
+            out[near] += delta
+            return out
+
+        return shift
+
+    ref = _dump(parity)
+    cand = _dump(parity, cp=2, shift=at_boundaries(0.006))  # window/interior ratio 4
+    assert _compare(parity, tmp_path, ref, cand) == 1
+    noise = _dump(parity, shift=at_boundaries(0.004))  # a correct layout at ratio 3
+    assert _compare(parity, tmp_path, ref, cand, noise=noise) == 0
+    worse = _dump(parity, cp=2, shift=at_boundaries(0.02))  # ratio 11: over 1.5 x the noise run's 3
+    assert _compare(parity, tmp_path, ref, worse, noise=noise) == 1
+    assert "near chunk boundaries" in capsys.readouterr().out
 
 
 def test_short_rows_are_gated_one_by_one_before_the_first_step(parity, tmp_path, capsys):
