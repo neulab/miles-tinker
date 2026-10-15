@@ -21,7 +21,7 @@ _FINISHED_TTL_S = 3600.0  # an undelivered result waits this long for its poller
 # A delivered result only serves a retry of a lost response, so it leaves much sooner:
 # at hundreds of samples per second an hour of results is GBs of heap, and every full
 # GC pass and expiry sweep walks all of it (1 s and 0.2 s per million results).
-_DELIVERED_TTL_S = 60.0
+_DELIVERED_TTL_S = 300.0
 _SWEEP_INTERVAL_S = 60.0  # full expiry pass; the polled promise itself is always checked
 
 

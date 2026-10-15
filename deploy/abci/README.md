@@ -1,5 +1,9 @@
 # Tinker gateway on ABCI (PBS + Singularity + Ray)
 
+For GRPO/PPO on one eight-GPU node with your own account paths, use the
+[single-node serving guide](SINGLE_NODE.md) and separate
+[environment setup](ENVIRONMENT.md).
+
 End-to-end runbook for serving `serve_tinker.py` from this fork on two 8xH200
 ABCI nodes and training against it with tinker-cookbook or platoon from the
 login node. Cluster facts used throughout:

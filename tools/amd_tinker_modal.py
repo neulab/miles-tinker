@@ -4,14 +4,18 @@ An outbound SSH reverse forward carries traffic from the sandbox back to the
 GPU host. Modal terminates HTTPS; nginx checks the client's X-API-Key before
 forwarding. Keys and relay metadata stay under the deployment's runtime folder.
 This helper is launched by ``amd_tinker.py serve --modal-relay``.
+Use ``--ssh-over-tls`` on hosts that require the outbound tunnel to use TLS port 443.
 """
 
 import argparse
 import json
 import os
 import secrets
+import shlex
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -68,23 +72,78 @@ def _relay_keys(runtime):
     return key_path.read_text().strip(), ssh_key
 
 
-def _wait_for_ssh(host, port):
+def _wait_for_ssh(host, port, *, tls=False):
+    context = ssl.create_default_context() if tls else None
     deadline = time.monotonic() + 60
+    last_error = None
     while time.monotonic() < deadline:
         try:
             with socket.create_connection((host, port), timeout=3) as connection:
-                if connection.recv(128).startswith(b"SSH-"):
+                if context is not None:
+                    with context.wrap_socket(connection, server_hostname=host) as secured:
+                        banner = secured.recv(128)
+                else:
+                    banner = connection.recv(128)
+                if banner.startswith(b"SSH-"):
                     return
-        except OSError:
-            pass
+        except OSError as error:
+            last_error = error
         time.sleep(1)
-    raise TimeoutError("Modal sandbox did not start its SSH listener within 60 seconds")
+    raise TimeoutError(f"Could not reach Modal SSH listener at {host}:{port} within 60 seconds") from last_error
 
 
-def _run_relay(root, port, timeout):
+def _ssh_command(runtime, ssh_key, port, host, ssh_port, *, tls=False):
+    command = [
+        "ssh",
+        "-N",
+        "-T",
+        "-i",
+        str(ssh_key),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"UserKnownHostsFile={runtime / 'modal-known-hosts'}",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ConnectTimeout=30",
+    ]
+    if tls:
+        proxy = shlex.join(
+            [
+                "openssl",
+                "s_client",
+                "-quiet",
+                "-no_ign_eof",
+                # SSH ciphertext can start with s_client command letters such as R or Q.
+                "-nocommands",
+                "-connect",
+                f"{host}:{ssh_port}",
+                "-servername",
+                host,
+                "-verify_return_error",
+                "-verify_hostname",
+                host,
+            ]
+        )
+        command.extend(["-o", f"ProxyCommand={proxy}"])
+    return command + ["-R", f"127.0.0.1:{port}:127.0.0.1:{port}", "-p", str(ssh_port), f"root@{host}"]
+
+
+def _run_relay(root, port, timeout, *, ssh_over_tls=False):
     # Modal is an optional host-side dependency, absent from the GPU environment.
     import modal
 
+    if ssh_over_tls and shutil.which("openssl") is None:
+        raise RuntimeError("--ssh-over-tls requires openssl on the host")
     runtime = root / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
     api_key, ssh_key = _relay_keys(runtime)
@@ -107,8 +166,8 @@ def _run_relay(root, port, timeout):
                 cpu=0.125,
                 memory=128,
                 timeout=timeout,
-                encrypted_ports=[8080],
-                unencrypted_ports=[2222],
+                encrypted_ports=[8080, 2222] if ssh_over_tls else [8080],
+                unencrypted_ports=[] if ssh_over_tls else [2222],
                 env={
                     "RELAY_SSH_PUBLIC_KEY": ssh_key.with_suffix(".pub").read_text().strip(),
                     "RELAY_LOCAL_PORT": str(port),
@@ -117,37 +176,10 @@ def _run_relay(root, port, timeout):
             )
         tunnels = sandbox.tunnels()
         ssh_tunnel = tunnels[2222]
-        _wait_for_ssh(ssh_tunnel.unencrypted_host, ssh_tunnel.unencrypted_port)
-        ssh = subprocess.Popen(
-            [
-                "ssh",
-                "-N",
-                "-T",
-                "-i",
-                str(ssh_key),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                f"UserKnownHostsFile={runtime / 'modal-known-hosts'}",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "ConnectTimeout=30",
-                "-R",
-                f"127.0.0.1:{port}:127.0.0.1:{port}",
-                "-p",
-                str(ssh_tunnel.unencrypted_port),
-                f"root@{ssh_tunnel.unencrypted_host}",
-            ]
-        )
+        host = ssh_tunnel.host if ssh_over_tls else ssh_tunnel.unencrypted_host
+        ssh_port = ssh_tunnel.port if ssh_over_tls else ssh_tunnel.unencrypted_port
+        _wait_for_ssh(host, ssh_port, tls=ssh_over_tls)
+        ssh = subprocess.Popen(_ssh_command(runtime, ssh_key, port, host, ssh_port, tls=ssh_over_tls))
         metadata = {
             "url": tunnels[8080].url,
             "sandbox_id": sandbox.object_id,
@@ -184,6 +216,7 @@ def main():
     parser.add_argument("--root", type=Path)
     parser.add_argument("--port", type=int, default=10613)
     parser.add_argument("--timeout", type=int, default=86400)
+    parser.add_argument("--ssh-over-tls", action="store_true", help="Wrap SSH in verified TLS on Modal port 443")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _terminate)
     if args.sandbox:
@@ -191,7 +224,7 @@ def main():
     else:
         if args.root is None:
             parser.error("--root is required")
-        _run_relay(args.root, args.port, args.timeout)
+        _run_relay(args.root, args.port, args.timeout, ssh_over_tls=args.ssh_over_tls)
 
 
 if __name__ == "__main__":
