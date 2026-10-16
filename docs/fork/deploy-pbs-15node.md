@@ -193,7 +193,7 @@ printf 'hnode%03d\n' 31 48 200 12 55 7 99 100 101 102 103 104 105 106 107 > /tmp
 DRY_RUN=1 DRY_RUN_IPS=10.0.1.9,10.0.1.10,10.0.0.200,10.0.1.100,10.0.0.5,10.0.2.1,10.0.0.7,10.0.0.99,10.0.0.100,10.0.0.101,10.0.0.102,10.0.0.103,10.0.0.104,10.0.0.105,10.0.0.106 \
   PBS_NODEFILE=/tmp/nf PBS_JOBID=1.pbs1 PBS_LOCALDIR=/tmp PROJECT_ROOT=/tmp/pr MILES_SRC=$PWD HF_SNAPSHOT=/x \
   MODE=full SERVICES=1 CLIENT_SCRIPT=$PWD/deploy/abci/clients/smoke_q36.sh bash deploy/abci/tinker_gateway.pbs
-DRY_RUN=1 MILES_SRC=$PWD bash deploy/abci/toolathlon_service.sh    # resolved SIF + sha 11d158f7..., guard argv, container line
+DRY_RUN=1 MILES_SRC=$PWD bash deploy/abci/toolathlon_service.sh    # resolved SIF + sha c9efc093..., guard argv, container line
 deploy/abci/submit_toolathlon.sh smoke --dry-run
 # step 9's overrides against the real platoon dataclasses (no gateway, no GPU; needs the platoon venv)
 cd /home/aci18912it/source/platoon-tinker/plugins/openreward && HF_HUB_OFFLINE=1 .venv/bin/python -c "

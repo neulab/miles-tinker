@@ -13,7 +13,7 @@ against it with tinker-cookbook or platoon from inside the job. Cluster facts us
 | Fork checkout | `/home/aci18912it/source/miles` bound at `/root/miles` (`MILES_SRC`; the job serves whichever checkout `MILES_SRC` names) |
 | Extra site | `extra-site/` = `pip --target` dir with `tinker` 0.27.1 (the gateway's proto codec needs it); prepended to `PYTHONPATH` |
 | HF cache | `HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface` (`Qwen/Qwen3-4B-Instruct-2507`, `apurvaga/Qwen3.6-35B-A3B-preserve-thinking`), `HF_HUB_OFFLINE=1` in jobs |
-| Toolathlon | derived SIF `/groups/gai51740/aci18912it/rasp/images/openreward-toolathlon-18e62c0d-pbs-53541066e97b.sif` (sha256 `11d158f7...`, pinned in `deploy/abci/toolathlon.env`), entrypoint + PGDATA stager from `$PLATOON_ROOT/plugins/openreward/scripts` |
+| Toolathlon | derived SIF `/groups/gai51740/aci18912it/platoon-next/toolathlon-audit/image-cd86c47/toolathlon-cd86c47-pbs-877db64719be.sif` (ApGa/toolathlon-gym `cd86c47`, with the grader fixes; sha256 `c9efc093...`, pinned in `deploy/abci/toolathlon.env`), entrypoint + PGDATA stager from `$PLATOON_ROOT/plugins/openreward/scripts` |
 | Platoon | `PLATOON_ROOT=/home/aci18912it/source/platoon-tinker` (branch `miles-tinker-toolathlon`), venv `plugins/openreward/.venv` (tinker 0.16.1) |
 | Logs | `/home/aci18912it/miles-tinker/logs/<job>.OU` (PBS), `$PROJECT_ROOT/jobs/<run>/` (launcher, head, workers, services, client) |
 | Clients | the gateway job's head node via `CLIENT_SCRIPT` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1) |

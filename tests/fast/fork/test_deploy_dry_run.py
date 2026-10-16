@@ -4,7 +4,7 @@
 - `tinker_gateway.pbs` DRY_RUN on 2 and 15 fake nodes: roles.tsv (trainers = TRAIN_NODES lowest IPoIB IPs by
   numeric per-octet sort), every pbsdsh/singularity line, `--actor-num-nodes/--rollout-num-gpus` ahead of
   LAUNCHER_ARGS, the C10 client exports, the 4-phase teardown sweep, and no secret name in the output;
-- `toolathlon_service.sh` DRY_RUN: resolved SIF + sha256 (11d158f7...), the exact guard argv, the container
+- `toolathlon_service.sh` DRY_RUN: resolved SIF + sha256 (c9efc093...), the exact guard argv, the container
   command with the release env, no secret name (skipped when the SIF is unreadable on this host);
 - the copied memory guard self-test: the helper's argv against a fake cgroup dir prints `event=start`.
 """
@@ -31,7 +31,7 @@ SECRET_NAMES = [
     "RUBRIC_DEFAULT_LLM", "HF_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
 ]
 SECRET_RE = re.compile("|".join(SECRET_NAMES) + "|LEAKED_")
-SIF_SHA = "11d158f7c1a76486f1338f8cf90ce8a0280962792c0e5c95559f19cc391cda14"
+SIF_SHA = "c9efc09331ace7ff85ca1dfc0fa13bb72a50a4a440a016c0646d15e1a163b0f8"
 
 SHELL_SCRIPTS = sorted(
     list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("*.pbs")) + list(DEPLOY.glob("clients/*.sh"))
@@ -155,7 +155,7 @@ def _toolathlon_env_values() -> dict[str, str]:
 
 def test_toolathlon_env_is_the_c12_contract():
     values = _toolathlon_env_values()
-    assert values["OPENREWARD_TOOLATHLON_SIF"] == "/groups/gai51740/aci18912it/rasp/images/openreward-toolathlon-18e62c0d-pbs-53541066e97b.sif"
+    assert values["OPENREWARD_TOOLATHLON_SIF"] == "/groups/gai51740/aci18912it/platoon-next/toolathlon-audit/image-cd86c47/toolathlon-cd86c47-pbs-877db64719be.sif"
     assert values["OPENREWARD_TOOLATHLON_SIF_SHA256"] == SIF_SHA
     assert values["PLATOON_CONTAINER_RUNTIME"] == "/usr/bin/singularity"
     assert values["OPENREWARD_TOOLATHLON_PLAYWRIGHT_BROWSERS_PATH"] == "/opt/ms-playwright"
