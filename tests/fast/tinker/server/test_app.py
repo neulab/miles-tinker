@@ -426,6 +426,44 @@ async def test_unknown_samplers_answer_400_and_404(client):
     assert (await client.get("/api/v1/samplers/sampling-nope", headers=_headers())).status_code == 404
 
 
+async def test_checkpoint_delete_answers_as_the_official_service_does(client, tmp_path):
+    """204 when deleted; {"detail": ...} bodies with 400 (invalid id), 404 (missing or another tenant's, alike),
+    409 (a save or load_state uses it; the SDK retries) and 403 (a symbolic link out of the checkpoint root)."""
+    model_id = await _create_model(client)
+    saved = await client.post(
+        "/api/v1/save_weights", json={"model_id": model_id, "seq_id": 1, "path": "ckpt"}, headers=_headers()
+    )
+    await _poll(client, saved.json()["request_id"])
+    url = f"/api/v1/training_runs/{model_id}/checkpoints/weights/ckpt"
+    not_found = {"detail": f"checkpoint tinker://{model_id}/weights/ckpt not found"}
+
+    foreign = await client.delete(url, headers=_headers("tml-tenant-b"))
+    assert (foreign.status_code, foreign.json()) == (404, not_found)
+
+    load_body = {"model_id": model_id, "seq_id": 2, "path": f"tinker://{model_id}/weights/ckpt", "optimizer": True}
+    async with client.service._backend_lock:  # the load stays queued
+        load = await client.post("/api/v1/load_weights", json=load_body, headers=_headers())
+        busy = await client.delete(url, headers=_headers())
+    assert busy.status_code == 409 and "a queued load_state will read it" in busy.json()["detail"]
+    await _poll(client, load.json()["request_id"])
+
+    deleted = await client.delete(url, headers=_headers())
+    assert (deleted.status_code, deleted.content) == (204, b"")
+    gone = await client.delete(url, headers=_headers())
+    assert (gone.status_code, gone.json()) == (404, not_found)
+
+    malformed = await client.delete(f"/api/v1/training_runs/{model_id}/checkpoints/bogus", headers=_headers())
+    assert malformed.status_code == 400 and "malformed checkpoint id" in malformed.json()["detail"]
+
+    outside = tmp_path / "outside" / "weights" / "x"
+    os.makedirs(outside)
+    (outside / "tinker_meta.json").write_text(json.dumps({"tenant": "tml-tenant-a"}))
+    os.symlink(tmp_path / "outside", f"{client.service.config.checkpoint_root}/model-elsewhere")
+    linked = await client.delete("/api/v1/training_runs/model-elsewhere/checkpoints/weights/x", headers=_headers())
+    assert linked.status_code == 403 and "symbolic link" in linked.json()["detail"]
+    assert (outside / "tinker_meta.json").is_file()
+
+
 async def test_a_failed_promise_reports_the_category(client):
     client.service.backend.fail_next = RuntimeError("boom")
     created = (

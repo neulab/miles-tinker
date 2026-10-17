@@ -18,7 +18,7 @@ from tests.fast.tinker.harness import (
 
 from miles.tinker.core.promise import DONE, FAILED
 from miles.tinker.core.service import SIDECAR_NAME, read_sidecar
-from miles.tinker.core.types import UserInputError
+from miles.tinker.core.types import NotFoundError, UserInputError
 
 
 def _optim_payload(model_id: str, seq_id: int) -> dict:
@@ -354,7 +354,7 @@ async def test_a_foreign_checkpoint_is_rejected_as_a_user_error(service):
     assert (promise.state, promise.error_category) == (FAILED, "user")
 
 
-async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
+async def test_delete_checkpoint_removes_the_dir_and_then_answers_not_found(service):
     model_id = await created_model(service)
     save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
     await await_settled(service, "tenant", save)
@@ -363,7 +363,8 @@ async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
 
     service.delete_checkpoint("tenant", model_id, "weights/ckpt")
     assert not os.path.exists(path)
-    service.delete_checkpoint("tenant", model_id, "weights/ckpt")  # already gone: fine
+    with pytest.raises(NotFoundError):  # the official service's 404: nothing left to delete
+        service.delete_checkpoint("tenant", model_id, "weights/ckpt")
     with pytest.raises(UserInputError):
         service.delete_checkpoint("tenant", model_id, "bogus")
 

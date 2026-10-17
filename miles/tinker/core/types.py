@@ -17,6 +17,18 @@ class OwnershipError(Exception):
     """model/checkpoint does not belong to the caller's tenant."""
 
 
+class NotFoundError(Exception):
+    """No such resource for the caller: missing, or another tenant's (the official service answers 404 for both)."""
+
+
+class ConflictError(Exception):
+    """The resource is in use right now (HTTP 409, which the SDK retries)."""
+
+
+class PermissionDeniedError(Exception):
+    """The gateway refuses to act on the resource, whoever asks (HTTP 403)."""
+
+
 @dataclass
 class GatewayConfig:
     base_model: str
