@@ -79,12 +79,72 @@ Two deployment modes are selected at launch (`examples/tinker/run_qwen3_4b_gatew
   lora_rank, lora_alpha, kind, name, sampler_version, created_at, train_mode`).
   `/api/v1/weights_info` and `load_state` resolve from the sidecar, so resume
   works after a gateway restart and from another session of the same tenant.
+  `DELETE /api/v1/training_runs/{model_id}/checkpoints/{weights|sampler_weights}/{name}`
+  deletes one; see "Deleting checkpoints" below.
 - Metrics on the wire: `forward_backward` returns `loss:sum` and `logprobs`
   per datum plus `num_tokens:sum` / `num_datums:sum`; `optim_step` returns the
   backend metrics dict verbatim (plain keys), always with `grad_norm`.
 - Tenant = the `X-API-Key` header (`TINKER_API_KEY`; SDK 0.16.1 needs a `tml-`
   prefix, any value works). Sessions lease their models for `lease_timeout_s`
   after the last heartbeat.
+
+## Deleting checkpoints
+
+`DELETE /api/v1/training_runs/{model_id}/checkpoints/{weights|sampler_weights}/{name}`
+is the route behind the SDK's `RestClient.delete_checkpoint(training_run_id,
+checkpoint_id)` and `delete_checkpoint_from_tinker_path(tinker_path)`, the same
+in SDK 0.16.1 and 0.27.1. It answers as the official service documents its
+checkpoint routes, with a `{"detail": "..."}` body on errors:
+
+| Status | When |
+|---|---|
+| 204 | deleted: the directory has left the namespace and its files are freed in the background |
+| 400 | the checkpoint id is not `weights/<name>` or `sampler_weights/<name>`, or a path component is invalid |
+| 403 | a symbolic link on the way (the run's directory, the kind directory or the checkpoint itself) |
+| 404 | no such checkpoint, or another tenant's: the same answer for both |
+| 409 | a save or a `load_state` that names it is queued or running; the SDK retries a 409 for up to 5 minutes |
+| 500 | the rename failed (an `OSError`); the SDK retries |
+
+- **Whose.** The tenant (`X-API-Key`) in the checkpoint's `tinker_meta.json`.
+  A resumed run can therefore delete what its earlier launches saved, across
+  gateway restarts, as long as it keeps the same key. A directory without a
+  sidecar belongs to the tenant of its live run (a save that is still running,
+  or one from before sidecars) and otherwise to nobody (404).
+- **Where.** The gateway resolves `--tinker-checkpoint-root` once (it may itself
+  be a link) and walks down one component at a time with `O_NOFOLLOW`, so a
+  delete never leaves the root.
+- **How.** One `rename` into `<checkpoint_root>/.tinker-trash/<uuid>`: on the
+  same filesystem it is instant even for the 352 GB of a 27B full fine-tuning
+  save, and no later load or save can see a half-deleted checkpoint. One daemon
+  thread then frees the directory and logs `checkpoint delete: freed
+  tinker://...: N files, X GB in S s`. With a mount point below the root, the
+  checkpoint is hidden beside itself as `.tinker-trash-<uuid>` instead. Whatever
+  a gateway leaves in the trash when it exits is freed by the next gateway's
+  first delete on the same root.
+- **Sampling is neither blocked nor disturbed.** No sampling session reads a
+  checkpoint directory. LoRA adapters reach the engines as tensors and are
+  registered by name, and a full fine-tuning sampler checkpoint holds only its
+  sidecar, because the engines serve the latest pushed weights. A delete touches
+  neither the engines nor the sampler names, so sessions on a deleted sampler
+  path keep sampling. LoRA versions still leave the engines by
+  `--tinker-sampler-versions-to-keep`.
+- **SDK 0.16.1 clients must not delete on the training session's `_async`
+  methods.** In 0.16.1 (platoon's pin) the `RestClient` of
+  `service_client.create_rest_client()` shares the training client's session,
+  and its `delete_checkpoint_async`, like every `_async` method of that
+  `RestClient`, is wrapped in `capture_exceptions(fatal=True)`. Any error raised
+  through it, a 404 included, is logged as fatal, which sends `SESSION_END` for
+  that session, and this gateway answers `SESSION_END` by releasing the
+  session's models: the training run is gone and its next call fails with
+  `unknown model`. Either delete through a `tinker.ServiceClient` of its own,
+  whose session holds no model (platoon's `checkpoint.keep_recovery` does), or
+  call the sync `rest_client.delete_checkpoint(run_id, checkpoint_id)`, whose
+  error is raised at `.result()`, outside that wrapper:
+  `await asyncio.to_thread(lambda: rest_client.delete_checkpoint(run_id,
+  checkpoint_id).result())`. The sync `delete_checkpoint_from_tinker_path`
+  parses the path inside the wrapper, so a malformed path ends the session too.
+  Treat `tinker.NotFoundError` as already deleted. SDK 0.27.1 reports REST
+  errors without a session, so any call is safe there.
 
 ## Where to start
 

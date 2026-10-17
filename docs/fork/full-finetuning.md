@@ -110,8 +110,15 @@ gateway's mode (`UserInputError`).
 - Resume works across gateway restarts and sessions of the same tenant because
   `weights_info` and `load_state` read the sidecar; restart the gateway with the
   same `--checkpoint-root` (`RUN_NAME` in `deploy/abci/tinker_gateway.pbs`).
-- Deleting a checkpoint (`DELETE .../checkpoints/...`) removes the directory;
-  a missing checkpoint is treated as already deleted.
+- Deleting a checkpoint (`RestClient.delete_checkpoint`, `DELETE
+  .../checkpoints/weights/<name>`) takes the directory away at once with one
+  rename, so the request returns in milliseconds even for a 352 GB save, and
+  frees the files in the background. A missing checkpoint answers 404
+  (`tinker.NotFoundError`), and one that a save or `load_state` is using
+  answers 409. The `sampler_weights/<name>` directory of a full fine-tuning
+  checkpoint holds only its sidecar, so deleting it never affects sampling.
+  Status codes, ownership and the client-side caveat: `README.md`, "Deleting
+  checkpoints".
 
 ## Restart and resume on the ABCI Toolathlon jobs
 
