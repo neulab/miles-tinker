@@ -372,3 +372,94 @@ def test_qwen35_4b_recipe(launcher, monkeypatch):
     assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
     with pytest.raises(AssertionError, match="no expert routes"):
         launcher.ScriptArgs(model_variant="4b", routing_replay=True)
+
+
+# --- gateway presets (deploy/abci/presets/*.env): head-inner.sh passes their LAUNCHER_ARGS and EXTRA_ARGS -------
+
+_PRESETS = sorted((REPO_ROOT / "deploy" / "abci" / "presets").glob("*.env"))
+
+
+def _read_preset(path: Path) -> dict[str, str]:
+    """KEY=value lines (test_deploy_dry_run.py checks that the job reads them as bash sources them)."""
+    values = {}
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            words = shlex.split(value)
+            assert len(words) <= 1, line
+            values[key] = words[0] if words else ""
+    return values
+
+
+@pytest.mark.parametrize("preset", _PRESETS, ids=lambda path: path.stem)
+def test_preset_options_are_accepted_by_its_launcher(launcher, monkeypatch, preset):
+    values = _read_preset(preset)
+    if values["GATEWAY_LAUNCHER"] != LAUNCHER.relative_to(REPO_ROOT).as_posix():
+        pytest.skip(f"{preset.name} serves {values['GATEWAY_LAUNCHER']}")
+    argv = [
+        "--mode",
+        values["MODE"],
+        *shlex.split(values["LAUNCHER_ARGS"]),
+        "--extra-args",
+        values.get("EXTRA_ARGS", ""),
+    ]
+    result, captured = _invoke_serve(launcher, monkeypatch, argv)
+    assert result.exit_code == 0, result.output
+    serve_argv = shlex.split(captured["train_args"])
+    fields = _server_args_fields()
+    assert not {flag for flag in serve_argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+
+
+def test_qwen38_128k_preset_serves_the_fcs_q38_argv_but_for_the_advertised_name(launcher, monkeypatch):
+    """fcs-q38 passed the snapshot path as --model-name where the preset passes the HF id; on fcs-q38's split (5 train
+    nodes, 40 rollout GPUs) nothing else in the serve_tinker.py argv may differ."""
+    values = _read_preset(REPO_ROOT / "deploy" / "abci" / "presets" / "qwen3.8-27b-128k.env")
+    model = values["HF_MODEL"]
+    snapshot = f"/x/hub/models--{model.replace('/', '--')}/snapshots/{values['HF_REVISION']}"
+
+    def serve(launcher_args: str):
+        argv = [
+            "--mode",
+            values["MODE"],
+            "--actor-num-nodes",
+            "5",
+            "--rollout-num-gpus",
+            "40",
+            "--tinker-port",
+            "18110",
+            *shlex.split(launcher_args),
+            "--extra-args",
+            values["EXTRA_ARGS"],
+        ]
+        result, captured = _invoke_serve(launcher, monkeypatch, argv)
+        assert result.exit_code == 0, result.output
+        return shlex.split(captured["train_args"]), captured
+
+    argv, captured = serve(values["LAUNCHER_ARGS"])
+    fcs_argv, fcs_captured = serve(
+        values["LAUNCHER_ARGS"].replace(f"--model-name {model} ", f"--model-name {snapshot} ")
+    )
+    assert len(argv) == len(fcs_argv)
+    differing = [i for i, (ours, fcs) in enumerate(zip(argv, fcs_argv, strict=True)) if ours != fcs]
+    assert differing == [argv.index("--tinker-base-model") + 1]
+    assert _flag(argv, "--tinker-base-model") == model and _flag(fcs_argv, "--tinker-base-model") == snapshot
+    assert captured["megatron_model_type"] == fcs_captured["megatron_model_type"] == "qwen3.6-27B"
+    assert U.resolve_extra_env_vars({}, captured["config"]) == {"NCCL_DEBUG": "INFO"}
+    # the recipe: dense TP4 training on 128K rows, no routing replay, the gateway's 128K limits, TP8 engines
+    for flag, value in (
+        ("--tensor-model-parallel-size", "4"),
+        ("--expert-model-parallel-size", "1"),
+        ("--max-tokens-per-gpu", "131073"),
+        ("--tinker-max-tokens-per-datum", "131073"),
+        ("--tinker-unit-token-budget", "1310730"),
+        ("--rollout-max-context-len", "131072"),
+        ("--sglang-context-length", str(captured["config"].sglang_context_length)),
+        ("--rollout-num-gpus-per-engine", "8"),
+        ("--sglang-ep-size", "1"),
+        ("--actor-num-nodes", "5"),
+        ("--rollout-num-gpus", "40"),
+    ):
+        assert _flag(argv, flag) == value, flag
+    assert "--use-rollout-routing-replay" not in argv
+    # EXTRA_ARGS come last, so their --lr 1e-6 wins over the launcher's initial --lr 3e-6
+    assert argv[-len(shlex.split(values["EXTRA_ARGS"])) :] == shlex.split(values["EXTRA_ARGS"])

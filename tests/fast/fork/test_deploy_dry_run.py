@@ -4,6 +4,11 @@
 - `tinker_gateway.pbs` DRY_RUN on 2 and 15 fake nodes: roles.tsv (trainers = TRAIN_NODES lowest IPoIB IPs by
   numeric per-octet sort), every pbsdsh/singularity line, `--actor-num-nodes/--rollout-num-gpus` ahead of
   LAUNCHER_ARGS, the C10 client exports, the 4-phase teardown sweep, and no secret name in the output;
+- gateway presets (`PRESET=`, `deploy/abci/presets/*.env`): read as bash would source them, rendered exactly like the
+  same job variables, job variables win, the Qwen3.8-27B 128K preset is fcs-q38's gateway but for the advertised
+  name, malformed presets fail before any node starts;
+- `CLIENT_CMD`: written verbatim to `client-cmd.sh`, which runs as written (quotes, spaces, the client exports, the
+  exit status) in `CLIENT_DIR` (default `PBS_O_WORKDIR`), and fails early when it cannot run;
 - `toolathlon_service.sh` DRY_RUN: resolved SIF + sha256 (2fb0ee8b...), the exact guard argv, the container
   command with the release env, no secret name (skipped when the SIF is unreadable on this host);
 - the copied memory guard self-test: the helper's argv against a fake cgroup dir prints `event=start`.
@@ -13,6 +18,7 @@ import importlib.util
 import io
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,7 +41,8 @@ SIF_SHA = "2fb0ee8ba5377a79206af36c4645c6e32242300aad5cf08677addc8e25ba468d"
 
 SHELL_SCRIPTS = sorted(
     list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("*.pbs")) + list(DEPLOY.glob("clients/*.sh"))
-    + list(DEPLOY.glob("*.env")) + list((REPO / "deploy" / "clients").glob("*.sh"))
+    + list(DEPLOY.glob("*.env")) + list(DEPLOY.glob("presets/*.env"))
+    + list((REPO / "deploy" / "clients").glob("*.sh"))
 )
 
 
@@ -44,7 +51,7 @@ def test_bash_syntax(script):
     subprocess.run(["bash", "-n", str(script)], check=True)
 
 
-def run_pbs_dry(tmp_path: Path, hosts: list[str], ips: list[str], **env) -> tuple[str, Path]:
+def run_pbs(tmp_path: Path, hosts: list[str], ips: list[str], **env) -> subprocess.CompletedProcess:
     nodefile = tmp_path / "nodefile"
     nodefile.write_text("".join(f"{h}\n" * 8 for h in hosts))  # mpiprocs=8: eight lines per host
     project = tmp_path / "project"
@@ -57,9 +64,13 @@ def run_pbs_dry(tmp_path: Path, hosts: list[str], ips: list[str], **env) -> tupl
         "RUN_NAME": "dry", "WANDB_API_KEY": "LEAKED_WANDB", "HF_TOKEN": "LEAKED_HF", "OPENAI_API_KEY": "LEAKED_OAI",
     }
     run_env.update(env)
-    proc = subprocess.run(["bash", str(PBS)], env=run_env, capture_output=True, text=True, timeout=120)
+    return subprocess.run(["bash", str(PBS)], env=run_env, capture_output=True, text=True, timeout=120)
+
+
+def run_pbs_dry(tmp_path: Path, hosts: list[str], ips: list[str], **env) -> tuple[str, Path]:
+    proc = run_pbs(tmp_path, hosts, ips, **env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    return proc.stdout + proc.stderr, project / "jobs" / "dry" / "2245678"
+    return proc.stdout + proc.stderr, tmp_path / "project" / "jobs" / "dry" / "2245678"
 
 
 FIFTEEN_HOSTS = [f"hnode{n:03d}" for n in (31, 48, 200, 12, 55, 7, 99, 100, 101, 102, 103, 104, 105, 106, 107)]
@@ -303,3 +314,288 @@ def test_node_init_helper_finds_ip_without_usr_sbin_in_path(tmp_path):
     ok = [line for line in out.stdout.splitlines() if line.startswith("init_ok ")]
     assert ok, out.stdout + out.stderr
     assert len(ok[0].split()) == 3 and ok[0].split()[2].startswith("10.0."), ok[0]
+
+
+# ---------------------------------------------------------------- gateway presets (PRESET=)
+
+PRESETS = DEPLOY / "presets"
+QWEN38 = "qwen3.8-27b-128k"
+# fcs-q38's gateway as rasp's launch/abci/submit.sh submits frontiercs-* (the same lines at rasp e3e0054, origin/main
+# 157ea06 and apga/platoon-879b589) and as the production run fcs10-q38-nonrec-...-v25 recorded them.
+FCS_Q38_SNAPSHOT = (
+    "/groups/gai51740/aci18912it/rasp/cache/huggingface/hub/models--apurvaga--Qwen3.8-27B-preserve-thinking/snapshots/"
+    "97c725615b8aa025b800da4ceed38811358b30f1"
+)
+FCS_Q38 = {
+    "GATEWAY_LAUNCHER": "examples/tinker/run_qwen3_6_35b_a3b_gateway.py",
+    "MODE": "full",
+    "LAUNCHER_ARGS": (
+        f"--extra-env-vars NCCL_DEBUG=INFO --model-variant 27b --model-name {FCS_Q38_SNAPSHOT} --no-routing-replay --tp 4 "
+        "--context-len 131072 --max-tokens-per-gpu 131073 --max-tokens-per-datum 131073 --unit-token-budget 1310730"
+    ),
+    "EXTRA_ARGS": (
+        "--sglang-attention-backend fa3 --lr 1e-6 --router-policy cache_aware --router-balance-abs-threshold 16 "
+        "--router-balance-rel-threshold 1.5"
+    ),
+    "TINKER_SAMPLE_TIMEOUT_SECONDS": "1800",
+}
+# fcs-q38's ten hosts, with made-up unsorted IPoIB addresses
+TEN_HOSTS = [f"hnode{n}" for n in (726, 725, 724, 720, 719, 717, 716, 715, 713, 723)]
+TEN_IPS = [f"10.0.7.{n}" for n in (26, 25, 24, 20, 19, 17, 16, 15, 13, 23)]
+TWO = (["hnode002", "hnode001"], ["10.0.0.2", "10.0.0.1"])
+DATE_RE = re.compile(r"\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \S+ \d{4}")
+
+
+def preset_keys() -> list[str]:
+    return re.search(r"^PRESET_KEYS=\((.*)\)$", PBS.read_text(), re.M).group(1).split()
+
+
+def source_preset(path: Path) -> dict[str, str]:
+    """The preset as bash reads it (`set -a; source`). The job parses the file instead; the two must agree."""
+    script = 'set -a; source "$1"; shift; for k in "$@"; do [[ -n ${!k+set} ]] && printf "%s=%s\\0" "$k" "${!k}"; done; true'
+    proc = subprocess.run(
+        ["bash", "-c", script, "_", str(path), *preset_keys()],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return dict(item.split("=", 1) for item in proc.stdout.split("\0") if item)
+
+
+def fake_hf_home(root: Path, model: str, revision: str, refs_main: str | None = None) -> tuple[Path, Path]:
+    repo = root / "hub" / f"models--{model.replace('/', '--')}"
+    snapshot = repo / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    if refs_main is not None:
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text(refs_main)
+    return root, snapshot
+
+
+def dry_argv(out: str, label: str) -> list[str]:
+    """The argv of one `DRY_RUN <label>:` line (printf %q words, so shlex reads them back)."""
+    line = next(line for line in out.splitlines() if line.startswith(f"DRY_RUN {label}:"))
+    return shlex.split(line.split(":", 1)[1])
+
+
+@pytest.mark.parametrize("preset", sorted(PRESETS.glob("*.env")), ids=lambda p: p.stem)
+def test_presets_are_read_as_bash_sources_them(tmp_path, preset):
+    values = source_preset(preset)
+    assert set(values) <= set(preset_keys()) and {"GATEWAY_LAUNCHER", "MODE", "LAUNCHER_ARGS"} <= set(values)
+    launcher_args = shlex.split(values["LAUNCHER_ARGS"])
+    assert not [arg for arg in launcher_args if arg.startswith("--tinker-")]  # serve_tinker.py flags go in EXTRA_ARGS
+    env = {"HF_SNAPSHOT": "/x/snap"}
+    if "HF_MODEL" in values:  # the gateway advertises the id that trainer configs name
+        assert re.fullmatch(r"[0-9a-f]{40}", values["HF_REVISION"])
+        assert launcher_args[launcher_args.index("--model-name") + 1] == values["HF_MODEL"]
+        hf_home, _ = fake_hf_home(tmp_path / "hf", values["HF_MODEL"], values["HF_REVISION"])
+        env = {"HF_SNAPSHOT": "", "HF_HOME": str(hf_home)}
+    out, _ = run_pbs_dry(tmp_path, *TWO, PRESET=preset.stem, **env)
+    assert f"preset {preset.stem} ({preset}):" in out
+    for key, value in values.items():
+        assert f'\n  {key}="{value}"\n' in out, key
+
+
+def test_the_qwen38_preset_is_the_fcs_q38_gateway_but_for_the_advertised_name(tmp_path):
+    values = source_preset(PRESETS / f"{QWEN38}.env")
+    for key in ("GATEWAY_LAUNCHER", "MODE", "EXTRA_ARGS", "TINKER_SAMPLE_TIMEOUT_SECONDS"):
+        assert values[key] == FCS_Q38[key], key
+    assert values["HF_MODEL"] == "apurvaga/Qwen3.8-27B-preserve-thinking"
+    assert FCS_Q38_SNAPSHOT.endswith(
+        f"/models--apurvaga--Qwen3.8-27B-preserve-thinking/snapshots/{values['HF_REVISION']}"
+    )
+    assert values["LAUNCHER_ARGS"] == FCS_Q38["LAUNCHER_ARGS"].replace(FCS_Q38_SNAPSHOT, values["HF_MODEL"])
+    # rendered on fcs-q38's ten nodes with TRAIN_NODES=5: the snapshot of HF_MODEL@HF_REVISION under HF_HOME
+    hf_home, snapshot = fake_hf_home(
+        tmp_path / "hf", values["HF_MODEL"], values["HF_REVISION"], refs_main=values["HF_REVISION"]
+    )
+    out, _ = run_pbs_dry(
+        tmp_path,
+        TEN_HOSTS,
+        TEN_IPS,
+        PRESET=QWEN38,
+        HF_SNAPSHOT="",
+        HF_HOME=str(hf_home),
+        TRAIN_NODES="5",
+        CLIENT_SCRIPT=str(DEPLOY / "clients" / "smoke.sh"),
+    )
+    assert (
+        f"nodes=10 train_nodes=5 rollout_gpus=40 services=0 launcher={FCS_Q38['GATEWAY_LAUNCHER']} snapshot={snapshot} "
+        in out
+    )
+    serve = dry_argv(out, "serve (inside the head container)")
+    assert serve[:3] == ["python", FCS_Q38["GATEWAY_LAUNCHER"], "serve"]
+    assert serve[3:7] == ["--mode", "full", "--hf-checkpoint", str(snapshot)]
+    split = ["--actor-num-nodes", "5", "--rollout-num-gpus", "40"]
+    expected = [*split, *shlex.split(values["LAUNCHER_ARGS"]), "--extra-args", FCS_Q38["EXTRA_ARGS"]]
+    assert serve[serve.index("--actor-num-nodes") :] == expected
+    assert f"HF_SNAPSHOT={snapshot}" in dry_argv(out, "bg[head.log]")
+    assert "\n  export TINKER_SAMPLE_TIMEOUT_SECONDS=1800\n" in out
+    assert "TINKER_SAMPLE_TIMEOUT_SECONDS=1800" in dry_argv(out, "client")
+    assert "note:" not in out  # refs/main names the revision
+
+
+def test_a_preset_renders_exactly_like_its_job_variables(tmp_path):
+    values = source_preset(PRESETS / f"{QWEN38}.env")
+    hf_home, snapshot = fake_hf_home(tmp_path / "hf", values["HF_MODEL"], values["HF_REVISION"])  # no refs/main
+    common = {"TRAIN_NODES": "5", "HF_HOME": str(hf_home), "CLIENT_SCRIPT": str(DEPLOY / "clients" / "smoke.sh")}
+    variables = {key: value for key, value in values.items() if key not in ("HF_MODEL", "HF_REVISION")}
+    runs = {}
+    for name, env in (
+        ("preset", {"PRESET": QWEN38, "HF_SNAPSHOT": ""}),
+        ("variables", {"HF_SNAPSHOT": str(snapshot), **variables}),
+    ):
+        root = tmp_path / name
+        root.mkdir()
+        out, jobdir = run_pbs_dry(root, TEN_HOSTS, TEN_IPS, **common, **env)
+        files = {
+            f.name: DATE_RE.sub("<date>", f.read_text().replace(str(root), "<tmp>"))
+            for f in jobdir.iterdir()
+            if f.is_file()
+        }
+        files.pop("launcher.log")  # the output itself
+        runs[name] = DATE_RE.sub("<date>", out.replace(str(root), "<tmp>")).splitlines(), files
+    (lines, files), (expected_lines, expected_files) = runs["preset"], runs["variables"]
+    assert files == expected_files  # head-inner.sh, worker.sh, container_args.txt, roles.tsv, ...
+    # the output adds the preset report and the client's sampling timeout, and nothing else
+    start = lines.index(f"preset {QWEN38} ({PRESETS / QWEN38}.env):")
+    assert sorted(lines[start + 1 : start + 1 + len(values)]) == sorted(
+        f'  {key}="{value}"' for key, value in values.items()
+    )
+    note = lines[start + 1 + len(values)]
+    assert note.startswith(
+        f"note: {hf_home}/hub/models--apurvaga--Qwen3.8-27B-preserve-thinking/refs/main does not name "
+    )
+    del lines[start : start + 2 + len(values)]
+    lines.remove("  export TINKER_SAMPLE_TIMEOUT_SECONDS=1800")
+    client = next(i for i, line in enumerate(lines) if line.startswith("DRY_RUN client:"))
+    lines[client] = lines[client].replace(" TINKER_SAMPLE_TIMEOUT_SECONDS=1800 bash ", " bash ")
+    assert lines == expected_lines
+
+
+def test_job_variables_replace_the_preset_values(tmp_path):
+    out, _ = run_pbs_dry(
+        tmp_path,
+        *TWO,
+        PRESET=QWEN38,
+        HF_SNAPSHOT="/x/own-snapshot",
+        LAUNCHER="examples/tinker/x.py",
+        EXTRA_ARGS="--tinker-lease-timeout-s 7200",
+        TINKER_SAMPLE_TIMEOUT_SECONDS="900",
+        CLIENT_SCRIPT=str(DEPLOY / "clients" / "smoke.sh"),
+    )
+    assert "mode=full " in out and "launcher=examples/tinker/x.py " in out and "snapshot=/x/own-snapshot " in out
+    assert (
+        "\n  GATEWAY_LAUNCHER=\"examples/tinker/x.py\" (the job's LAUNCHER; the preset's value is not used)\n" in out
+    )
+    assert "\n  EXTRA_ARGS=\"--tinker-lease-timeout-s 7200\" (the job's value; the preset's is not used)\n" in out
+    assert "\n  TINKER_SAMPLE_TIMEOUT_SECONDS=\"900\" (the job's value; the preset's is not used)\n" in out
+    assert '\n  MODE="full"\n' in out  # from the preset
+    serve = dry_argv(out, "serve (inside the head container)")
+    assert serve[1] == "examples/tinker/x.py" and "--model-variant" in serve  # LAUNCHER_ARGS still the preset's
+    assert serve[-2:] == ["--extra-args", "--tinker-lease-timeout-s 7200"]
+    assert "\n  export TINKER_SAMPLE_TIMEOUT_SECONDS=900\n" in out and "note:" not in out
+
+
+def test_a_preset_may_be_a_path(tmp_path):
+    preset = tmp_path / "my preset.env"
+    preset.write_text('# a project-local preset\nMODE=full\n\nLAUNCHER_ARGS="--check-weight-update-equal --tp 2"\n')
+    out, _ = run_pbs_dry(tmp_path, *TWO, PRESET=str(preset))
+    assert f'preset {preset} ({preset}):\n  MODE="full"\n  LAUNCHER_ARGS="--check-weight-update-equal --tp 2"\n' in out
+    serve = dry_argv(out, "serve (inside the head container)")
+    expected = ["--check-weight-update-equal", "--tp", "2", "--extra-args", ""]
+    assert serve[serve.index("--rollout-num-gpus") + 2 :] == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("MODE=full\nTRAIN_NODES=5\n", ":2: TRAIN_NODES is not a preset key"),
+        ("LAUNCHER_ARGS=--tp 4\n", ":1: quote a value with spaces or symbols"),
+        ('LAUNCHER_ARGS="--tp 4\n', ":1: quote a value with spaces or symbols"),
+        ('EXTRA_ARGS="--lr $LR"\n', ":1: a value holds no quote, $, backquote or backslash"),
+        ("MODE=full\n# lora next\nMODE=lora\n", ":3: MODE is set twice"),
+        ("export MODE=full\n", ":1: expected KEY=value"),
+    ],
+)
+def test_a_malformed_preset_fails_before_any_node_starts(tmp_path, content, message):
+    preset = tmp_path / "bad.env"
+    preset.write_text(content)
+    proc = run_pbs(tmp_path, *TWO, PRESET=str(preset))
+    assert proc.returncode == 2 and f"{preset}{message}" in proc.stderr, proc.stderr
+    assert not (tmp_path / "project").exists()
+
+
+def test_an_unknown_preset_or_a_missing_snapshot_fails_before_any_node_starts(tmp_path):
+    unknown, missing = tmp_path / "unknown", tmp_path / "missing"
+    unknown.mkdir(), missing.mkdir()
+    proc = run_pbs(unknown, *TWO, PRESET="qwen9-1t")
+    assert (
+        proc.returncode == 2 and "presets/qwen9-1t.env is not a readable file" in proc.stderr and QWEN38 in proc.stderr
+    )
+    proc = run_pbs(missing, *TWO, PRESET=QWEN38, HF_SNAPSHOT="", HF_HOME=str(tmp_path / "empty-hf"))
+    assert proc.returncode == 2, proc.stderr
+    assert (
+        "hf download apurvaga/Qwen3.8-27B-preserve-thinking --revision 97c725615b8aa025b800da4ceed38811358b30f1"
+        in proc.stderr
+    )
+    assert not (unknown / "project").exists() and not (missing / "project").exists()
+
+
+# ---------------------------------------------------------------- CLIENT_CMD
+
+# quotes of both kinds, two spaces that only quotes keep, variables, a command substitution, a file name with a space
+CLIENT_CMD = """printf '[%s]\\n' "two  words" 'it said "hi"' "$RUN_NAME" "$(basename "$PWD")" > "out file"; exit 3"""
+
+
+def test_client_cmd_runs_as_written_in_the_submission_directory(tmp_path):
+    submitted = tmp_path / "submit dir"
+    submitted.mkdir()
+    out, jobdir = run_pbs_dry(tmp_path, *TWO, CLIENT_CMD=CLIENT_CMD, PBS_O_WORKDIR=str(submitted))
+    script = jobdir / "client-cmd.sh"
+    assert script.read_text().splitlines()[2:] == [CLIENT_CMD]  # after the shebang and one comment line
+    assert f"\nclient: CLIENT_CMD in {submitted} on " in out and f"): {CLIENT_CMD}\n" in out
+    client = dry_argv(out, "client")
+    assert client[0] == "env" and client[-2:] == ["bash", str(script)]
+    assert "\n  export RUN_NAME=dry\n" in out and "RUN_NAME=dry" in client
+    # the argv the job runs in CLIENT_DIR (there in its own session, with its output in client.log)
+    proc = subprocess.run(client, cwd=submitted, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 3, proc.stderr  # the command's exit status is the client's
+    assert (submitted / "out file").read_text() == '[two  words]\n[it said "hi"]\n[dry]\n[submit dir]\n'
+
+
+def test_client_dir_overrides_the_submission_directory(tmp_path):
+    out, _ = run_pbs_dry(tmp_path, *TWO, CLIENT_CMD="true", CLIENT_DIR=str(tmp_path), PBS_O_WORKDIR="/nonexistent")
+    assert f"\nclient: CLIENT_CMD in {tmp_path} on " in out
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        (
+            {"CLIENT_CMD": "true", "CLIENT_SCRIPT": str(DEPLOY / "clients" / "smoke.sh")},
+            "set CLIENT_SCRIPT or CLIENT_CMD, not both",
+        ),
+        ({"CLIENT_CMD": "true", "CLIENT_DIR": "/nonexistent/dir"}, "CLIENT_DIR is not a directory on "),
+        ({"CLIENT_CMD": "true", "PBS_O_WORKDIR": "/nonexistent/dir"}, "CLIENT_DIR is not a directory on "),
+        (
+            {"CLIENT_SCRIPT": str(DEPLOY / "clients" / "smoke.sh"), "CLIENT_DIR": "/nonexistent/dir"},
+            "CLIENT_DIR is not a directory on ",
+        ),
+        ({"CLIENT_CMD": 'platoon train "configs/a.yaml'}, "CLIENT_CMD is not a bash command line"),
+    ],
+)
+def test_a_client_that_cannot_start_fails_before_any_node_starts(tmp_path, env, message):
+    proc = run_pbs(tmp_path, *TWO, **env)
+    assert proc.returncode == 2 and message in proc.stderr, proc.stderr
+    assert not (tmp_path / "project").exists()
+
+
+def test_without_preset_or_client_cmd_a_client_script_launch_is_unchanged(tmp_path):
+    script = DEPLOY / "clients" / "smoke.sh"
+    # TINKER_SAMPLE_TIMEOUT_SECONDS as rasp's submit.sh passes it: the client inherits it from the job, unlisted
+    out, jobdir = run_pbs_dry(tmp_path, *TWO, CLIENT_SCRIPT=str(script), TINKER_SAMPLE_TIMEOUT_SECONDS="1800")
+    assert f"\nclient: {script} on " in out and dry_argv(out, "client")[-2:] == ["bash", str(script)]
+    assert "TINKER_SAMPLE_TIMEOUT_SECONDS" not in out and "\npreset " not in out
+    assert not (jobdir / "client-cmd.sh").exists()

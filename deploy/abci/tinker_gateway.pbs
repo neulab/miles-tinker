@@ -15,14 +15,19 @@
 #   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs (miles/ray/placement_group.py sorts bundles by IP)
 #   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one OpenReward
 #                                  service per engine node, started before Ray
-# Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for presets):
+# Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for the
+# Toolathlon jobs):
+#   PRESET (a gateway preset: deploy/abci/presets/<PRESET>.env, or a path; it sets GATEWAY_LAUNCHER MODE HF_MODEL
+#   HF_REVISION LAUNCHER_ARGS EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS, and a non-empty job variable wins over it)
 #   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
 #   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
 #   (context parallelism: LAUNCHER_ARGS="--cp N [--max-tokens-per-gpu <per-rank>]" with run_qwen3_6_35b_a3b_gateway.py)
-#   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
-#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
+#   CLIENT_SCRIPT (a bash script) or CLIENT_CMD (a command line)  CLIENT_DIR (the client's working directory: default
+#   PBS_O_WORKDIR for CLIENT_CMD, MILES_SRC for CLIENT_SCRIPT)  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)
+#   PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT  MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
 #   SERVICE_ENVIRONMENT=toolathlon|swe_rebench|frontier_cs  SWE_ENV  FRONTIER_ENV
-# Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
+# Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT or CLIENT_CMD, not on
+# a login node.
 # DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
 # and every pbsdsh / singularity command line without executing anything.
 set -euo pipefail
@@ -44,6 +49,61 @@ ROOTFS=${ROOTFS:-$PROJECT_ROOT/rootfs}                 # mounted as /root: Megat
 MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}  # the fork checkout, mounted at /root/miles
 EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}     # pip --target dir with the tinker SDK
 HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
+# ---------------------------------------------------------------- gateway preset (PRESET=<name> or a path)
+# A preset pins one model's gateway: deploy/abci/presets/<name>.env holds KEY=value lines (a value with spaces in one
+# pair of quotes) for the keys below. The file is read, never sourced, so nothing in it is expanded or run. A non-empty
+# job variable (qsub -v) replaces the preset's value. HF_MODEL + HF_REVISION select the snapshot under $HF_HOME
+# unless HF_SNAPSHOT is given; TINKER_SAMPLE_TIMEOUT_SECONDS is exported to the client.
+PRESET_KEYS=(GATEWAY_LAUNCHER MODE HF_MODEL HF_REVISION LAUNCHER_ARGS EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS)
+PRESET_LOG=()
+load_preset() {  # load_preset <file>: set every preset key the job left empty; PRESET_LOG records what came from where
+  local file=$1 line key raw value lineno=0; local -A seen=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || { echo "$file:$lineno: expected KEY=value: $line" >&2; exit 2; }
+    key=${BASH_REMATCH[1]}; raw=${BASH_REMATCH[2]}
+    [[ " ${PRESET_KEYS[*]} " == *" $key "* ]] || { echo "$file:$lineno: $key is not a preset key (${PRESET_KEYS[*]})" >&2; exit 2; }
+    [[ -z ${seen[$key]:-} ]] || { echo "$file:$lineno: $key is set twice" >&2; exit 2; }
+    seen[$key]=1
+    case $raw in
+      \"*\" | \'*\') value=${raw:1:${#raw}-2} ;;
+      *) value=$raw
+         [[ $value =~ ^[A-Za-z0-9_./:@%+,=-]*$ ]] || { echo "$file:$lineno: quote a value with spaces or symbols: $line" >&2; exit 2; } ;;
+    esac
+    [[ $value != *[\"\'\$\`\\]* ]] || { echo "$file:$lineno: a value holds no quote, \$, backquote or backslash (nothing is expanded): $line" >&2; exit 2; }
+    if [[ $key == GATEWAY_LAUNCHER && -z ${GATEWAY_LAUNCHER:-} && -n ${LAUNCHER:-} ]]; then
+      PRESET_LOG+=("$key=\"$LAUNCHER\" (the job's LAUNCHER; the preset's value is not used)")
+    elif [[ -n ${!key:-} ]]; then
+      PRESET_LOG+=("$key=\"${!key}\" (the job's value; the preset's is not used)")
+    else
+      printf -v "$key" '%s' "$value"; PRESET_LOG+=("$key=\"$value\"")
+    fi
+  done < "$file"
+}
+PRESET_NOTE=
+if [[ -n ${PRESET:-} ]]; then
+  if [[ $PRESET == */* ]]; then PRESET_FILE=$PRESET
+  elif [[ $PRESET =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then PRESET_FILE=$MILES_SRC/deploy/abci/presets/$PRESET.env
+  else echo "PRESET=$PRESET is neither a preset name nor a path" >&2; exit 2; fi
+  [[ -f $PRESET_FILE && -r $PRESET_FILE ]] || {
+    echo "PRESET=$PRESET: $PRESET_FILE is not a readable file; presets in $MILES_SRC/deploy/abci/presets:" \
+         "$(find "$MILES_SRC/deploy/abci/presets" -maxdepth 1 -name '*.env' -printf '%f ' 2>/dev/null | sed 's/\.env / /g')" >&2
+    exit 2
+  }
+  load_preset "$PRESET_FILE"
+  if [[ -z ${HF_SNAPSHOT:-} && -n ${HF_MODEL:-} ]]; then
+    [[ $HF_MODEL =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && ${HF_REVISION:-} =~ ^[0-9a-f]{40}$ ]] || {
+      echo "PRESET=$PRESET: HF_MODEL must be an <org>/<name> id and HF_REVISION a 40-hex commit (got '$HF_MODEL' '${HF_REVISION:-}')" >&2; exit 2; }
+    HF_SNAPSHOT=$HF_HOME/hub/models--${HF_MODEL//\//--}/snapshots/$HF_REVISION
+    [[ -d $HF_SNAPSHOT ]] || {
+      echo "PRESET=$PRESET: no snapshot $HF_SNAPSHOT (fetch it: HF_HOME=$HF_HOME hf download $HF_MODEL --revision $HF_REVISION)" >&2; exit 2; }
+    # The gateway loads $HF_SNAPSHOT by path; a client that names the model by id resolves it through refs/main.
+    if [[ $(cat "$HF_HOME/hub/models--${HF_MODEL//\//--}/refs/main" 2>/dev/null || true) != "$HF_REVISION" ]]; then
+      PRESET_NOTE="note: $HF_HOME/hub/models--${HF_MODEL//\//--}/refs/main does not name $HF_REVISION, so a client that loads $HF_MODEL by id with HF_HUB_OFFLINE=1 (its tokenizer) will not find this snapshot"
+    fi
+  fi
+fi
 HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
 MODE=${MODE:-lora}
 GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-${LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}}  # run from /root/miles inside the container
@@ -75,6 +135,16 @@ esac
 WORKERS=${WORKERS:-3}
 LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
+# The client's command line and directory fail here, before any node starts, not after an hour of gateway startup.
+if [[ -n ${CLIENT_CMD:-} ]]; then
+  [[ -z ${CLIENT_SCRIPT:-} ]] || { echo "set CLIENT_SCRIPT or CLIENT_CMD, not both" >&2; exit 2; }
+  CLIENT_DIR=${CLIENT_DIR:-${PBS_O_WORKDIR:-$PWD}}
+  bash -n -c "$CLIENT_CMD" || {
+    echo "CLIENT_CMD is not a bash command line (qsub -v removes quotes; see deploy/abci/README.md section 5): $CLIENT_CMD" >&2; exit 2; }
+fi
+if [[ -n ${CLIENT_SCRIPT:-}${CLIENT_CMD:-} && -n ${CLIENT_DIR:-} && ! -d ${CLIENT_DIR:-} ]]; then
+  echo "CLIENT_DIR is not a directory on $(hostname -s): $CLIENT_DIR" >&2; exit 2
+fi
 JOB=${PBS_JOBID%%.*}
 RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
 # Per-attempt log dir. A resume reuses RUN_NAME (the checkpoint path depends on it), so a flat
@@ -128,6 +198,10 @@ if dry; then IFS=, read -r -a DRY_IPS <<< "${DRY_RUN_IPS:-}"; HEAD_IP=${DRY_IPS[
 exec > >(tee -a "$JOBDIR/launcher.log") 2>&1
 echo "job=$JOB run=$RUN_NAME mode=$MODE nodes=$NODES train_nodes=$TRAIN_NODES rollout_gpus=$ROLLOUT_GPUS services=$SERVICES launcher=$GATEWAY_LAUNCHER snapshot=$HF_SNAPSHOT head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME port=$TINKER_PORT sif=$SIF dry_run=$DRY_RUN $(date)"
 echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD 2>/dev/null) $(git -C "$MILES_SRC" branch --show-current 2>/dev/null)"
+if [[ -n ${PRESET:-} ]]; then
+  echo "preset $PRESET ($PRESET_FILE):"; (( ${#PRESET_LOG[@]} == 0 )) || printf '  %s\n' "${PRESET_LOG[@]}"
+  [[ -z $PRESET_NOTE ]] || echo "$PRESET_NOTE"
+fi
 install -m 755 "$MILES_SRC/deploy/abci/kill-leftovers.sh" "$JOBDIR/kill-leftovers.sh"
 
 # ---------------------------------------------------------------- node-local init on every node (also reports host -> IPoIB ip)
@@ -418,9 +492,10 @@ if [[ ${HEAD_MEMORY_GUARD:-1} == 1 && -r $MILES_SRC/deploy/abci/openreward-node-
 fi
 
 # ---------------------------------------------------------------- client on the head node (never on a login node)
-# CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway (and the services) are healthy,
-# in its own process group with the C10 exports below; its output goes to $JOBDIR/client.log and its exit code to
-# $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1.
+# CLIENT_SCRIPT=<bash script> or CLIENT_CMD=<command line> runs here on the head compute node once the gateway (and the
+# services) are healthy, in its own process group with the C10 exports below; its output goes to $JOBDIR/client.log and
+# its exit code to $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1. CLIENT_CMD is written
+# verbatim to $JOBDIR/client-cmd.sh, which then runs exactly as a CLIENT_SCRIPT does, in CLIENT_DIR.
 CLIENT_ENV=(
   "TINKER_BASE_URL=http://$HEAD_HOST:$TINKER_PORT" "TINKER_API_KEY=${TINKER_API_KEY:-tml-local}" "ENDPOINT_FILE=$ENDPOINT_FILE"
   "JOBDIR=$JOBDIR" "RUN_NAME=$RUN_NAME" "HF_HOME=$HF_HOME"
@@ -430,12 +505,25 @@ CLIENT_ENV=(
   "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}"
   "PBS_LOCALDIR=$PBS_LOCALDIR" "WORKERS=$WORKERS"
 )
-if [[ -n ${CLIENT_SCRIPT:-} ]]; then
-  [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
-  echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"; printf '  export %s\n' "${CLIENT_ENV[@]}"
-  if dry; then show "client" env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT"; CLIENT_STATUS=0
+# A preset's sampling timeout is a client setting (how long one sample request may take), so it goes to the client.
+if [[ -n ${PRESET:-} && -n ${TINKER_SAMPLE_TIMEOUT_SECONDS:-} ]]; then
+  CLIENT_ENV+=("TINKER_SAMPLE_TIMEOUT_SECONDS=$TINKER_SAMPLE_TIMEOUT_SECONDS")
+fi
+if [[ -n ${CLIENT_SCRIPT:-} || -n ${CLIENT_CMD:-} ]]; then
+  if [[ -n ${CLIENT_SCRIPT:-} ]]; then
+    [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
+    CLIENT_FILE=$CLIENT_SCRIPT; CLIENT_DIR=${CLIENT_DIR:-$MILES_SRC}
+    echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"
   else
-    ( cd "$MILES_SRC" && exec setsid env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT" ) > "$JOBDIR/client.log" 2>&1 &
+    CLIENT_FILE=$JOBDIR/client-cmd.sh
+    printf '#!/bin/bash\n# CLIENT_CMD, verbatim: tinker_gateway.pbs runs this file in CLIENT_DIR with the client exports\n%s\n' \
+      "$CLIENT_CMD" > "$CLIENT_FILE"
+    echo "client: CLIENT_CMD in $CLIENT_DIR on $(hostname -s) ($(date)): $CLIENT_CMD"
+  fi
+  printf '  export %s\n' "${CLIENT_ENV[@]}"
+  if dry; then show "client" env "${CLIENT_ENV[@]}" bash "$CLIENT_FILE"; CLIENT_STATUS=0
+  else
+    ( cd "$CLIENT_DIR" && exec setsid env "${CLIENT_ENV[@]}" bash "$CLIENT_FILE" ) > "$JOBDIR/client.log" 2>&1 &
     CLIENT_PID=$!
     CLIENT_STATUS=0; wait "$CLIENT_PID" || CLIENT_STATUS=$?
     CLIENT_PID=

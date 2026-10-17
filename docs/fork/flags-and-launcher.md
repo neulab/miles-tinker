@@ -8,8 +8,9 @@ path or model identifier with `--model-name`. The default `35b-a3b` variant keep
 the existing MoE recipe. Node counts remain explicit launcher arguments.
 
 The `--tinker-*` flags of `serve_tinker.py`, the two fused-head flags, the
-serve-time validation they trigger, and the launcher that emits them for the
-35B MoE deployment (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`).
+serve-time validation they trigger, the launcher that emits them for the
+35B MoE deployment (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`), and the
+gateway presets that pin its options per model.
 `FORK.md` lists the files; `full-finetuning.md` covers the training semantics.
 
 ## Flags (`miles/utils/arguments.py`, tinker group)
@@ -86,6 +87,36 @@ decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
 - `--tp 2` is the memory fallback (`--sequence-parallel` becomes effective);
   a resumed run must keep the TP/EP/DP of its save.
 - `--check-weight-update-equal` is opt-in (smoke runs).
+
+## Gateway presets (`deploy/abci/presets/*.env`)
+
+`deploy/abci/tinker_gateway.pbs` takes `PRESET=<name>` and reads the launcher, `LAUNCHER_ARGS`,
+`EXTRA_ARGS`, the snapshot (`HF_MODEL` at `HF_REVISION` under `$HF_HOME`) and the client's
+`TINKER_SAMPLE_TIMEOUT_SECONDS` from `deploy/abci/presets/<name>.env`; a non-empty job variable
+replaces a preset value (runbook: `deploy/abci/README.md`, section 4).
+
+`qwen3.8-27b-128k` is the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it,
+with one change: `--model-name` is the HF id `apurvaga/Qwen3.8-27B-preserve-thinking` where fcs-q38
+passed the snapshot path, so the gateway advertises the id and a trainer's `model_name` names the id.
+Through `run_qwen3_6_35b_a3b_gateway.py serve` its options give:
+
+| Preset option | `serve_tinker.py` argv |
+|---|---|
+| `--model-variant 27b` | Megatron model `qwen3.6-27B`, EP1 training, TP8/EP1 engines (`--rollout-num-gpus-per-engine 8 --sglang-ep-size 1`) |
+| `--model-name apurvaga/Qwen3.8-27B-preserve-thinking` | `--tinker-base-model apurvaga/Qwen3.8-27B-preserve-thinking`, the one word that differs from fcs-q38's argv |
+| `--no-routing-replay` | no `--use-rollout-routing-replay` (the dense model has no expert routes) |
+| `--tp 4` | `--tensor-model-parallel-size 4`: DP = 2 x `TRAIN_NODES`, DP10 at fcs-q38's `TRAIN_NODES=5` |
+| `--context-len 131072` | `--rollout-max-context-len 131072`, and the engines' `--sglang-context-length`, which the launcher derives from it |
+| `--max-tokens-per-gpu 131073` | `--max-tokens-per-gpu 131073`: one 128K row per microbatch |
+| `--max-tokens-per-datum 131073 --unit-token-budget 1310730` | `--tinker-max-tokens-per-datum 131073 --tinker-unit-token-budget 1310730`: ten rows per unit |
+| `--extra-env-vars NCCL_DEBUG=INFO` | `NCCL_DEBUG=INFO` in the Ray job's environment |
+| `EXTRA_ARGS` | appended last, so they win: `--sglang-attention-backend fa3`, `--lr 1e-6` (the optimizer's initial lr; every `optim_step` sends its own Adam parameters), `--router-policy cache_aware --router-balance-abs-threshold 16 --router-balance-rel-threshold 1.5` |
+
+`tests/fast/fork/test_qwen36_gateway_launcher.py` builds both argvs through the launcher's CLI and
+requires that only `--tinker-base-model` differs, and requires every preset's options to parse with
+its launcher (its `--sglang-*` flags included, against the allowlist below);
+`tests/fast/fork/test_deploy_dry_run.py` pins the preset to fcs-q38's strings and checks that the job
+renders a preset exactly as it renders the same job variables.
 
 ## The `--sglang-*` allowlist
 

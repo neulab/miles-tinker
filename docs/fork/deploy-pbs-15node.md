@@ -21,7 +21,7 @@ commands is `deploy/abci/README.md`.
 | `deploy/abci/clients/prune_tinker_checkpoints.py` | prunes `<checkpoint_root>/<model_id>/{weights,sampler_weights}/<name>` from `checkpoints.jsonl` (stdlib; `tests/fast/fork/test_prune_tinker_checkpoints.py`) |
 | `deploy/abci/clients/smoke_q36.sh` | CLIENT_SCRIPT: design 10.2 steps 1-9 on the 5-node smoke (9 = the end-to-end platoon run) |
 | `deploy/clients/tinker_r3_probe.py` | SDK 0.16.1 probe: `routing_id` on every sequence, `routing_handle` datum, C6 optim metrics |
-| `tests/fast/fork/test_deploy_dry_run.py` | `bash -n`, PBS DRY_RUN (2 and 15 fake nodes), service-helper DRY_RUN, guard self-test, submit presets |
+| `tests/fast/fork/test_deploy_dry_run.py` | `bash -n`, PBS DRY_RUN (2 and 15 fake nodes), service-helper DRY_RUN, guard self-test, submit presets, gateway presets (`PRESET=`), `CLIENT_CMD` |
 | `tests/fast/fork/test_smoke_q36_step9.py` | smoke step 9: the shared client env, the override list against platoon's dataclasses, `PLATOON_STEP=0`, and the whole step run against a stub trainer |
 
 ## Topology and roles (C10)
@@ -76,9 +76,9 @@ Health (release quorum): per host >= 1 of 4 `GET http://<ip>:8082/health` probes
 built from IPoIB IPs. The monitor sweeps every 30 s; 10 consecutive failures (or a dead head
 container) TERMs the batch shell -> cleanup.
 
-Exports to `CLIENT_SCRIPT` (C10): `TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME
+Exports to the client, `CLIENT_SCRIPT` or `CLIENT_CMD` (C10): `TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME
 HF_HOME no_proxy MILES_SRC PLATOON_ROOT SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON
-OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`; the URL lists are `http://<engine-ip>:8082` in IP
+OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`, plus a `PRESET`'s `TINKER_SAMPLE_TIMEOUT_SECONDS`; the URL lists are `http://<engine-ip>:8082` in IP
 order (empty with `SERVICES=0`). The client runs in its own session (`setsid`) so a monitor-fatal
 teardown can TERM its whole process group.
 
