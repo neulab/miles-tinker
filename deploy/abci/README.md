@@ -16,7 +16,7 @@ against it with tinker-cookbook or platoon from inside the job. Cluster facts us
 | Toolathlon | derived SIF `/groups/gai51740/aci18912it/platoon-next/toolathlon-audit/ghcr-c66ff0d/abci-sif/openreward-toolathlon-c66ff0d-pbs-7034e1a61a4a.sif` (`ghcr.io/apga/toolathlon-gym:c66ff0d` with the PBS portability patch: the grader fixes and the snowflake tools; sha256 `2fb0ee8b...`, pinned in `deploy/abci/toolathlon.env`), entrypoint + PGDATA stager from `$PLATOON_ROOT/plugins/openreward/scripts` |
 | Platoon | `PLATOON_ROOT=/home/aci18912it/source/platoon-tinker` (branch `miles-tinker-toolathlon`), venv `plugins/openreward/.venv` (tinker 0.16.1) |
 | Logs | `/home/aci18912it/miles-tinker/logs/<job>.OU` (PBS), `$PROJECT_ROOT/jobs/<run>/` (launcher, head, workers, services, client) |
-| Clients | the gateway job's head node via `CLIENT_SCRIPT` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1) |
+| Clients | the gateway job's head node via `CLIENT_SCRIPT` or `CLIENT_CMD` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1) |
 
 Commands below are typed on a login node (qsub, tail, git) but every client and probe runs inside the job on the head compute node: the launchers in `deploy/clients/` and the client scripts in `deploy/abci/clients/` refuse to start on a `login*` host (`MILES_ALLOW_LOGIN_NODE=1` only for a seconds-long smoke).
 
@@ -77,7 +77,7 @@ tail -50 /home/aci18912it/miles-tinker/logs/miles-tinker-smoke.o<jobid>
   node before Ray comes up, waits for the release health quorum, monitors it, and
   exports the URLs to the client (section 5). Details and contracts:
   `docs/fork/deploy-pbs-15node.md`.
-- The job ends when `CLIENT_SCRIPT` exits (or `KEEP_GATEWAY=1` keeps serving).
+- The job ends when the client (`CLIENT_SCRIPT` or `CLIENT_CMD`) exits (or `KEEP_GATEWAY=1` keeps serving).
 
 ## 4. Launch
 
@@ -92,11 +92,52 @@ qsub -v MODE=full,RUN_NAME=gw-full deploy/abci/tinker_gateway.pbs
 qsub -v MODE=lora,LAUNCHER_ARGS="--n-adapters 8 --max-tokens-per-gpu 24576",EXTRA_ARGS="--tinker-lease-timeout-s 7200" deploy/abci/tinker_gateway.pbs
 ```
 
-Every knob is a `qsub -v` variable: `MODE`, `RUN_NAME`, `TRAIN_NODES`, `SERVICES`,
+Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN_NODES`, `SERVICES`,
 `GATEWAY_LAUNCHER` (repo-relative launcher; `LAUNCHER` is an alias), `HF_SNAPSHOT`
-(its `--hf-checkpoint`), `LAUNCHER_ARGS`, `EXTRA_ARGS`, `CLIENT_SCRIPT`, `KEEP_GATEWAY`,
+(its `--hf-checkpoint`), `LAUNCHER_ARGS`, `EXTRA_ARGS`, `CLIENT_SCRIPT` or `CLIENT_CMD` and
+`CLIENT_DIR` (section 5), `KEEP_GATEWAY`,
 `WORKERS` (client rollout workers, 3), `PLATOON_ROOT`, `TOOLATHLON_ENV`, `TINKER_PORT`
 (default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`.
+
+### Gateway presets (`PRESET=`)
+
+A preset pins one model's gateway: the launcher, its options, the engine flags and the client's
+sampling timeout. `PRESET=<name>` reads `deploy/abci/presets/<name>.env` in `MILES_SRC`, the
+checkout the job serves, whatever checkout you run `qsub` from. So a launch that serves a checkout
+of its own passes `MILES_SRC`; without it, the job reads the default checkout's presets and serves
+its code. `PRESET=<path>` reads a file of your own in the same format. (The Toolathlon "presets"
+below are `qsub` lines; these are gateways.)
+
+| Preset | Model (`HF_MODEL` @ `HF_REVISION`) | Gateway |
+|---|---|---|
+| `qwen3.8-27b-128k` | `apurvaga/Qwen3.8-27B-preserve-thinking` @ `97c72561` | the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it: full fine-tuning, `--model-variant 27b` with TP4 training and TP8 engines, 128K context, FA3 engines, initial lr 1e-6, the cache-aware router (thresholds 16 and 1.5), sampling timeout 1800 s. It advertises the HF id, not the snapshot path, so a trainer config names `model_name: apurvaga/Qwen3.8-27B-preserve-thinking` |
+
+```bash
+# fcs-q38's layout: 10 nodes, 5 train (TP4 x DP10) + 5 TP8 engines. Run from the training project: the client is
+# its command line and runs in this directory. MILES is the miles-tinker checkout the job serves.
+qsub -l select=10:mpiprocs=8 -l walltime=72:00:00 \
+  -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,TRAIN_NODES=5,RUN_NAME=my-run,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" \
+  $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+- A preset holds `KEY=value` lines for `GATEWAY_LAUNCHER MODE HF_MODEL HF_REVISION LAUNCHER_ARGS
+  EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS`; a value with spaces goes in one pair of quotes. The job
+  reads the file and never sources it, so nothing in it is expanded, and an unknown key, a second
+  value for a key or a line it cannot read fails the job before any node starts.
+- A non-empty job variable replaces the preset's value; it does not add to it, so changing one
+  launcher option means passing the whole `LAUNCHER_ARGS`. `launcher.log` lists every key with the
+  value used and marks the job's own.
+- `HF_MODEL` and `HF_REVISION` select `$HF_HOME/hub/models--<org>--<name>/snapshots/<revision>` as
+  `HF_SNAPSHOT`, unless the job gives `HF_SNAPSHOT`. A missing snapshot fails the job with the
+  `hf download` command that fetches it.
+- `TINKER_SAMPLE_TIMEOUT_SECONDS` is the client's deadline for one sample request; the job exports it
+  to the client with the section 5 variables.
+- The gateway loads the snapshot by path. A client that names the model by id resolves it through
+  `refs/main` of the hub cache, so with `HF_HUB_OFFLINE=1` it needs `refs/main` to name the
+  revision; `launcher.log` prints a note when it does not (the rasp cache has no `refs/` for
+  `apurvaga/Qwen3.8-27B-preserve-thinking`).
+
+Flag by flag, with the `serve_tinker.py` argv it produces: `docs/fork/flags-and-launcher.md`.
 
 ### Context parallelism (full fine-tuning, `run_qwen3_6_35b_a3b_gateway.py`)
 
@@ -174,15 +215,41 @@ addresses and are reached by the driver only.
 ## 5. Run clients inside the job (head node)
 
 ABCI login nodes are shared and monitored; a Tinker client (rollouts, rendering, per-token logprobs) pins a
-core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`; the
-launcher starts it (in its own process group) once the gateway and the services are healthy, with these exports:
+core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`, or a
+command line with `CLIENT_CMD`; the launcher starts it (in its own process group) once the gateway and the services
+are healthy, with these exports:
 
 `TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME HF_HOME no_proxy MILES_SRC PLATOON_ROOT
 SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`
 
-(the URL lists are `http://<engine-IPoIB-ip>:8082,...` in IP order, empty with `SERVICES=0`), logs it to
-`$JOBDIR/client.log` (exit code in `client.status`), and ends the job when the client finishes (the nodes are
-released about ten seconds later; `KEEP_GATEWAY=1` keeps serving). Ready-made scripts:
+(the URL lists are `http://<engine-IPoIB-ip>:8082,...` in IP order, empty with `SERVICES=0`; a `PRESET` adds its
+`TINKER_SAMPLE_TIMEOUT_SECONDS`), logs it to `$JOBDIR/client.log` (exit code in `client.status`), and ends the job
+when the client finishes, with the client's exit status (the nodes are released about ten seconds later;
+`KEEP_GATEWAY=1` keeps serving).
+
+`CLIENT_CMD` needs no script file. The job writes it verbatim to `$JOBDIR/client-cmd.sh` and runs that file exactly
+as it runs a `CLIENT_SCRIPT`, in `CLIENT_DIR`: by default `PBS_O_WORKDIR`, the directory you ran `qsub` in. (A
+`CLIENT_SCRIPT` runs in `MILES_SRC` unless `CLIENT_DIR` is set.) The command line runs as bash reads it, so its
+quotes group words and its `$VARIABLES` expand on the head node, the exports above included. Before any node
+starts, the job fails if both `CLIENT_SCRIPT` and `CLIENT_CMD` are set, if `CLIENT_DIR` is not a directory, or if
+`bash -n` rejects the command line.
+
+```bash
+qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+`qsub -v` rewrites a value written after `=`: a comma ends the value unless the value is in quotes
+(`-v "CLIENT_CMD='echo a,b'"`), and the quotes are removed, because they are `qsub`'s own syntax. A command line
+without quotes, commas or backslashes passes as is. To keep quotes and commas, put the command line in `qsub`'s
+environment and name it in `-v` without a value; `qsub` then copies it unchanged:
+
+```bash
+CLIENT_CMD='platoon train train.yaml "stats.notes=lr 1e-6, group 8"' \
+  qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+Backslashes survive neither way (PBS doubles them), so a command line that needs one belongs in a `CLIENT_SCRIPT`.
+Ready-made scripts:
 
 ```bash
 # SDK smoke + sampler/trainer probe + short MFU benchmark (LoRA or full, two nodes)
@@ -231,7 +298,7 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 | Artifact | Path |
 |---|---|
 | Gateway checkpoints (`tinker://<model_id>/weights/<name>`, `.../sampler_weights/<name>`, `tinker_meta.json` sidecars) | `$PROJECT_ROOT/checkpoints/<RUN_NAME>/<model_id>/...` (`--checkpoint-root`); pruned by `clients/prune_tinker_checkpoints.py` on the Toolathlon jobs |
-| Launcher / head / worker / service / client logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head}.log`, `worker-<host>.log`, `ray-worker-<host>.log`, `services-<host>.log`, `client.log` + `client.status`, `teardown-<host>.log`, `roles.tsv`, `nodes.tsv`, `container_args.txt`, `worker.sh`, `node-init.sh`, `kill-leftovers.sh` |
+| Launcher / head / worker / service / client logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head}.log`, `worker-<host>.log`, `ray-worker-<host>.log`, `services-<host>.log`, `client.log` + `client.status` (+ `client-cmd.sh` with `CLIENT_CMD`), `teardown-<host>.log`, `roles.tsv`, `nodes.tsv`, `container_args.txt`, `worker.sh`, `node-init.sh`, `kill-leftovers.sh` |
 | PBS stdout/err | `/home/aci18912it/miles-tinker/logs/<jobname>.o<jobid>` |
 | Ray session logs (node-local, gone with the job) | `/local/<jobid>/miles/tmp/ray/session_latest/logs` |
 | Toolathlon node-local state (gone with the job) | `/local/<jobid>/toolathlon/{images,state,rootfs-overlay.img,singularity-cache,singularity-tmp}` |
