@@ -8,6 +8,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# An SGLang engine refuses (HTTP 400) a prompt of ``context_length - SGLANG_PROMPT_MARGIN`` tokens or more:
+# TpModelWorker.get_worker_info sets max_req_len = context_length - 1 and max_req_input_len = max_req_len - 5,
+# and validate_input_length (sglang/srt/managers/utils.py) refuses len(input_ids) >= max_req_input_len. The
+# gateway admits prompts up to --rollout-max-context-len - 1 tokens (_clamp_max_new_tokens in
+# miles/tinker/runtime.py), so the engines need this many tokens of context over it. The same rule holds in
+# the miles-latest-cu13 and dev-202610102218 images; it assumes no speculative decoding (EAGLE reserves its
+# draft tokens on top) and a KV pool of at least one context (SGLang takes the smaller of the two).
+SGLANG_PROMPT_MARGIN = 6
+
+
+def engine_context_length(rollout_max_context_len: int) -> int:
+    """The SGLang ``--context-length`` that takes every request the gateway admits under
+    ``--rollout-max-context-len``: prompts up to ``rollout_max_context_len - 1`` tokens, and completions the
+    gateway clamps to ``rollout_max_context_len`` (SGLang caps max_new_tokens at
+    ``context_length - 2 - prompt_len``, which this context also covers)."""
+    return rollout_max_context_len + SGLANG_PROMPT_MARGIN
+
 
 def validate_tinker_serve_args(args) -> None:
     """Constraints of the Tinker gateway executors (entry == "serve")."""
@@ -49,6 +66,7 @@ def validate_tinker_serve_args(args) -> None:
     if args.context_parallel_size > 1:
         _validate_context_parallel(args)
     _validate_datum_token_cap(args)
+    _validate_engine_context(args)
     assert (
         args.rollout_temperature == 1.0
     ), "the Tinker gateway scores logprobs at --rollout-temperature; Tinker semantics are untempered (keep 1.0)"
@@ -117,6 +135,22 @@ def _validate_datum_token_cap(args) -> None:
         f"--max-tokens-per-gpu {max_tokens_per_gpu} holds per rank at --context-parallel-size {cp} (two zigzag "
         f"chunks padded to a multiple of {pad}); a full-length datum needs --max-tokens-per-gpu >= "
         f"{cp_shard_tokens(max_tokens_per_datum, cp, pad)}"
+    )
+
+
+def _validate_engine_context(args) -> None:
+    """The engines must take every prompt the gateway admits: one they refuse fails the sample as a server
+    error (a platoon eval on 2026-10-17: engines at context 32769 refused a 32763-token prompt that the
+    gateway had admitted at --rollout-max-context-len 32768)."""
+    gateway_context = getattr(args, "rollout_max_context_len", None)
+    engine_context = getattr(args, "sglang_context_length", None)
+    if not gateway_context or engine_context is None:
+        return  # no gateway clamp, or the engines use the model's own context length
+    needed = engine_context_length(gateway_context)
+    assert engine_context >= needed, (
+        f"--sglang-context-length {engine_context} refuses prompts that --rollout-max-context-len "
+        f"{gateway_context} admits: SGLang refuses a prompt of context_length - {SGLANG_PROMPT_MARGIN} tokens or "
+        f"more, and the gateway admits up to {gateway_context - 1}; pass --sglang-context-length >= {needed}"
     )
 
 
