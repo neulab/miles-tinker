@@ -53,6 +53,12 @@ In addition to the existing full-mode / LoRA-mode checks:
   `--use-rollout-entropy` (the head yields target log-probs only), no
   `--enable-mtp-training` and `--mtp-num-layers 0`/unset (the MTP block calls
   `output_layer` for its own logits), and untied embeddings.
+- With both `--rollout-max-context-len` and `--sglang-context-length` set, the
+  engine context must be at least the gateway's plus 6
+  (`engine_context_length`). SGLang refuses a prompt of `context_length - 6`
+  tokens or more (`max_req_input_len = context_length - 1 - 5`), while the
+  gateway admits prompts up to `--rollout-max-context-len - 1` tokens; a
+  prompt the engines refuse fails its sample as a server error.
 
 ## The 35B launcher
 
@@ -76,9 +82,9 @@ decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
   `--tinker-max-tokens-per-datum 65537 --tinker-unit-token-budget 2097184
   --tinker-coalesce-wait-s 5.0 --tinker-coalesce-max-wait-s 120.0
   --tinker-max-concurrent-samples 1024 --tinker-lease-timeout-s 600`.
-- `--context-len 65536` drives `--sglang-context-length 65537`,
-  `--rollout-max-context-len 65536` and the `--max-tokens-per-gpu 65537`
-  lower bound.
+- `--context-len 65536` drives `--rollout-max-context-len 65536`,
+  `--sglang-context-length 65542` (the 6 tokens SGLang holds back from
+  prompts, above) and the `--max-tokens-per-gpu 65537` lower bound.
 - No `--sglang-mamba-*` flag: the image resolves
   `mamba_radix_cache_strategy=auto` to `extra_buffer` for
   `Qwen3_5MoeForConditionalGeneration`; `--sglang-max-total-tokens` is emitted

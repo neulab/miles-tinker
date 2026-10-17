@@ -216,6 +216,29 @@ def test_datum_cap_is_skipped_without_both_limits():
     arguments._validate_datum_token_cap(_serve_args(context_parallel_size=2, tinker_max_tokens_per_datum=None))
 
 
+# -------- the engines' context against the gateway's --------
+
+
+def test_the_engine_context_holds_sglangs_prompt_margin_over_the_gateways():
+    """SGLang refuses a prompt of context_length - 6 tokens or more, and the gateway admits prompts up to
+    --rollout-max-context-len - 1: the old context_len + 1 refused the gateway's last five prompt lengths."""
+    assert arguments.engine_context_length(32768) == 32774
+    with pytest.raises(AssertionError, match="--sglang-context-length 32769 refuses .* >= 32774"):
+        arguments.validate_tinker_serve_args(_serve_args(rollout_max_context_len=32768, sglang_context_length=32769))
+    for engine_context in (32774, 65536):
+        arguments.validate_tinker_serve_args(
+            _serve_args(rollout_max_context_len=32768, sglang_context_length=engine_context)
+        )
+
+
+def test_the_engine_context_check_needs_both_contexts():
+    """Without --rollout-max-context-len the gateway does not clamp; without --sglang-context-length the engines
+    take the model's own context length, which the serve args do not know."""
+    arguments.validate_tinker_serve_args(_serve_args(sglang_context_length=4096))
+    arguments.validate_tinker_serve_args(_serve_args(rollout_max_context_len=32768, sglang_context_length=None))
+    arguments.validate_tinker_serve_args(_serve_args(rollout_max_context_len=None, sglang_context_length=4096))
+
+
 # -------- context parallelism (full fine-tuning only) --------
 
 

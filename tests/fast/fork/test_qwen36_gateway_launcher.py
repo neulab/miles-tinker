@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 import miles.utils.external_utils.command_utils as U
+from miles.tinker.core.types import UserInputError
+from miles.tinker.runtime import _clamp_max_new_tokens
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = REPO_ROOT / "examples" / "tinker" / "run_qwen3_6_35b_a3b_gateway.py"
@@ -89,7 +91,7 @@ _EXPECTED_DEFAULT_ARGV = (
     "--moe-token-dispatcher-type alltoall "
     "--mtp-num-layers 0 "
     "--rollout-num-gpus-per-engine 8 --sglang-ep-size 8 --sglang-mem-fraction-static 0.75 "
-    "--sglang-context-length 65537 --rollout-max-context-len 65536 --sglang-chunked-prefill-size 16384 "
+    "--sglang-context-length 65542 --rollout-max-context-len 65536 --sglang-chunked-prefill-size 16384 "
     "--sglang-max-running-requests 128 --sglang-enable-fp32-lm-head "
     "--pause-generation-mode retract --update-weight-buffer-size 2147483648 "
     "--num-gpus-per-node 8 --actor-num-nodes 4 --actor-num-gpus-per-node 8 --rollout-num-gpus 88 "
@@ -174,9 +176,54 @@ def test_head_fallback_and_r3_off(launcher, monkeypatch):
 
 def test_context_length_drives_both_sides(launcher, monkeypatch):
     argv = _serve_argv(launcher, monkeypatch, context_len=32768, max_tokens_per_gpu=32769, max_tokens_per_datum=32769)
-    assert _flag(argv, "--sglang-context-length") == "32769"
+    assert _flag(argv, "--sglang-context-length") == "32774"
     assert _flag(argv, "--rollout-max-context-len") == "32768"
     assert _flag(argv, "--max-tokens-per-gpu") == "32769"
+
+
+def _sglang_max_new_tokens(context_length: int, prompt_len: int, max_new_tokens: int) -> int:
+    """SGLang's length checks on one /generate request in the serving image (no speculative decoding, a KV pool
+    of at least one context): the max_new_tokens the engine keeps, or ValueError with the message of its 400.
+
+    - tokenizer_manager._validate_one_request: prompt < context_length, prompt + max_new_tokens <= context_length;
+    - tp_worker.get_worker_info (max_req_len = context_length - 1, max_req_input_len = max_req_len - 5) and
+      managers/utils.validate_input_length: prompt < max_req_input_len;
+    - scheduler.init_req_max_new_tokens: max_new_tokens <= max_req_len - 1 - prompt (a silent cap).
+    """
+    if prompt_len >= context_length or prompt_len + max_new_tokens > context_length:
+        raise ValueError(f"Requested token count exceeds the model's maximum context length of {context_length}")
+    max_req_len = context_length - 1
+    max_req_input_len = max_req_len - 5
+    if prompt_len >= max_req_input_len:
+        raise ValueError(
+            f"Input length ({prompt_len} tokens) exceeds the maximum allowed length ({max_req_input_len} tokens)."
+        )
+    return min(max_new_tokens, max_req_len - 1 - prompt_len)
+
+
+def test_the_sglang_model_reproduces_the_refusal_seen_on_gpu():
+    """A platoon eval on 2026-10-17, with the engines at the old context_len + 1: SGLang's 400 for a prompt that
+    the gateway had admitted at --rollout-max-context-len 32768, and one completion token cut when it fit."""
+    with pytest.raises(ValueError, match=r"Input length \(32763 tokens\) exceeds the maximum allowed length \(32763"):
+        _sglang_max_new_tokens(32769, prompt_len=32763, max_new_tokens=5)
+    assert _sglang_max_new_tokens(32769, prompt_len=32762, max_new_tokens=6) == 5
+
+
+@pytest.mark.parametrize("context_len", [8192, 32768, 65536, 131072])
+def test_the_engines_take_every_request_the_gateway_admits(launcher, monkeypatch, context_len):
+    """Every prompt the gateway admits under --rollout-max-context-len reaches the engines with the whole
+    completion budget the gateway clamped it to, and one token less of engine context would refuse the longest."""
+    argv = _serve_argv(launcher, monkeypatch, context_len=context_len, max_tokens_per_datum=context_len + 1)
+    gateway_context = int(_flag(argv, "--rollout-max-context-len"))
+    engine_context = int(_flag(argv, "--sglang-context-length"))
+    assert gateway_context == context_len
+    for prompt_len in (1, gateway_context // 2, *range(gateway_context - 16, gateway_context)):
+        max_new_tokens = _clamp_max_new_tokens(1 << 30, prompt_len=prompt_len, context_len=gateway_context)
+        assert _sglang_max_new_tokens(engine_context, prompt_len, max_new_tokens) == max_new_tokens
+    with pytest.raises(UserInputError, match="no room"):  # the gateway's own bound: prompts under its context
+        _clamp_max_new_tokens(1, prompt_len=gateway_context, context_len=gateway_context)
+    with pytest.raises(ValueError, match="exceeds the maximum allowed length"):
+        _sglang_max_new_tokens(engine_context - 1, prompt_len=gateway_context - 1, max_new_tokens=1)
 
 
 @pytest.mark.parametrize("nchannels", [8, 16])
