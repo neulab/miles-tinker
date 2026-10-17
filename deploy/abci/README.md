@@ -102,19 +102,22 @@ Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN
 ### Gateway presets (`PRESET=`)
 
 A preset pins one model's gateway: the launcher, its options, the engine flags and the client's
-sampling timeout. `PRESET=<name>` reads `deploy/abci/presets/<name>.env`; `PRESET=<path>` reads a
-file of your own in the same format. (The Toolathlon "presets" below are `qsub` lines; these are
-gateways.)
+sampling timeout. `PRESET=<name>` reads `deploy/abci/presets/<name>.env` in `MILES_SRC`, the
+checkout the job serves, whatever checkout you run `qsub` from. So a launch that serves a checkout
+of its own passes `MILES_SRC`; without it, the job reads the default checkout's presets and serves
+its code. `PRESET=<path>` reads a file of your own in the same format. (The Toolathlon "presets"
+below are `qsub` lines; these are gateways.)
 
 | Preset | Model (`HF_MODEL` @ `HF_REVISION`) | Gateway |
 |---|---|---|
 | `qwen3.8-27b-128k` | `apurvaga/Qwen3.8-27B-preserve-thinking` @ `97c72561` | the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it: full fine-tuning, `--model-variant 27b` with TP4 training and TP8 engines, 128K context, FA3 engines, initial lr 1e-6, the cache-aware router (thresholds 16 and 1.5), sampling timeout 1800 s. It advertises the HF id, not the snapshot path, so a trainer config names `model_name: apurvaga/Qwen3.8-27B-preserve-thinking` |
 
 ```bash
-# fcs-q38's layout: 10 nodes, 5 train (TP4 x DP10) + 5 TP8 engines; the client is a command line run from here
+# fcs-q38's layout: 10 nodes, 5 train (TP4 x DP10) + 5 TP8 engines. Run from the training project: the client is
+# its command line and runs in this directory. MILES is the miles-tinker checkout the job serves.
 qsub -l select=10:mpiprocs=8 -l walltime=72:00:00 \
-  -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,TRAIN_NODES=5,RUN_NAME=my-run,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" \
-  deploy/abci/tinker_gateway.pbs
+  -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,TRAIN_NODES=5,RUN_NAME=my-run,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" \
+  $MILES/deploy/abci/tinker_gateway.pbs
 ```
 
 - A preset holds `KEY=value` lines for `GATEWAY_LAUNCHER MODE HF_MODEL HF_REVISION LAUNCHER_ARGS
@@ -232,7 +235,7 @@ starts, the job fails if both `CLIENT_SCRIPT` and `CLIENT_CMD` are set, if `CLIE
 `bash -n` rejects the command line.
 
 ```bash
-qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" deploy/abci/tinker_gateway.pbs
+qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" $MILES/deploy/abci/tinker_gateway.pbs
 ```
 
 `qsub -v` rewrites a value written after `=`: a comma ends the value unless the value is in quotes
@@ -242,7 +245,7 @@ environment and name it in `-v` without a value; `qsub` then copies it unchanged
 
 ```bash
 CLIENT_CMD='platoon train train.yaml "stats.notes=lr 1e-6, group 8"' \
-  qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,CLIENT_CMD deploy/abci/tinker_gateway.pbs
+  qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD $MILES/deploy/abci/tinker_gateway.pbs
 ```
 
 Backslashes survive neither way (PBS doubles them), so a command line that needs one belongs in a `CLIENT_SCRIPT`.
