@@ -79,8 +79,10 @@ Args:
   --max-tokens-per-gpu: packed tokens per training microbatch and rank (default:
     one ``context_len + 1`` row, or its zigzag shard at ``--cp`` > 1).
   --context-len: model_input tokens per datum; datums are ``context_len + 1``
-    tokens, the engines get ``context_len + 1`` as context length and
-    ``--rollout-max-context-len context_len``.
+    tokens. The gateway gets ``--rollout-max-context-len context_len`` (prompts
+    up to ``context_len - 1`` tokens, generation clamped to ``context_len``) and
+    the engines ``context_len + 6`` as context length: SGLang refuses a prompt
+    of ``context_length - 6`` tokens or more (``engine_context_length``).
   --max-tokens-per-datum / --unit-token-budget / --coalesce-wait-s /
     --coalesce-max-wait-s / --max-concurrent-samples / --lease-timeout-s: the
     gateway limits (``--tinker-*`` flags).
@@ -121,7 +123,7 @@ from typing import Literal
 import typer
 
 import miles.utils.external_utils.command_utils as U
-from miles.utils.tinker_args import cp_shard_tokens, max_datum_tokens
+from miles.utils.tinker_args import cp_shard_tokens, engine_context_length, max_datum_tokens
 
 app = typer.Typer()
 
@@ -333,8 +335,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def sglang_context_length(self) -> int:
-        """One token of slack over the datum length: the gateway clamps generation to ``context_len``."""
-        return self.context_len + 1
+        """The engines' context: the gateway admits prompts up to ``context_len - 1`` tokens and clamps
+        generation to ``context_len``, and SGLang refuses the last 6 tokens of its context to prompts."""
+        return engine_context_length(self.context_len)
 
     @property
     def deterministic_env_vars(self) -> dict[str, str]:
