@@ -48,6 +48,8 @@ class InferenceController:
         self.eval_fleet: EvalFleet | None = None
         self._watcher_disposers: list[StopWatchFn] = []
         self._health_checker_activeness = ActivenessTracker(active=True)
+        # whether engine health checks ran when the current weight update paused them (restored when it ends)
+        self._health_active_before_update = False
         self._ticker: SimpleTicker | None = None
 
     @lock_exempt
@@ -157,11 +159,17 @@ class InferenceController:
 
     @acquires_lock
     async def start_update_weights(self) -> "UpdatableEngines":
-        """Return engines eligible for weight updates."""
+        """Return engines eligible for weight updates. The lock stays held and engine health checks stay paused
+        until end_update_weights, or abort_update_weights for an update that failed."""
+        self._health_active_before_update = self._health_checker_activeness.get().active
         await self._health_monitoring_pause()
-        await self._ensure_cells_ready()
+        try:
+            await self._ensure_cells_ready()
+            srv = self._get_updatable_server()
+        except BaseException:
+            await self._restore_health_monitoring_after_update()
+            raise
 
-        srv = self._get_updatable_server()
         if not srv:
             return UpdatableEngines(
                 rollout_engines=[],
@@ -179,16 +187,27 @@ class InferenceController:
 
     @releases_lock
     async def end_update_weights(self, snapshot_cell_id_to_hashes: dict[str, str]):
-        await asyncio.gather(
-            *[
-                cell.mark_weights_ready()
-                for srv in self.servers.values()
-                for cell_id, cell in srv.server_cells.items()
-                if cell_id in snapshot_cell_id_to_hashes
-                and snapshot_cell_id_to_hashes[cell_id] == cell.meta.workers_hash
-                and cell.is_pending_weights
-            ]
-        )
+        try:
+            await asyncio.gather(
+                *[
+                    cell.mark_weights_ready()
+                    for srv in self.servers.values()
+                    for cell_id, cell in srv.server_cells.items()
+                    if cell_id in snapshot_cell_id_to_hashes
+                    and snapshot_cell_id_to_hashes[cell_id] == cell.meta.workers_hash
+                    and cell.is_pending_weights
+                ]
+            )
+        finally:
+            await self._restore_health_monitoring_after_update()
+
+    @releases_lock
+    async def abort_update_weights(self) -> None:
+        """End a weight update that failed: release the lock and let engine health checks run again as they did
+        before it, but mark no engine weights-ready, because each may hold a partial update. Fault tolerance (when
+        enabled) then replaces an engine that the failed update left paused."""
+        logger.warning("Weight update failed: releasing the controller lock; no engine is marked weights-ready")
+        await self._restore_health_monitoring_after_update()
 
     @requires_lock
     async def _ensure_cells_ready(self) -> None:
@@ -310,6 +329,13 @@ class InferenceController:
     @requires_lock
     async def _health_monitoring_resume(self) -> None:
         self._health_checker_activeness.bump_active(True)
+
+    @requires_lock
+    async def _restore_health_monitoring_after_update(self) -> None:
+        # Only what start_update_weights paused: engines offloaded before the update (colocated training) are not
+        # ready for a generation probe, and prepare_rollout / prepare_eval resume their checks.
+        if self._health_active_before_update:
+            await self._health_monitoring_resume()
 
 
 @dataclass(frozen=True)
