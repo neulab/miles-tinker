@@ -102,7 +102,8 @@ Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN
 `CLIENT_DIR` (section 5), `KEEP_GATEWAY`,
 `WORKERS` (client rollout workers, 3), `PLATOON_ROOT`, `TOOLATHLON_ENV`, `TINKER_PORT`
 (default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`,
-`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz, 30 s apart, that end the job).
+`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz, 30 s apart, that end the job; 0 keeps
+a dead gateway's job running, to inspect it).
 
 ### Gateway presets (`PRESET=`)
 

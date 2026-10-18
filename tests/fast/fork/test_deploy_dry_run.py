@@ -267,6 +267,24 @@ def test_any_other_answer_resets_the_count(tmp_path):
     ]
 
 
+def test_zero_probes_keeps_a_dead_gateway_running(tmp_path):
+    """GATEWAY_DEAD_PROBES=0 is the way to keep a dead gateway's nodes for inspection."""
+    results, stderr = _probe_gateway(tmp_path, [DEAD] * 6, probes=0)
+
+    assert results == ["alive 0"] * 6
+    assert "monitor: gateway unavailable" not in stderr
+
+
+def test_a_probe_count_that_is_not_a_number_is_refused(tmp_path):
+    nodefile = tmp_path / "nodes"
+    nodefile.write_text("hnode001\nhnode002\n")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "DRY_RUN": "1", "PBS_NODEFILE": str(nodefile), "PBS_JOBID": "1.pbs",
+           "PBS_LOCALDIR": str(tmp_path), "PROJECT_ROOT": str(tmp_path / "p"), "MILES_SRC": str(REPO), "HF_SNAPSHOT": "/x",
+           "GATEWAY_DEAD_PROBES": "off"}
+    proc = subprocess.run(["bash", str(PBS)], env=env, capture_output=True, text=True)
+    assert proc.returncode == 2 and "GATEWAY_DEAD_PROBES=off must be a count (0 = off)" in proc.stderr
+
+
 def test_the_monitor_loop_ends_the_job_on_a_dead_gateway():
     text = PBS.read_text()
     monitor = text[text.index("monitor_loop() {") :]

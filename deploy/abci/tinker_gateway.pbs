@@ -186,6 +186,7 @@ NODES=${#HOSTS[@]}
 (( NODES >= 2 )) || { echo "expected >= 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
 TRAIN_NODES=${TRAIN_NODES:-$(( NODES == 2 ? 1 : 4 ))}
 (( TRAIN_NODES >= 1 && TRAIN_NODES < NODES )) || { echo "TRAIN_NODES=$TRAIN_NODES must be in [1, $NODES)" >&2; exit 2; }
+[[ ${GATEWAY_DEAD_PROBES:-4} =~ ^[0-9]+$ ]] || { echo "GATEWAY_DEAD_PROBES=$GATEWAY_DEAD_PROBES must be a count (0 = off)" >&2; exit 2; }
 ROLLOUT_GPUS=$(( 8 * (NODES - TRAIN_NODES) ))
 NUM_GPUS=$(( 8 * NODES ))
 dry || [[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
@@ -477,10 +478,12 @@ fi
 # The gateway's healthz answers 503 once its trainer is dead (a failed weight push or training command kills the
 # trainer actors, and nothing rebuilds them in place): every later command fails, so after GATEWAY_DEAD_PROBES
 # consecutive 503s, 30 s apart, the job ends instead of holding its nodes. Any other answer, no answer included,
-# resets the count: a busy gateway is not a dead one. Services: 10 consecutive failed sweeps are fatal.
+# resets the count: a busy gateway is not a dead one. GATEWAY_DEAD_PROBES=0 keeps a dead gateway's job running (to
+# inspect it). Services: 10 consecutive failed sweeps are fatal.
 GATEWAY_DEAD_PROBES=${GATEWAY_DEAD_PROBES:-4}
 GATEWAY_DEAD=0
 gateway_dead() {  # one healthz probe; true once GATEWAY_DEAD_PROBES probes in a row answered 503
+  (( GATEWAY_DEAD_PROBES > 0 )) || return 1
   local out code
   out=$(curl -s --noproxy '*' --connect-timeout 3 --max-time 15 --write-out '\n%{http_code}' \
         "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" 2>/dev/null) || true
