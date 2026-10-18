@@ -575,6 +575,27 @@ class TestUpdateWeightsLockWindow:
         assert controller._health_checker_activeness.get().active
 
     @pytest.mark.asyncio
+    async def test_a_start_that_fails_listing_the_engines_restores_probing(self):
+        """Reading the engine set (a cell's api_client) can raise after the server was chosen."""
+
+        class _BrokenEngineList(_RecordingServer):
+            @property
+            def api_clients(self):
+                raise RuntimeError("cell has no api client")
+
+            @api_clients.setter
+            def api_clients(self, _value):
+                pass
+
+        controller = _make_controller({"a": _BrokenEngineList(model_name="a", update_weights=True)})
+
+        with pytest.raises(RuntimeError, match="no api client"):
+            await controller.start_update_weights()
+
+        assert not controller.context_lock.locked
+        assert controller._health_checker_activeness.get().active
+
+    @pytest.mark.asyncio
     async def test_reconcile_waits_while_the_update_weights_window_is_open(self):
         """A concurrent reconcile must not mutate the engine set mid weight update."""
         controller = _make_controller({})

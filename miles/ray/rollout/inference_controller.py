@@ -166,24 +166,26 @@ class InferenceController:
         try:
             await self._ensure_cells_ready()
             srv = self._get_updatable_server()
+            if not srv:
+                return UpdatableEngines(
+                    rollout_engines=[],
+                    engine_gpu_counts=[],
+                    engine_gpu_offsets=[],
+                    snapshot_cell_id_to_hashes={},
+                )
+
+            return UpdatableEngines(
+                rollout_engines=srv.api_clients,
+                engine_gpu_counts=srv.engine_gpu_counts,
+                engine_gpu_offsets=srv.engine_gpu_offsets,
+                snapshot_cell_id_to_hashes={
+                    cell_id: cell.meta.workers_hash for cell_id, cell in srv.server_cells.items()
+                },
+            )
         except BaseException:
+            # acquires_lock releases the lock; the health checks this call paused are ours to restore
             await self._restore_health_monitoring_after_update()
             raise
-
-        if not srv:
-            return UpdatableEngines(
-                rollout_engines=[],
-                engine_gpu_counts=[],
-                engine_gpu_offsets=[],
-                snapshot_cell_id_to_hashes={},
-            )
-
-        return UpdatableEngines(
-            rollout_engines=srv.api_clients,
-            engine_gpu_counts=srv.engine_gpu_counts,
-            engine_gpu_offsets=srv.engine_gpu_offsets,
-            snapshot_cell_id_to_hashes={cell_id: cell.meta.workers_hash for cell_id, cell in srv.server_cells.items()},
-        )
 
     @releases_lock
     async def end_update_weights(self, snapshot_cell_id_to_hashes: dict[str, str]):
