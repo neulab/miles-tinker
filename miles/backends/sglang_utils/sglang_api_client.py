@@ -8,6 +8,10 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 
 logger = logging.getLogger(__name__)
 
+# The connection was reset or closed before a response arrived. On a reused keep-alive connection that is the
+# engine dropping it as idle while the request was on its way (see GeneralHttpClientProvider).
+_CONNECTION_RESET_ERRORS = (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)
+
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
     return {
@@ -55,12 +59,31 @@ async def wait_server_healthy(server_url, api_key):
         await asyncio.sleep(2)
 
 
+async def _post_idempotent(url: str, payload: dict) -> httpx.Response:
+    """POST a control call whose repeat leaves the engine as one call would, retried once after a connection reset.
+
+    Only pause_generation, continue_generation and update_weight_version (without abort_all_requests) qualify. Never
+    retry update_weights_from_distributed: the engine may already have joined the NCCL broadcast, and a second join
+    waits for a broadcast that never comes. Nor begin/end_weight_update or the LoRA calls: SGLang asserts the
+    session state, so a repeat of a call that did arrive fails the engine.
+    """
+    try:
+        response = await GeneralHttpClientProvider.client().post(url, json=payload)
+    except _CONNECTION_RESET_ERRORS as error:
+        logger.warning(f"POST {url} lost its connection before a response ({error!r}); retrying once")
+        response = await GeneralHttpClientProvider.client().post(url, json=payload)
+    response.raise_for_status()
+    return response
+
+
 @dataclasses.dataclass(frozen=True)
 class SGLangApiClient:
     server_url: str
 
     async def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.
+
+        Never retried: most endpoints are not safe to repeat (see _post_idempotent for the ones that are).
 
         Args:
             endpoint: The API endpoint to call
@@ -371,17 +394,10 @@ class SGLangApiClient:
         )
 
     async def pause_generation(self, mode: str = "retract"):
-        response = await GeneralHttpClientProvider.client().post(
-            f"{self.server_url}/pause_generation",
-            json={"mode": mode},
-        )
-        response.raise_for_status()
-        return response
+        return await _post_idempotent(f"{self.server_url}/pause_generation", {"mode": mode})
 
     async def continue_generation(self):
-        response = await GeneralHttpClientProvider.client().post(f"{self.server_url}/continue_generation", json={})
-        response.raise_for_status()
-        return response
+        return await _post_idempotent(f"{self.server_url}/continue_generation", {})
 
     async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
@@ -394,10 +410,11 @@ class SGLangApiClient:
         return await self._make_request("end_weight_update", {"expected_lora_checksums": expected_lora_checksums})
 
     async def update_weight_version(self, weight_version: str, abort_all_requests: bool = False):
-        return await self._make_request(
-            "update_weight_version",
-            {"new_version": weight_version, "abort_all_requests": abort_all_requests},
-        )
+        payload = {"new_version": weight_version, "abort_all_requests": abort_all_requests}
+        if abort_all_requests:  # a repeat would also abort what arrived in between
+            return await self._make_request("update_weight_version", payload)
+        response = await _post_idempotent(f"{self.server_url}/update_weight_version", payload)
+        return response.json()
 
     async def start_profile(
         self,
