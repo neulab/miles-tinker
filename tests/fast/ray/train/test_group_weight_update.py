@@ -8,6 +8,7 @@ module imports sglang, which is why these tests do not live in test_group.py."""
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import ray
@@ -96,3 +97,62 @@ class TestAWeightPushHandsTheInferenceControllerBack:
 
         assert ended == []
         assert not inference.context_lock.locked
+
+
+class TestACancelledPushHandsTheInferenceControllerBack:
+    """Cancellation is a BaseException: cell.execute neither catches it nor kills the cell, so only the update frame
+    hands the controller back. The real lock checks its holder through a context variable that start detached and
+    the abort must reattach in the same task."""
+
+    @pytest.mark.parametrize("command", ["push_slot", "unload_adapter", "update_weights"])
+    async def test_a_push_cancelled_mid_command_releases_the_lock_and_the_next_push_runs(self, command, monkeypatch):
+        inference = _make_inference_controller()
+        group = await _make_alive_controller(num_cells=1, inference_controller=inference)
+        cell = _cell(group, 0)
+        real_execute = cell.execute
+        started = asyncio.Event()
+
+        async def _hang(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(cell, "execute", _hang)
+        push = asyncio.create_task(_push_weights(group, command))
+        await asyncio.wait_for(started.wait(), timeout=10)
+        assert inference.context_lock.locked and not inference._health_checker_activeness.get().active
+        push.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await push
+
+        assert not inference.context_lock.locked
+        assert inference._health_checker_activeness.get().active
+        assert group.has_alive_cell(), "a cancellation kills no cell"
+        await asyncio.wait_for(inference._tick_cells(), timeout=10)
+        monkeypatch.setattr(cell, "execute", real_execute)
+        await asyncio.wait_for(_push_weights(group, command), timeout=60)
+        assert not inference.context_lock.locked
+
+    async def test_a_push_cancelled_while_the_engines_start_releases_the_lock(self):
+        """start_update_weights waits for engine cells with the lock released between polls; a cancellation there
+        re-takes the lock, puts the health checks back and releases it, and no update frame was ever opened."""
+        inference = _make_inference_controller()
+        starting_engine = SimpleNamespace(
+            is_pending_weights_or_serving=False, is_uninitialized=False, tick=AsyncMock()
+        )
+        inference.servers = {"model": SimpleNamespace(server_cells={"engine-0": starting_engine}, update_weights=True)}
+        group = await _make_alive_controller(num_cells=1, inference_controller=inference)
+
+        push = asyncio.create_task(_push_weights(group, "push_slot"))
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if not inference._health_checker_activeness.get().active and not inference.context_lock.locked:
+                break  # paused and polling with the lock released
+        else:
+            pytest.fail("the push never started waiting for the engine")
+        push.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await push
+
+        assert not inference.context_lock.locked
+        assert inference._health_checker_activeness.get().active
+        await asyncio.wait_for(inference._tick_cells(), timeout=10)
