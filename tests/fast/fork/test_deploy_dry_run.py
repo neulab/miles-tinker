@@ -88,8 +88,10 @@ def test_fifteen_nodes_roles_services_and_exports(tmp_path):
     )
     roles = [line.split("\t") for line in (jobdir / "roles.tsv").read_text().splitlines()]
     assert [r[3] for r in roles] == ["train"] * 4 + ["engine"] * 11
-    # numeric per-octet order (10.0.0.99 < 10.0.0.100 < 10.0.0.200 < 10.0.1.9 < 10.0.1.10 < 10.0.1.100 < 10.0.2.1)
-    assert [r[2] for r in roles] == sorted(FIFTEEN_IPS, key=lambda ip: tuple(map(int, ip.split("."))))
+    # numeric per-octet order (10.0.0.99 < 10.0.0.100 < 10.0.0.200 < 10.0.1.10 < 10.0.1.100 < 10.0.2.1), the head
+    # (hnode031, 10.0.1.9) last, as placement_group.sort_bundles_head_last orders the actor slots
+    others = sorted(FIFTEEN_IPS[1:], key=lambda ip: tuple(map(int, ip.split("."))))
+    assert [r[2] for r in roles] == others + [FIFTEEN_IPS[0]]
     assert [r[0] for r in roles[:4]] == ["hnode055", "hnode099", "hnode100", "hnode101"]
     assert {r[1] for r in roles} == {str(8 * i) for i in range(15)}  # vnode index = first line of the host in PBS_NODEFILE
     engine_ips = [r[2] for r in roles[4:]]
@@ -139,6 +141,47 @@ def test_two_nodes_defaults_to_one_trainer_and_no_services(tmp_path):
     assert "run_qwen3_4b_gateway.py serve --mode lora" in serve and "--actor-num-nodes 1 --rollout-num-gpus 8" in serve
     assert "export OPENREWARD_SESSION_URLS_TOOLATHLON=\n" in out and "export SERVICE_NODES=\n" in out  # empty without services
     assert not SECRET_RE.search(out)
+
+
+@pytest.mark.parametrize(
+    "hosts, ips, train_nodes, trainers",
+    [
+        (["hnode001", "hnode002"], ["10.0.0.1", "10.0.0.2"], None, ["hnode002"]),
+        # the failed job's layout: ten nodes, five trainers, and the head with the lowest IP
+        (
+            [f"hnode{n}" for n in (110, 401, 402, 403, 404, 601, 405, 406, 602, 603)],
+            [
+                "10.0.1.10",
+                "10.0.4.1",
+                "10.0.4.2",
+                "10.0.4.3",
+                "10.0.4.4",
+                "10.0.6.1",
+                "10.0.4.5",
+                "10.0.4.6",
+                "10.0.6.2",
+                "10.0.6.3",
+            ],
+            "5",
+            ["hnode401", "hnode402", "hnode403", "hnode404", "hnode405"],
+        ),
+    ],
+    ids=["two-nodes", "ten-nodes"],
+)
+def test_the_head_node_is_never_a_trainer(tmp_path, hosts, ips, train_nodes, trainers):
+    """The head runs the Ray head, the driver, the gateway and the client; trainer rank 0 there converted and sent
+    weight-sync buckets 5 s apart on a saturated CPU and lost a keep-alive race with the engines."""
+    env = {"TRAIN_NODES": train_nodes} if train_nodes else {}
+    out, jobdir = run_pbs_dry(tmp_path, hosts, ips, **env)
+
+    roles = [line.split("\t") for line in (jobdir / "roles.tsv").read_text().splitlines()]
+    assert [r[0] for r in roles if r[3] == "train"] == trainers
+    assert roles[-1] == [hosts[0], "0", ips[0], "engine"]
+    engines = [r[0] for r in roles if r[3] == "engine"]
+    assert (
+        f"node roles: head {hosts[0]} ({ips[0]}) = ray head + driver + gateway + client + engine; "
+        f"trainers (rank 0 first): {' '.join(trainers)}; engines: {' '.join(engines)}"
+    ) in out
 
 
 def test_launcher_alias_and_explicit_train_nodes(tmp_path):

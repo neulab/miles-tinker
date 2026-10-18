@@ -12,7 +12,8 @@
 # N-node Tinker gateway on ABCI (singularity + PBS + Ray), N = unique hosts in PBS_NODEFILE (>= 2).
 #   PBS node 0 (this batch shell): ray head + miles driver (serve_tinker.py) + gateway HTTP (one container)
 #   every other node:              ray worker (one container each, held by pbsdsh)
-#   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs (miles/ray/placement_group.py sorts bundles by IP)
+#   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs other than the head's (miles/ray/placement_group.py
+#                                  sorts bundles by IP with the Ray head node last), so the head is always an engine node
 #   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one OpenReward
 #                                  service per engine node, started before Ray
 # Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for the
@@ -246,7 +247,10 @@ for i in "${!HOSTS[@]}"; do
 done
 [[ ${HOST_IP[$HEAD_HOST]} == "$HEAD_IP" ]] || { echo "head ip mismatch: $HEAD_IP vs ${HOST_IP[$HEAD_HOST]}" >&2; exit 2; }
 
-# ---------------------------------------------------------------- roles: trainers = TRAIN_NODES lowest IPs (numeric per octet, as placement_group.sort_key)
+# ---------------------------------------------------------------- roles: trainers = TRAIN_NODES lowest IPs, the head's last
+# Numeric per octet with the head node last, as miles/ray/placement_group.py orders the actor slots (sort_bundles_head_last):
+# the head runs the Ray head, the driver, the gateway and the client, so trainer rank 0, which converts and sends every
+# weight-sync bucket, must not compete with them for CPU. TRAIN_NODES < NODES, so the head is always an engine node.
 TRAIN_HOSTS=(); ENGINE_HOSTS=(); ENGINE_IPS=(); ENGINE_VIDX=()
 : > "$JOBDIR/roles.tsv"
 n=0
@@ -255,11 +259,15 @@ while IFS=$'\t' read -r ip host vidx; do
   else role=engine; ENGINE_HOSTS+=("$host"); ENGINE_IPS+=("$ip"); ENGINE_VIDX+=("$vidx"); fi
   printf '%s\t%s\t%s\t%s\n' "$host" "$vidx" "$ip" "$role" >> "$JOBDIR/roles.tsv"
   n=$((n + 1))
-done < <(for i in "${!HOSTS[@]}"; do printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i]}]}" "${HOSTS[$i]}" "${VIDX[$i]}"; done \
-         | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+done < <({ for i in "${!HOSTS[@]}"; do (( i == 0 )) && continue
+             printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i]}]}" "${HOSTS[$i]}" "${VIDX[$i]}"; done \
+           | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
+         printf '%s\t%s\t%s\n' "$HEAD_IP" "$HEAD_HOST" "${VIDX[0]}"; })
 echo "roles (host vidx ip role):"; cat "$JOBDIR/roles.tsv"
+echo "node roles: head $HEAD_HOST ($HEAD_IP) = ray head + driver + gateway + client + engine;" \
+     "trainers (rank 0 first): ${TRAIN_HOSTS[*]}; engines: ${ENGINE_HOSTS[*]}"
 SERVICE_NODES=; SERVICE_URLS=; ENGINE_IP_LIST=
-if [[ $SERVICES == 1 ]]; then  # one service per engine node; URLs by IPoIB ip in IP order (C10)
+if [[ $SERVICES == 1 ]]; then  # one service per engine node; URLs in roles.tsv order: IPoIB ip order, the head last (C10)
   SERVICE_NODES=$(IFS=,; echo "${ENGINE_HOSTS[*]}")
   SERVICE_URLS=$(printf "http://%s:$SERVICE_PORT," "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
   ENGINE_IP_LIST=$(IFS=,; echo "${ENGINE_IPS[*]}")
