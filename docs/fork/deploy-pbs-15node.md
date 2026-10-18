@@ -49,7 +49,7 @@ commands is `deploy/abci/README.md`.
   bound ports, never takes 28100-28107) -> Ray workers (one pbsdsh + container per node,
   `ray-worker-<host>.log` / `worker-<host>.log`) -> head container (`ray status` waits 180 x 10 s
   for `8*NODES` GPUs) -> service health quorum (<= 1200 s) -> gateway `/api/v1/healthz`
-  (<= 3600 s) -> monitor -> client.
+  (<= 3600 s; `GATEWAY_DEAD_PROBES` 503s in a row, 10 s apart, end the job) -> monitor -> client.
 - `GATEWAY_LAUNCHER` is the launcher knob (repo-relative, default the Qwen3-4B one); `LAUNCHER`
   is accepted as an alias.
 

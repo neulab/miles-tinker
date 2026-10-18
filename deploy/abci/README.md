@@ -102,8 +102,8 @@ Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN
 `CLIENT_DIR` (section 5), `KEEP_GATEWAY`,
 `WORKERS` (client rollout workers, 3), `PLATOON_ROOT`, `TOOLATHLON_ENV`, `TINKER_PORT`
 (default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`,
-`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz, 30 s apart, that end the job; 0 keeps
-a dead gateway's job running, to inspect it).
+`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz that end the job, 30 s apart once the
+gateway is up and 10 s apart while the job still waits for it; 0 keeps a dead gateway's job running, to inspect it).
 
 ### Gateway presets (`PRESET=`)
 
@@ -363,6 +363,8 @@ stays flat.
   and took the trainer actors down (`ft op=execute phase=fail` in `head.log`). The gateway cannot rebuild
   them, so every later command would fail: `/api/v1/healthz` answers 503 with the reason, and after
   `GATEWAY_DEAD_PROBES` (4) such answers 30 s apart the monitor ends the job instead of leaving it idle.
+  A trainer that dies before the gateway was ever healthy (a failed warmup push) ends the job the same way,
+  with "the gateway's trainer died before the gateway was healthy; ending the job" and the end of `head.log`.
   Resubmit with the same `RUN_NAME`; the client resumes from its last checkpoint (next bullet).
 - Engine connections: SGLang closes a keep-alive connection that stays idle for
   `SGLANG_TIMEOUT_KEEP_ALIVE` seconds (5 by default, the same as httpx's own idle limit), and a request

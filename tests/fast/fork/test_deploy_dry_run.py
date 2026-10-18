@@ -246,7 +246,7 @@ def test_the_monitor_ends_the_job_after_four_consecutive_503s(tmp_path):
     results, stderr = _probe_gateway(tmp_path, [DEAD] * 4)
 
     assert results == ["alive 1", "alive 2", "alive 3", "dead"]
-    assert "monitor: gateway unavailable (4/4)" in stderr and "the trainer is dead" in stderr
+    assert "gateway unavailable (4/4)" in stderr and "the trainer is dead" in stderr
 
 
 def test_any_other_answer_resets_the_count(tmp_path):
@@ -272,17 +272,85 @@ def test_zero_probes_keeps_a_dead_gateway_running(tmp_path):
     results, stderr = _probe_gateway(tmp_path, [DEAD] * 6, probes=0)
 
     assert results == ["alive 0"] * 6
-    assert "monitor: gateway unavailable" not in stderr
+    assert "gateway unavailable" not in stderr
 
 
-def test_a_probe_count_that_is_not_a_number_is_refused(tmp_path):
+@pytest.mark.parametrize("probes", ["off", "-1", "08"])
+def test_a_probe_count_that_is_not_a_number_is_refused(tmp_path, probes):
+    """08 is no count either: bash arithmetic reads it as octal, fails, and the probe would never end the job."""
     nodefile = tmp_path / "nodes"
     nodefile.write_text("hnode001\nhnode002\n")
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "DRY_RUN": "1", "PBS_NODEFILE": str(nodefile), "PBS_JOBID": "1.pbs",
            "PBS_LOCALDIR": str(tmp_path), "PROJECT_ROOT": str(tmp_path / "p"), "MILES_SRC": str(REPO), "HF_SNAPSHOT": "/x",
-           "GATEWAY_DEAD_PROBES": "off"}
+           "GATEWAY_DEAD_PROBES": probes}
     proc = subprocess.run(["bash", str(PBS)], env=env, capture_output=True, text=True)
-    assert proc.returncode == 2 and "GATEWAY_DEAD_PROBES=off must be a count (0 = off)" in proc.stderr
+    assert proc.returncode == 2 and f"GATEWAY_DEAD_PROBES={probes} must be a count (0 = off)" in proc.stderr
+
+
+def _wait_for_the_gateway(tmp_path: Path, code: str, probes: int = 4) -> subprocess.CompletedProcess:
+    """Run the job's wait for a healthy gateway against a fake curl whose every healthz answer has `code`."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    curl = bindir / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        f'code={code}; body=\'{{"status": "unavailable", "error": "the trainer is dead"}}\'\n'
+        'count=$(( $(cat "$CALLS" 2>/dev/null || echo 0) + 1 )); echo $count > "$CALLS"\n'
+        "# -sf fails on anything but a 2xx answer; --write-out appends the code after a newline\n"
+        'if [[ " $* " == *" -sf "* ]]; then [[ $code == 2* ]]; exit; fi\n'
+        'printf \'%s\\n%s\' "$body" "$code"\n'
+        "[[ $code != 000 ]]\n"
+    )
+    curl.chmod(0o755)
+    (tmp_path / "head.log").write_text("the head log's last lines\n")
+    text = PBS.read_text()
+    block = text[text.index("# ---------------------------------------------------------------- gateway health") :]
+    block = block[: block.index("# ---------------------------------------------------------------- monitor")]
+    script = (
+        "set -euo pipefail\n"
+        f"HEAD_HOST=hnode001 TINKER_PORT=31234 JOBDIR={tmp_path} HEAD_PID=$$ GATEWAY_DEAD_PROBES={probes}\n"
+        "dry() { false; }\n"
+        "sleep() { :; }  # the wait polls every 10 s\n"
+        f"{block}"
+        'echo "the job goes on"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{bindir}:/usr/bin:/bin", "CALLS": str(tmp_path / "calls")},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_a_trainer_that_dies_before_the_gateway_is_healthy_ends_the_job(tmp_path):
+    """A failed warmup push kills the trainer before the job's wait for the gateway ends (with SERVICES=1 that wait
+    starts only once the services are up): healthz answers 503 from then on, and the wait used to run its full hour."""
+    proc = _wait_for_the_gateway(tmp_path, "503")
+
+    assert proc.returncode == 1 and "the job goes on" not in proc.stdout
+    assert "gateway unavailable (4/4)" in proc.stderr and "the trainer is dead" in proc.stderr
+    assert "the gateway's trainer died before the gateway was healthy; ending the job" in proc.stderr
+    assert "the head log's last lines" in proc.stderr
+    assert "gateway not healthy after 3600 s" not in proc.stderr
+
+
+def test_the_wait_ends_when_the_gateway_is_healthy(tmp_path):
+    proc = _wait_for_the_gateway(tmp_path, "200")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "gateway healthy at http://hnode001:31234" in proc.stdout and "the job goes on" in proc.stdout
+    assert (tmp_path / "calls").read_text().strip() == "1"
+
+
+@pytest.mark.parametrize("code, probes", [("000", 4), ("503", 0)], ids=["still-starting", "probe-off"])
+def test_a_gateway_that_is_not_answering_or_not_probed_gets_the_full_wait(tmp_path, code, probes):
+    """No answer is a gateway still loading its trainer, never a dead one; GATEWAY_DEAD_PROBES=0 waits as before."""
+    proc = _wait_for_the_gateway(tmp_path, code, probes=probes)
+
+    assert proc.returncode == 1 and "the job goes on" not in proc.stdout
+    assert "gateway not healthy after 3600 s" in proc.stderr
+    assert "gateway unavailable" not in proc.stderr and "died before" not in proc.stderr
 
 
 def test_the_monitor_loop_ends_the_job_on_a_dead_gateway():
