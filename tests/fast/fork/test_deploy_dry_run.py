@@ -155,6 +155,85 @@ def test_rejects_train_nodes_out_of_range(tmp_path):
     assert proc.returncode == 2 and "TRAIN_NODES=2 must be in [1, 2)" in proc.stderr
 
 
+def _gateway_dead_function() -> str:
+    match = re.search(r"^gateway_dead\(\) \{.*?^\}\n", PBS.read_text(), re.M | re.S)
+    assert match, "tinker_gateway.pbs defines gateway_dead()"
+    return match.group(0)
+
+
+def _probe_gateway(tmp_path: Path, answers: list[str], probes: int = 4) -> tuple[list[str], str]:
+    """Call gateway_dead once per answer against a fake curl replaying `answers` ("<http code> <body>")."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    answer_file = tmp_path / "answers"
+    answer_file.write_text("".join(f"{answer}\n" for answer in answers))
+    curl = bindir / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        "# the next answer: its body, a newline and its code, as --write-out '\\n%{http_code}' prints them\n"
+        'line=$(head -n 1 "$ANSWERS"); tail -n +2 "$ANSWERS" > "$ANSWERS.next"; mv "$ANSWERS.next" "$ANSWERS"\n'
+        "code=${line%% *}; body=${line#* }\n"
+        'printf \'%s\\n%s\' "$body" "$code"\n'
+        "[[ $code != 000 ]]\n"
+    )
+    curl.chmod(0o755)
+    script = (
+        "set -euo pipefail\n"
+        f"HEAD_HOST=hnode001 TINKER_PORT=31234 GATEWAY_DEAD_PROBES={probes} GATEWAY_DEAD=0\n"
+        f"{_gateway_dead_function()}"
+        f'for _ in $(seq {len(answers)}); do if gateway_dead; then echo dead; else echo "alive $GATEWAY_DEAD"; fi; done\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{bindir}:/usr/bin:/bin", "ANSWERS": str(answer_file)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.splitlines(), proc.stderr
+
+
+DEAD = '503 {"status": "unavailable", "error": "the trainer is dead"}'
+OK = '200 {"status": "ok"}'
+
+
+def test_the_monitor_ends_the_job_after_four_consecutive_503s(tmp_path):
+    """healthz answers 503 once the trainer is dead; the job used to idle on its nodes for an hour like that."""
+    results, stderr = _probe_gateway(tmp_path, [DEAD] * 4)
+
+    assert results == ["alive 1", "alive 2", "alive 3", "dead"]
+    assert "monitor: gateway unavailable (4/4)" in stderr and "the trainer is dead" in stderr
+
+
+def test_any_other_answer_resets_the_count(tmp_path):
+    """A gateway that is busy (no answer within 15 s) or healthy again is not a dead one."""
+    results, _ = _probe_gateway(tmp_path, [DEAD, DEAD, OK, DEAD, DEAD, "000 ", DEAD, DEAD, DEAD, DEAD])
+
+    assert results == [
+        "alive 1",
+        "alive 2",
+        "alive 0",
+        "alive 1",
+        "alive 2",
+        "alive 0",
+        "alive 1",
+        "alive 2",
+        "alive 3",
+        "dead",
+    ]
+
+
+def test_the_monitor_loop_ends_the_job_on_a_dead_gateway():
+    text = PBS.read_text()
+    monitor = text[text.index("monitor_loop() {") :]
+    assert (
+        'gateway_dead && { echo "monitor: the gateway\'s trainer is dead; ending the job" >&2; kill -TERM $$; return; }'
+        in monitor
+    )
+    assert "GATEWAY_DEAD_PROBES=${GATEWAY_DEAD_PROBES:-4}" in text
+
+
 def _toolathlon_env_values() -> dict[str, str]:
     values = {}
     for line in (DEPLOY / "toolathlon.env").read_text().splitlines():

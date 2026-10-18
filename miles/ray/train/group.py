@@ -470,6 +470,10 @@ class TrainerController:
     def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
 
+    def has_alive_cell(self) -> bool:
+        """Whether any cell can still run a command (False once every cell failed and had its actors killed)."""
+        return self._is_recoverable()
+
     # ------------------------ utils to forward calls to cells ------------------------
 
     def _is_recoverable(self) -> bool:

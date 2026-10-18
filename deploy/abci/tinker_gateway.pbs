@@ -465,11 +465,28 @@ if ! dry; then
   done
 fi
 
-# ---------------------------------------------------------------- monitor: head container alive, services quorum (10 consecutive failures = fatal)
+# ---------------------------------------------------------------- monitor: head container alive, trainer alive, services quorum
+# The gateway's healthz answers 503 once its trainer is dead (a failed weight push or training command kills the
+# trainer actors, and nothing rebuilds them in place): every later command fails, so after GATEWAY_DEAD_PROBES
+# consecutive 503s, 30 s apart, the job ends instead of holding its nodes. Any other answer, no answer included,
+# resets the count: a busy gateway is not a dead one. Services: 10 consecutive failed sweeps are fatal.
+GATEWAY_DEAD_PROBES=${GATEWAY_DEAD_PROBES:-4}
+GATEWAY_DEAD=0
+gateway_dead() {  # one healthz probe; true once GATEWAY_DEAD_PROBES probes in a row answered 503
+  local out code
+  out=$(curl -s --noproxy '*' --connect-timeout 3 --max-time 15 --write-out '\n%{http_code}' \
+        "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" 2>/dev/null) || true
+  code=${out##*$'\n'}
+  if [[ $code != 503 ]]; then GATEWAY_DEAD=0; return 1; fi
+  GATEWAY_DEAD=$((GATEWAY_DEAD + 1))
+  echo "monitor: gateway unavailable ($GATEWAY_DEAD/$GATEWAY_DEAD_PROBES): ${out%$'\n'*} ($(date))" >&2
+  (( GATEWAY_DEAD >= GATEWAY_DEAD_PROBES ))
+}
 monitor_loop() {
   local fails=0
   while sleep 30; do
     kill -0 "$HEAD_PID" 2>/dev/null || { echo "monitor: head container died ($(date)); ending the job" >&2; kill -TERM $$; return; }
+    gateway_dead && { echo "monitor: the gateway's trainer is dead; ending the job" >&2; kill -TERM $$; return; }
     [[ $SERVICES == 1 ]] || continue
     if sweep_services; then fails=0; continue; fi
     fails=$((fails + 1)); echo "monitor: unhealthy services ($fails/10):$SWEEP_REPORT ($(date))" >&2

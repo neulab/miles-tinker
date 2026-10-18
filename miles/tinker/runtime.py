@@ -183,6 +183,13 @@ class MilesBackend(ExecutorBackend):
         self._window_counts.pop(slot, None)
         self._window_seq_lens.pop(slot, None)
 
+    def health_problem(self) -> str | None:
+        if not self.trainer.has_alive_cell():
+            # a failed slot command kills the cell's actors (cell.execute's kill_on_failure) and only the
+            # independent-DP train() path heals cells, so every later command fails with ActorDiedError
+            return "the trainer is dead: a failed command took down every trainer cell; restart the gateway"
+        return None
+
     def sweep(self) -> None:
         """Periodic housekeeping from the service's lease sweep: routing cache TTL / byte cap."""
         if self.routing is not None:

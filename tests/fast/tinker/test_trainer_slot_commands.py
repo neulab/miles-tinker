@@ -106,3 +106,9 @@ async def test_a_cancelled_push_aborts_the_engine_update():
         await push
     assert inference.calls == ["start", "abort"]
 
+
+def test_the_trainer_has_no_alive_cell_once_its_only_cell_failed():
+    controller, _ = _pushing_controller(AsyncMock())
+    assert controller.has_alive_cell()
+    controller._cells_by_id["cell-0"].is_alive = False
+    assert not controller.has_alive_cell()
