@@ -886,6 +886,15 @@ class TestConnectionResetRetry:
 
         assert len(requests) == 1
 
+    async def test_an_engine_error_answer_keeps_the_engines_reason(self, client, monkeypatch):
+        """update_weight_version answers 400 with the reason in its body; the raised error carries it, as before."""
+        self._serve(monkeypatch, [], status_code=400)
+
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            await client.update_weight_version("7")
+
+        assert any("response.text=" in note and "success" in note for note in raised.value.__notes__)
+
     async def test_a_refused_connection_is_not_retried(self, client, monkeypatch):
         """Not a reset of a reused connection: the engine is not listening, and a second try finds the same."""
         requests = self._serve(monkeypatch, [httpx.ConnectError("[Errno 111] Connection refused")])

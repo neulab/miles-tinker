@@ -72,7 +72,11 @@ async def _post_idempotent(url: str, payload: dict) -> httpx.Response:
     except _CONNECTION_RESET_ERRORS as error:
         logger.warning(f"POST {url} lost its connection before a response ({error!r}); retrying once")
         response = await GeneralHttpClientProvider.client().post(url, json=payload)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:  # keep the engine's reason, as _make_request does
+        e.add_note(f"{response.text=}")
+        raise
     return response
 
 
