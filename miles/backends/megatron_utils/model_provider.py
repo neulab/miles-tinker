@@ -151,6 +151,111 @@ def _check_model_mtp(model, args: argparse.Namespace) -> None:
         )
 
 
+def _bridge_builds_from_model_config(bridge) -> bool:
+    """Whether megatron-bridge builds this family through its ModelBuilder (``get_model_config()``).
+
+    Families that moved there (``USE_MODEL_CONFIG_FOR_CONVERSION``, Muse Glimmer the first) keep only a
+    deprecated ``to_megatron_provider()``: a generic GPTModelProvider without the family's modules (for
+    Glimmer an empty one whose ``finalize()`` divides by zero), so they must not take the provider path.
+    """
+    return bool(getattr(getattr(bridge, "_model_bridge", None), "USE_MODEL_CONFIG_FOR_CONVERSION", False))
+
+
+def _builder_backed_model_config(bridge, args: argparse.Namespace, role: Literal["actor", "critic"]):
+    """The family's ModelConfig with miles' runtime settings, finalized once for every pipeline stage.
+
+    The ModelConfig nests a TransformerConfig and forwards flat assignments to it (and refuses unknown
+    fields), so the provider path's runtime-config copy applies unchanged. Two settings differ:
+
+    * ``transformer_impl`` comes from ``--transformer-impl``: megatron-bridge leaves some builder-backed
+      families at its ``local`` implementation (unfused attention that materializes S x S scores and cannot
+      take packed THD rows), which its own recipes override to ``transformer_engine`` as well.
+    * Context parallelism is refused: these models slice their inputs for CP themselves, while miles hands
+      every rank its pre-sharded zigzag rows, which would be sliced a second time.
+    """
+    if args.context_parallel_size > 1:
+        raise ValueError(
+            f"--context-parallel-size {args.context_parallel_size}: {type(bridge._model_bridge).__name__} builds "
+            "through megatron-bridge's ModelBuilder, whose models slice their inputs for context parallelism "
+            "themselves; miles' pre-sharded rows would be sliced twice. Use --context-parallel-size 1."
+        )
+    model_config = bridge.get_model_config()
+    _apply_bridge_runtime_config(model_config, args)
+    model_config.transformer_impl = args.transformer_impl
+    if role == "critic":
+        model_config.share_embeddings_and_output_weights = False
+    model_config.finalize()
+    _check_bridge_mtp_depth(model_config, args)
+    logger.info(f"bridge: {type(model_config).__name__} through its ModelBuilder: {_describe_layers(model_config)}")
+    return model_config
+
+
+def _describe_layers(model_config) -> str:
+    """The attention settings a builder-backed config resolved to, for the trainer log."""
+    window_layers = getattr(model_config, "window_attn_skip_freq", None)
+    no_rope_layers = getattr(model_config, "no_rope_freq", None)
+    return (
+        f"transformer_impl={model_config.transformer_impl}, num_layers={model_config.num_layers}, "
+        f"window_size={getattr(model_config, 'window_size', None)}, "
+        f"windowed layers={sum(window_layers) if isinstance(window_layers, list) else window_layers}, "
+        f"no-RoPE layers={sum(no_rope_layers) if isinstance(no_rope_layers, list) else no_rope_layers}, "
+        f"attention_output_gate={getattr(model_config, 'attention_output_gate', None)}, "
+        f"output_multiplier={getattr(model_config, 'output_multiplier', None)}, "
+        f"final_logit_softcapping={getattr(model_config, 'final_logit_softcapping', None)}"
+    )
+
+
+def _builder_backed_model_provider(bridge, args: argparse.Namespace, role: Literal["actor", "critic"]):
+    """``get_model``'s provider for a builder-backed family: the config's builder builds each stage."""
+    model_config = _builder_backed_model_config(bridge, args, role)
+    builder = model_config.get_builder_cls()(model_config)
+
+    def wrapped_builder_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: TransformerConfig | None = None,
+        pg_collection=None,
+    ):
+        assert config is None, "miles builds the config from args, so it expects config to be None"
+        if pg_collection is None:
+            # Megatron's get_model always passes one; a caller that does not gets the mpu groups, as it would there
+            from megatron.core.process_groups_config import ProcessGroupCollection
+
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model = builder.build_model(
+            pg_collection, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+        )
+        return _finish_bridge_model(model, args, role=role, post_process=post_process)
+
+    return wrapped_builder_provider
+
+
+def _finish_bridge_model(model, args: argparse.Namespace, *, role: Literal["actor", "critic"], post_process: bool):
+    """The checks and wrappers every bridge-built model stage gets, from a provider or a builder."""
+    if changed := restore_per_token_loss(model, args):
+        logger.info(
+            f"bridge: reset calculate_per_token_loss={args.calculate_per_token_loss} on {changed} "
+            f"config(s) of {type(model).__name__} (the provider's finalize() changed it)"
+        )
+    check_qwen_vl_mrope_patch(model, args)
+    _check_model_mtp(model, args)
+    if post_process and role == "critic":
+        model.output_layer = LinearForLastLayer(
+            input_size=model.config.hidden_size, output_size=1, config=model.config
+        )
+    assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
+    # Gemma-4 and Muse Glimmer return (logits, loss_mask) when given a loss mask; keep the logits only.
+    _bridge_forward = model.forward
+
+    def _logits_only_forward(*args, **kwargs):
+        out = _bridge_forward(*args, **kwargs)
+        return out[0] if isinstance(out, tuple) else out
+
+    model.forward = _logits_only_forward
+    return model
+
+
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -219,6 +324,8 @@ def get_model_provider_func(
         from megatron.bridge import AutoBridge
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        if _bridge_builds_from_model_config(bridge):
+            return _builder_backed_model_provider(bridge, args, role)
         provider = bridge.to_megatron_provider(load_weights=False)
         _apply_bridge_runtime_config(provider, args)
         if role == "critic":
@@ -244,27 +351,7 @@ def get_model_provider_func(
             # the provider is the model's config: a previous chunk's reset must not trip this build's assert
             provider.calculate_per_token_loss = finalized_per_token_loss
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-            if changed := restore_per_token_loss(model, args):
-                logger.info(
-                    f"bridge: reset calculate_per_token_loss={args.calculate_per_token_loss} on {changed} "
-                    f"config(s) of {type(model).__name__} (the provider's finalize() changed it)"
-                )
-            check_qwen_vl_mrope_patch(model, args)
-            _check_model_mtp(model, args)
-            if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
-                )
-            assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
-            # Gemma-4 forward returns (logits, loss_mask); keep logits only.
-            _bridge_forward = model.forward
-
-            def _logits_only_forward(*args, **kwargs):
-                out = _bridge_forward(*args, **kwargs)
-                return out[0] if isinstance(out, tuple) else out
-
-            model.forward = _logits_only_forward
-            return model
+            return _finish_bridge_model(model, args, role=role, post_process=post_process)
 
         return wrapped_bridge_provider
 
