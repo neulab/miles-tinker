@@ -32,6 +32,8 @@
 # DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
 # and every pbsdsh / singularity command line without executing anything.
 set -euo pipefail
+# Under pipefail, a reader that stops early (head, grep -q or -m, awk's exit) can fail its pipeline: the writer dies of
+# SIGPIPE (status 141) if it writes again, and errexit then ends the job. So every reader under pipefail reads to the end.
 umask 077
 DRY_RUN=${DRY_RUN:-0}
 # Credentials never enter this batch shell: the client subshell sources abci.env/secrets.env itself and every
@@ -105,7 +107,7 @@ if [[ -n ${PRESET:-} ]]; then
     fi
   fi
 fi
-HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
+HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | sed -n 1p)}
 MODE=${MODE:-lora}
 GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-${LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}}  # run from /root/miles inside the container
 PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon-tinker}
@@ -159,7 +161,7 @@ ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint
 mkdir -p "$JOBDIR" "$PROJECT_ROOT/checkpoints" "$PROJECT_ROOT/name-resolve"
 # Gateway port: outside miles' dynamic 20000+ range and Toolathlon's 8082 / 28100-28107; bumped while bound.
 TINKER_PORT=${TINKER_PORT:-$((30000 + 10#$JOB % 9000))}
-while ss -ltn 2>/dev/null | grep -q ":$TINKER_PORT "; do echo "port $TINKER_PORT is bound, trying the next"; TINKER_PORT=$((TINKER_PORT + 1)); done
+while [[ $(ss -ltn 2>/dev/null) == *":$TINKER_PORT "* ]]; do echo "port $TINKER_PORT is bound, trying the next"; TINKER_PORT=$((TINKER_PORT + 1)); done
 
 # ---------------------------------------------------------------- helpers (DRY_RUN prints instead of executing)
 dry() { [[ $DRY_RUN == 1 ]]; }
@@ -191,9 +193,10 @@ ROLLOUT_GPUS=$(( 8 * (NODES - TRAIN_NODES) ))
 NUM_GPUS=$(( 8 * NODES ))
 dry || [[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
 # The node's own hostname resolves to an IPv6 link-local address on the node itself, so pick the
-# IPoIB hostname network (10.0.x.y) from the interface list instead of getent.
-node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}'; }
-node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
+# IPoIB hostname network (10.0.x.y) from the interface list instead of getent. awk prints the first match and reads on:
+# one that exited there could leave `ip` writing to a closed pipe, and its SIGPIPE (141) ended the script at start-up.
+node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ && !found++ {split($4, a, "/"); print a[1]}'; }
+node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ && !found++ {print $2}'; }
 HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
 if dry; then IFS=, read -r -a DRY_IPS <<< "${DRY_RUN_IPS:-}"; HEAD_IP=${DRY_IPS[0]:-10.0.0.1}; IFNAME=${IFNAME:-ib0}; fi
 [[ -n $HEAD_IP && -n $IFNAME ]] || { echo "could not determine the head IPoIB address" >&2; ip -o -4 addr show >&2; exit 2; }
@@ -319,8 +322,10 @@ cat > "$JOBDIR/head-inner.sh" <<'EOF'
 set -euo pipefail
 ray start --head --node-ip-address="$HEAD_IP" --port="$RAY_PORT" --dashboard-host=127.0.0.1 --dashboard-port="$DASH_PORT" \
           --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats
-for t in $(seq 1 180); do ray status 2>/dev/null | grep -q "/${NUM_GPUS}.0 GPU" && break; echo "waiting for $NUM_GPUS GPUs ($t/180)"; sleep 10; done
-ray status | grep -q "/${NUM_GPUS}.0 GPU" || { echo "workers never joined ($NUM_GPUS GPUs expected)" >&2; ray status; exit 1; }
+# ray status is read in full, then grepped: behind a pipe, grep -q can quit while ray still writes, and under pipefail
+# ray's broken pipe fails the check
+for t in $(seq 1 180); do out=$(ray status 2>/dev/null) && grep -q "/${NUM_GPUS}.0 GPU" <<< "$out" && break; echo "waiting for $NUM_GPUS GPUs ($t/180)"; sleep 10; done
+out=$(ray status) && grep -q "/${NUM_GPUS}.0 GPU" <<< "$out" || { echo "workers never joined ($NUM_GPUS GPUs expected)" >&2; ray status; exit 1; }
 printf "http://%s:%s\n" "$(hostname -s)" "$TINKER_PORT" > "$ENDPOINT_FILE.tmp" && mv "$ENDPOINT_FILE.tmp" "$ENDPOINT_FILE"
 echo "endpoint $(cat "$ENDPOINT_FILE") (ray cluster ready $(date))"
 # shellcheck disable=SC2086

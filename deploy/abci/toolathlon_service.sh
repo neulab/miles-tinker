@@ -128,7 +128,9 @@ rmdir "$LOCAL_ROOT/overlay-layout/upper" "$LOCAL_ROOT/overlay-layout/work" "$LOC
 
 # ---------------------------------------------------------------- supervision (child or guard dies -> TERM the other, exit 1)
 container_pid=; guard_pid=; cleanup_started=0
-port_closed() { ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$PORT\$"; }
+# The readers below read to the end. Under pipefail, one that quits early (grep -q, head) can leave its writer to die of
+# SIGPIPE: that fails the pipeline (a listening port reads as closed) and, through errexit, the helper.
+port_closed() { ! ss -ltn 2>/dev/null | awk -v port="$PORT" '$4 ~ ("(^|:)" port "$") {open = 1} END {exit !open}'; }
 cleanup() {
   local st=${1:-$?} t
   ((cleanup_started)) && return; cleanup_started=1; trap - EXIT INT TERM
@@ -158,7 +160,7 @@ log "starting Toolathlon host=$(hostname -s) port=$PORT workers=$WORKER_BASE_POR
 next_ps=$((SECONDS + 300))
 while kill -0 "$container_pid" 2>/dev/null && kill -0 "$guard_pid" 2>/dev/null; do
   if (( SECONDS >= next_ps )); then
-    log "top rss (kB, comm):"; ps -eo rss,comm --sort=-rss | head -8; next_ps=$((SECONDS + 300))
+    log "top rss (kB, comm):"; ps -eo rss,comm --sort=-rss | sed -n 1,8p; next_ps=$((SECONDS + 300))
   fi
   sleep 2
 done

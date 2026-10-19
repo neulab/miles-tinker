@@ -11,7 +11,11 @@
   exit status) in `CLIENT_DIR` (default `PBS_O_WORKDIR`), and fails early when it cannot run;
 - `toolathlon_service.sh` DRY_RUN: resolved SIF + sha256 (2fb0ee8b...), the exact guard argv, the container
   command with the release env, no secret name (skipped when the SIF is unreadable on this host);
-- the copied memory guard self-test: the helper's argv against a fake cgroup dir prints `event=start`.
+- the copied memory guard self-test: the helper's argv against a fake cgroup dir prints `event=start`;
+- broken pipes: every pipeline the job runs under errexit and pipefail reads to the end, against fake writers that
+  always outlast a reader that stops early (the head's IPoIB address, the port probe, the default snapshot, the head's
+  wait for the GPUs, the Toolathlon helper's port check and memory report, the clients' head.log lookups), and no such
+  reader is left in those scripts.
 """
 
 import importlib.util
@@ -850,3 +854,231 @@ def test_without_preset_or_client_cmd_a_client_script_launch_is_unchanged(tmp_pa
     assert f"\nclient: {script} on " in out and dry_argv(out, "client")[-2:] == ["bash", str(script)]
     assert "TINKER_SAMPLE_TIMEOUT_SECONDS" not in out and "\npreset " not in out
     assert not (jobdir / "client-cmd.sh").exists()
+
+
+# ---------------------------------------------------------------- broken pipes (errexit + pipefail)
+
+# About 1.3 MB of lines that no reader in the job matches: far more than a pipe holds (64 KiB on Linux)
+FILLER = "".join(f"filler {i:05d} - {'x' * 48} matches nothing\n" for i in range(16384))
+IP_LINES = [  # `ip -o -4 addr show` on a compute node; ibh1, the hostname network, is the first 10.0.x.y interface
+    "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever",
+    "2: eno1    inet 172.16.3.12/16 brd 172.16.255.255 scope global eno1\\       valid_lft forever preferred_lft forever",
+    "9: ibh1    inet 10.0.80.12/16 brd 10.0.255.255 scope global ibh1\\       valid_lft forever preferred_lft forever",
+    "10: ibn1    inet 10.0.81.12/16 brd 10.0.255.255 scope global ibn1\\       valid_lft forever preferred_lft forever",
+]
+SS_HEADER = "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process"
+
+
+def outlasting_writer(bindir: Path, name: str, lines: list[str]) -> None:
+    """A fake `name`, first on PATH, that prints `lines` and then FILLER. A reader that stops after one of `lines` (head,
+    grep -q, awk's exit) leaves it blocked on a full pipe, so it always dies of SIGPIPE (status 141) when that reader
+    exits: the real command's rare race, made certain. A reader that reads to the end gets everything. `ray start`
+    exits 0."""
+    bindir.mkdir(exist_ok=True)
+    output = bindir / f"{name}.out"
+    output.write_text("".join(f"{line}\n" for line in lines) + FILLER)
+    fake = bindir / name
+    fake.write_text(f"#!/bin/bash\n[[ ${{1:-}} == start ]] && exit 0\nexec cat {shlex.quote(str(output))}\n")
+    fake.chmod(0o755)
+
+
+@pytest.mark.parametrize("writer", ["ip", "ss", "ls"])
+def test_a_writer_that_outlasts_its_reader_cannot_break_the_job_start(tmp_path, writer):
+    """A DRY_RUN died with status 141 at `HEAD_IP=$(node_ipv4)`: awk exited at the first 10.0.x.y address while `ip` still
+    had lines to write, and its next write, to the closed pipe, killed it (SIGPIPE). pipefail made that the status of the
+    assignment and errexit ended the job; `ip` is fast, so it was rare. Each pipeline of the start-up, against a writer
+    that outlasts any reader that stops early: `ip` (the head's address and interface), `ss` (the port probe, where the
+    broken pipe made a bound port look free) and `ls` (the default snapshot)."""
+    hf_home = tmp_path / "hf"
+    snapshots = hf_home / "hub" / "models--Qwen--Qwen3-4B-Instruct-2507" / "snapshots"
+    first, second = snapshots / ("a" * 40), snapshots / ("b" * 40)
+    first.mkdir(parents=True)
+    second.mkdir()
+    lines = {
+        "ip": IP_LINES,
+        "ss": [SS_HEADER, "LISTEN 0      4096         0.0.0.0:31234      0.0.0.0:*"],
+        "ls": [str(first), str(second)],
+    }
+    outlasting_writer(tmp_path / "bin", writer, lines[writer])
+    proc = run_pbs(
+        tmp_path,
+        *TWO,
+        PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        TINKER_PORT="31234",
+        HF_SNAPSHOT="",
+        HF_HOME=str(hf_home),
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out[-3000:]
+    expected = {"ip": " if=ibh1 ", "ss": " port=31235 ", "ls": f" snapshot={first} "}
+    assert expected[writer] in out
+    if writer == "ss":
+        assert "port 31234 is bound, trying the next" in out
+
+
+def test_the_head_ip_is_the_first_ipoib_address_however_long_ip_writes(tmp_path):
+    """node_ipv4 and node_ifname as the job calls them, under errexit and pipefail: still the first 10.0.x.y interface."""
+    outlasting_writer(tmp_path / "bin", "ip", IP_LINES)
+    text = PBS.read_text()
+    functions = "".join(
+        re.search(rf"^{name}\(\) \{{.*\}}\n", text, re.M).group(0) for name in ("node_ipv4", "node_ifname")
+    )
+    script = f'set -euo pipefail\n{functions}HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)\necho "$HEAD_IP $IFNAME"\n'
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "10.0.80.12 ibh1\n"  # not ibn1, the second 10.0.x.y interface
+
+
+def test_the_head_waits_for_every_gpu_however_long_ray_status_writes(tmp_path):
+    """head-inner.sh (errexit, pipefail) waits until `ray status` shows every GPU. Behind `| grep -q`, ray's broken pipe
+    reads as "not yet" in the wait and, in the check after it, ends the job ("workers never joined")."""
+    _, jobdir = run_pbs_dry(tmp_path, *TWO)
+    bindir = tmp_path / "bin"
+    status = [
+        "======== Autoscaler status: 2026-10-20 05:07:54.000000 ========",
+        "Resources",
+        "-" * 63,
+        "Usage:",
+        " 0.0/384.0 CPU",
+        " 0.0/16.0 GPU",
+        " 0B/3.73TiB memory",
+    ]
+    outlasting_writer(bindir, "ray", status)
+    for name, body in (("python", 'echo "python $*"'), ("sleep", ":  # the wait polls every 10 s")):
+        (bindir / name).write_text(f"#!/bin/bash\n{body}\n")
+        (bindir / name).chmod(0o755)
+    env = {
+        "PATH": f"{bindir}:/usr/bin:/bin",
+        "HEAD_IP": "10.0.0.2",
+        "RAY_PORT": "6379",
+        "DASH_PORT": "8265",
+        "NUM_GPUS": "16",
+        "TINKER_PORT": "31234",
+        "ENDPOINT_FILE": str(tmp_path / "endpoint"),
+        "MODE": "lora",
+        "GATEWAY_LAUNCHER": "examples/tinker/x.py",
+        "HF_SNAPSHOT": "/x/snap",
+        "CHECKPOINT_ROOT": "/x/ckpt",
+        "TRAIN_NODES": "1",
+        "ROLLOUT_GPUS": "8",
+        "LAUNCHER_ARGS": "",
+        "EXTRA_ARGS": "",
+    }
+    proc = subprocess.run(
+        ["bash", str(jobdir / "head-inner.sh")], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert "waiting for" not in proc.stdout and "workers never joined" not in proc.stderr
+    assert re.fullmatch(r"http://\S+:31234\n", (tmp_path / "endpoint").read_text())
+    assert "\npython examples/tinker/x.py serve --mode lora --hf-checkpoint /x/snap " in proc.stdout
+
+
+@pytest.mark.parametrize("listening, report", [("0.0.0.0:8082", "open"), ("0.0.0.0:18082", "closed")])
+def test_the_toolathlon_port_check_reads_all_of_ss(tmp_path, listening, report):
+    """At cleanup the Toolathlon helper reports whether port 8082 still listens. Behind `| grep -q`, a broken pipe makes a
+    listening port read as closed."""
+    outlasting_writer(tmp_path / "bin", "ss", [SS_HEADER, f"LISTEN 0      511          {listening}      0.0.0.0:*"])
+    function = re.search(r"^port_closed\(\) \{.*\}\n", SERVICE.read_text(), re.M).group(0)
+    script = f"set -euo pipefail\nPORT=8082\n{function}if port_closed; then echo closed; else echo open; fi\n"
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"{report}\n"
+
+
+def test_the_toolathlon_memory_report_reads_all_of_ps(tmp_path):
+    """Every 300 s the Toolathlon helper logs its node's eight largest processes. Behind `| head -8`, `ps` dies of SIGPIPE
+    when it still has lines to write as head exits, and errexit then ends the helper and its service."""
+    pipeline = re.search(r'log "top rss \(kB, comm\):"; (ps .*?); next_ps=', SERVICE.read_text()).group(1)
+    processes = ["   RSS COMMAND", *(f"{900 - i:6d} proc{i}" for i in range(20))]
+    outlasting_writer(tmp_path / "bin", "ps", processes)
+    proc = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{pipeline}\n"],
+        env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == processes[:8]
+
+
+@pytest.mark.parametrize(
+    "client, expected",
+    [("smoke.sh", " mode=full model=org/first ("), ("cp_parity.sh", " model=org/first cp=2 tp=4 out=")],
+)
+def test_a_client_reads_the_gateway_flags_from_any_head_log(tmp_path, client, expected):
+    """The clients take the gateway's model id (cp_parity.sh also its CP and TP sizes) from the first match in head.log.
+    Behind `| head -1`, grep dies of SIGPIPE once its matches outgrow a pipe, and errexit ends the client."""
+    jobdir = tmp_path / "job"
+    jobdir.mkdir()
+    first = "serve --tinker-base-model org/first --context-parallel-size 2 --tensor-model-parallel-size 4\n"
+    later = "".join(
+        f"serve --tinker-base-model org/model-{i} --context-parallel-size 8 --tensor-model-parallel-size 8\n"
+        for i in range(20000)
+    )
+    (jobdir / "head.log").write_text(first + later)
+    python = tmp_path / "python"
+    python.write_text("#!/bin/bash\n")
+    python.chmod(0o755)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "JOBDIR": str(jobdir),
+        "RUN_NAME": "dry",
+        "MODE": "full",
+        "TINKER_BASE_URL": "http://gw",
+        "ENDPOINT_FILE": str(tmp_path / "endpoint"),
+        "COOKBOOK_PYTHON": str(python),
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "clients" / client)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert expected in proc.stdout
+
+
+# A reader that can stop before its input ends: head, grep -q or -m (--quiet, --silent, --max-count), or an awk program
+# with an exit before any END block. `||` is not a pipe.
+EARLY_READER = re.compile(
+    r"(?<!\|)\|(?!\|)\s*(?:head\b|grep\b[^|]*\s(?:-[A-Za-z]*[qm]|--quiet|--silent|--max-count)"
+    r"|awk\b(?:(?!\bEND\b)[^|])*\bexit\b)"
+)
+
+
+def test_no_reader_stops_early_under_errexit_and_pipefail(tmp_path):
+    """The rule behind the tests above, for every script the job runs with errexit and pipefail: the batch script, the
+    helpers it writes (as rendered), the service helpers and the clients."""
+    _, jobdir = run_pbs_dry(tmp_path, *TWO, CLIENT_CMD="true")
+    scripts = {"tinker_gateway.pbs": re.sub(r"<<'?EOF'?\n.*?\nEOF\n", "\n", PBS.read_text(), flags=re.S)}
+    scripts |= {f"rendered {path.name}": path.read_text() for path in sorted(jobdir.glob("*.sh"))}
+    for path in (
+        SERVICE,
+        DEPLOY / "swe_rebench_service.sh",
+        DEPLOY / "frontier_cs_service.sh",
+        DEPLOY / "kill-leftovers.sh",
+        *sorted(DEPLOY.glob("clients/*.sh")),
+    ):
+        scripts[path.relative_to(REPO).as_posix()] = path.read_text()
+    checked = {
+        name: text for name, text in scripts.items() if re.search(r"^\s*set -[a-z]*e[a-z]* .*\bpipefail\b", text, re.M)
+    }
+    assert {"tinker_gateway.pbs", "rendered head-inner.sh", "deploy/abci/toolathlon_service.sh"} <= set(checked)
+    early = [
+        f"{name}: {line.strip()}"
+        for name, text in checked.items()
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#") and EARLY_READER.search(line)
+    ]
+    assert not early, "\n".join(early)
