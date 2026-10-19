@@ -64,8 +64,11 @@ the rationale column of this table, so keep one row per file or directory
 
 | File | Rationale | Upstream-worthy? |
 |---|---|---|
-| `miles/backends/megatron_utils/full/` | full fine-tuning executor for slot 0 (E7): reuses `run_forward_backward_pass`, defers `finalize_model_grads` to optim_step, Megatron dist-ckpt save/load, `update_weights()` as the sampler push | yes |
-| `miles/backends/megatron_utils/actor.py` | executor selection by `--tinker-train-mode`; FFT commands no longer assert `multi_lora` | yes |
+| `miles/backends/megatron_utils/full/` | full fine-tuning executor for slot 0 (E7): reuses `run_forward_backward_pass`, defers `finalize_model_grads` to optim_step, Megatron dist-ckpt save/load, `update_weights()` as the sampler push; `--log-weight-movement` (share of BF16 weights changed per step); a weights-only checkpoint (`--no-save-optim`) resumes with a fresh optimizer instead of failing with KeyError('optimizer') | yes |
+| `miles/backends/megatron_utils/actor.py` | executor selection by `--tinker-train-mode`; FFT commands no longer assert `multi_lora`; with `--tinker-kl-coef`, scores each unit with the frozen reference and logs `[kl-ref]` drift | yes |
+| `miles/backends/megatron_utils/full/reference.py` | frozen starting weights in pinned CPU memory, swapped in for one forward pass per unit, as the reference of the KL penalty (`--tinker-kl-coef`); full fine-tuning has no pinned base sampler to score with | maybe |
+| `miles/backends/megatron_utils/stochastic_rounding.py` | `--stochastic-rounding` (`--stochastic-rounding-noise fixed`): FP32 master to BF16 with stochastic rounding, so at lr 1e-6 weights move every step instead of whole magnitude buckets at updates 4, 8, 16 | maybe |
+| `miles/backends/megatron_utils/model_provider.py` | `--fp32-lm-head`: LM head in FP32, matching SGLang's `--enable-fp32-lm-head` | yes |
 | `miles/backends/megatron_utils/model.py` | grad finalize hook split so LoRA and FFT executors share it | yes |
 | `miles/backends/megatron_utils/checkpoint.py` | FFT checkpoint directory layout under `<checkpoint_root>/<model_id>/weights/<name>/` | yes |
 | `miles/backends/megatron_utils/lora/executor.py` | `actor_train` timer + `log_perf_data` on the tinker path (MFU instrumentation, E5); `discard_grads` | yes |
@@ -73,13 +76,14 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/backends/training_utils/loss.py` | sum-reduction scaling keyed on the tinker train mode, not only `is_multi_lora_enabled` | yes |
 | `miles/ray/rollout/train_data_conversion.py` | `advantages` shipped with every DP shard (the client's advantages never reached the trainer: every RL loss crashed) | yes |
 | `miles/backends/training_utils/data.py` | units padded to a multiple of dp_size with dummy rows so small SDK chunks do not divide by zero (E6) | yes |
-| `miles/backends/training_utils/loss_hub/tinker_losses.py` | loss fixes found in the review (E2) | yes |
+| `miles/backends/training_utils/loss_hub/tinker_losses.py` | loss fixes found in the review (E2); `--tinker-kl-coef` x KL(policy || reference) per trained token, weighted like the policy-gradient term | yes |
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
 | `miles/tinker/runtime.py` (MilesBackend) | dp padding of units and output stripping; FFT `train_data` without `adapter_slots`; optim_step metrics passthrough and `<checkpoint_root>/perf.jsonl` (per-slot MFU records) | yes |
 | `serve_tinker.py` | uvloop when installed, no uvicorn access log, 60 s keep-alive; `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode | yes |
-| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA) | yes |
+| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA); `--tinker-kl-coef`, `--tinker-kl-type`, `--tinker-max-tokens-per-datum`, `--stochastic-rounding[-noise]`, `--log-weight-movement`, `--fp32-lm-head` | yes |
 | `miles/utils/train_metric_utils.py`, `miles/utils/timer.py`, `miles/utils/flops_utils.py` | only if needed for per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`) | yes |
 | `tests/fast/tinker/test_runtime.py`, `tests/fast/tinker/test_full_executor.py`, `tests/fast/backends/` | padding, FFT executor and metrics tests | yes |
+| `tests/fast/tinker/test_reference_policy.py`, `tests/fast/tinker/test_tinker_losses.py`, `tests/fast/backends/test_stochastic_rounding.py` | KL reference, KL loss term and stochastic rounding tests | yes |
 
 ### Fork-only tooling, deployment and docs
 
@@ -91,6 +95,10 @@ the rationale column of this table, so keep one row per file or directory
 | `tests/fast/fork/` | tests for the sync tool | no |
 | `.claude/skills/upstream-sync/` | Claude Code skill wrapping the sync tool and the conflict policy | no |
 | `deploy/abci/` | ABCI PBS launchers: `tinker_gateway.pbs` (two nodes, one container per node, `CLIENT_SCRIPT` runs the client on the head node and the job ends when it exits), `clients/*.sh` ready-made client scripts, `pull_image.pbs`, `smoke_container.pbs`, README runbook | no |
+| `deploy/babel/` | Babel setup and Apptainer runner for existing repository training commands | no |
+| `deploy/flame/` | OpenHands RL client for FLAME (or Babel), alone on one 8-GPU node or against a remote Tinker server (`TINKER_BASE_URL`); node-local staging and GCS persistence; README runbook for the FLAME/Babel + AMD setup | no |
+| `deploy/amd/serve_openhands.sbatch` | Tinker server for that client on AMD HPC Fund mi3508x: Qwen3.8-27B defaults, learner/recompute/router settings, weights-only checkpoints on `$WORK`, two nodes via `tools/amd_tinker_cluster.py` | no |
+| `tools/amd_tinker_cluster.py`, `tools/amd_tinker.py` | multi-GPU nodes (`--gpus-per-node`), `--roce` (mi3508x RoCE NCCL settings, GPU-direct RDMA off), allocator/NCCL settings passed to every node and into the container, SSH retry, `MILES_AMD_MODELS` | no |
 | `deploy/clients/` | client launchers (refuse login nodes via `hostguard`; run them through `CLIENT_SCRIPT`): cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | `execute_train`-shaped launcher for the gateway (lora/full) on 8 + 8 GPUs | maybe (as `examples/tinker/`) once FFT lands upstream |
 | `docs/fork/` | fork overview, full fine-tuning semantics, acceptance procedure | no |

@@ -159,6 +159,7 @@ def get_model_provider_func(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
             _maybe_install_witness(args, model)
+            _maybe_fp32_lm_head(args, model)
             return model
 
         return wrapped_model_provider
@@ -192,6 +193,7 @@ def get_model_provider_func(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
+            _maybe_fp32_lm_head(args, model)
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.
             _bridge_forward = model.forward
 
@@ -337,10 +339,53 @@ def get_model_provider_func(
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
         _maybe_install_witness(args, model)
+        _maybe_fp32_lm_head(args, model)
 
         return model
 
     return model_provider
+
+
+def _maybe_fp32_lm_head(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    """Run the LM head in FP32 (--fp32-lm-head), matching SGLang's --enable-fp32-lm-head.
+
+    BF16 logits carry ~3 significant digits (a logit of 20 rounds in steps of 0.125), so
+    rounding them separately in the trainer and the rollout engine is a direct source of
+    logprob mismatch. The weight stays a BF16 parameter (it may be tied to the embedding);
+    only the matmul sees FP32 copies. Gradient-accumulation fusion is bypassed for this
+    layer because its kernel writes into the FP32 copy's missing ``main_grad``; the
+    gradient reaches the parameter through the cast instead.
+    """
+    if not getattr(args, "fp32_lm_head", False):
+        return
+    layers = [
+        (name, module)
+        for name, module in model.named_modules()
+        if name.rsplit(".", 1)[-1] == "output_layer" and isinstance(module, tensor_parallel.ColumnParallelLinear)
+    ]
+    if not layers:
+        # Pipeline stages without the head, and critics (scalar LinearForLastLayer, already FP32).
+        logger.warning(f"--fp32-lm-head: no ColumnParallelLinear output_layer in {type(model).__name__}")
+    for name, layer in layers:
+        layer.forward = _fp32_forward(layer)
+        logger.info(f"--fp32-lm-head: {name} computes logits in FP32")
+
+
+def _fp32_forward(layer: tensor_parallel.ColumnParallelLinear):
+    bf16_forward = layer.forward
+
+    def forward(input_, weight=None, runtime_gather_output=None):
+        weight = layer.weight if weight is None else weight
+        fusion = layer.gradient_accumulation_fusion
+        layer.gradient_accumulation_fusion = False
+        try:
+            return bf16_forward(
+                input_.float(), weight=weight.float(), runtime_gather_output=runtime_gather_output
+            )
+        finally:
+            layer.gradient_accumulation_fusion = fusion
+
+    return forward
 
 
 def _maybe_install_witness(

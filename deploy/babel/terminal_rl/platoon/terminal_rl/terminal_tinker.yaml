@@ -1,0 +1,80 @@
+# LiteCoder terminal-RL Tinker training configuration.
+#
+# Sized for terminal episodes rather than single-shot tasks: each rollout holds
+# an Apptainer instance and issues up to VANILLUX_CALL_LIMIT bash commands, so
+# batches are small and timeouts are long. deploy/babel/run.py overrides the
+# model, step count and W&B settings on the command line.
+
+train:
+  model_name: Qwen/Qwen3-4B-Instruct-2507
+  renderer_name: qwen3_instruct
+  batch_size: 4
+  num_epochs: 1000
+  num_minibatches: 1
+  num_microbatches: 1
+  max_staleness: 3
+  lora_rank: 32
+  loss_fn: cispo
+  loss_fn_config:
+    clip_low_threshold: 0.0
+    clip_high_threshold: 5.0
+  optimizer:
+    learning_rate: 1e-6
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+  workflow_config:
+    group_size: 8
+    rollout_config:
+      # GroupRolloutWorkflow overwrites task.max_steps with this, so it -- not
+      # VANILLUX_CALL_LIMIT -- is the cap that applies. Each turn appends its
+      # action and observation to the prompt, so 100 turns overran a 64k context.
+      max_steps: 30
+      output_dir: ./rollout_results
+      verbose: true
+      # A whole episode: container start, up to 100 commands, then the verifier.
+      timeout: 3600
+      # One agent.act plus one env.step; a slow command is bounded by the
+      # sandbox's own timeout, so this only catches a wedged step.
+      step_timeout: 900
+      inference_params:
+        temperature: 1.0
+        max_completion_tokens: 2048
+  # Each rollout holds a container; this is a CPU and memory bound, not a GPU one.
+  num_concurrent_rollout_workflow_workers: 8
+
+eval:
+  strategy: step
+  every: 10
+  num_concurrent_rollout_workflow_workers: 4
+  workflow_config:
+    group_size: 1
+    rollout_config:
+      max_steps: 30
+      output_dir: ./eval_results
+      verbose: false
+      timeout: 3600
+      step_timeout: 900
+      inference_params:
+        temperature: 1.0
+        max_completion_tokens: 2048
+
+checkpoint:
+  strategy: step
+  every: 25
+  load_checkpoint_path: null
+
+log_path: ./logs
+tinker_base_url: null
+
+stats:
+  experiment_name: litecoder-terminal-platoon-tinker
+  trial_name: grpo-trial1
+  wandb:
+    mode: online
+    project: litecoder-terminal-platoon-tinker
+    entity: null
+    tags:
+      - litecoder-terminal
+      - tinker
+      - grpo

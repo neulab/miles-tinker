@@ -1,0 +1,420 @@
+# tmax tasks whose environment cannot be set up in the training sandbox.
+# Found by running each failing task's setup.sh in a fresh sandbox with the
+# training flags (2026-10-09); failures from an already-prepared image were kept. Removed from the training split
+# only; the eval split is left unchanged so evals stay comparable.
+# One task id per line; text after '#' is the reason.
+task_000086_7f269221  # missing C headers/libs
+task_000352_88055f14  # missing C headers/libs
+task_001038_3f8088d2  # missing C headers/libs
+task_001091_8fb4ffe7  # overlay cross-device rename
+task_001552_87d83871  # missing C headers/libs
+task_002059_d77b1349  # overlay cross-device rename
+task_002340_fcb0ffea  # missing C headers/libs
+task_002524_36ec272e  # missing C headers/libs
+task_002589_d7484fe2  # missing C headers/libs
+task_002623_1d9e6a06  # unclear
+task_003261_f0d7df10  # overlay cross-device rename
+task_003397_35f53b7c  # missing C headers/libs
+task_003519_5f6531ff  # unclear
+task_003622_c13285ca  # missing C headers/libs
+task_003712_3d62c671  # missing C headers/libs
+task_003907_c111dc21  # apt/dpkg
+task_004103_8732a95a  # missing C headers/libs
+task_004179_0ee52583  # missing file/command
+task_004445_d387b556  # missing C headers/libs
+task_004857_2c3d045e  # missing C headers/libs
+task_005655_4c2f4e25  # apt/dpkg
+task_009952_1c017070  # overlay cross-device rename
+# Full-pool scan of the remaining tasks (same method, 2026-10-09):
+task_000001_e67d5628  # missing C headers/libs
+task_000016_3ffaf505  # overlay cross-device rename
+task_000021_5e1d9408  # missing C headers/libs
+task_000026_b557e887  # missing C headers/libs
+task_000077_662ef3eb  # ImageMagick font missing (input not drawn)
+task_000078_efbae60d  # network/download
+task_000115_a01c565c  # missing C headers/libs
+task_000140_a41de773  # C toolchain unusable
+task_000188_16ababdf  # missing C headers/libs
+task_000232_9e79baea  # missing C headers/libs
+task_000306_b7243206  # C toolchain unusable
+task_000317_6a7b03ce  # overlay cross-device rename
+task_000353_274799a4  # missing C headers/libs
+task_000365_1922cbd1  # ImageMagick font missing (input not drawn)
+task_000382_d6f23c02  # missing C headers/libs
+task_000430_37cb6021  # missing C headers/libs
+task_000494_147e8440  # missing C headers/libs
+task_000521_063d28ee  # missing C headers/libs
+task_000575_08a41bf3  # overlay cross-device rename
+task_000632_9fa8b4a0  # apt/dpkg
+task_000703_e8678a4c  # missing C headers/libs
+task_000742_084d8048  # missing C headers/libs
+task_000751_b2bfaa17  # overlay cross-device rename
+task_000780_aa9f4298  # missing C headers/libs
+task_000810_8d08d90a  # missing C headers/libs
+task_000861_3e77b33d  # missing C headers/libs
+task_001068_ba585e13  # missing C headers/libs
+task_001236_b97e19de  # missing C headers/libs
+task_001243_2e462934  # missing C headers/libs
+task_001288_305375d1  # missing C headers/libs
+task_001298_305bb0fd  # missing C headers/libs
+task_001358_44749e38  # apt/dpkg
+task_001371_59130ace  # overlay cross-device rename
+task_001376_00c24fa4  # missing C headers/libs
+task_001409_f24c2eda  # apt/dpkg
+task_001417_851b57ff  # missing C headers/libs
+task_001440_caaf0e7c  # overlay cross-device rename
+task_001463_94cd6031  # missing C headers/libs
+task_001491_92af38ac  # missing C headers/libs
+task_001502_813f7d1d  # missing C headers/libs
+task_001704_632d5bb4  # missing C headers/libs
+task_001776_0461a512  # overlay cross-device rename
+task_001791_eed6787f  # apt/dpkg
+task_001892_dd3c46f8  # missing C headers/libs
+task_001893_ad084f86  # apt/dpkg
+task_001912_1942fbed  # missing C headers/libs
+task_001919_5003c847  # C toolchain unusable
+task_002010_9e4f08e9  # missing C headers/libs
+task_002015_30c1f280  # missing C headers/libs
+task_002070_68ecbbb3  # missing C headers/libs
+task_002093_c9d6abd5  # missing C headers/libs
+task_002115_88d01e6c  # ImageMagick font missing (input not drawn)
+task_002158_10a1bd0e  # missing C headers/libs
+task_002164_25281eee  # C toolchain unusable
+task_002172_6c5c40f8  # overlay cross-device rename
+task_002199_d4cf4bdb  # missing C headers/libs
+task_002250_885d5e0d  # missing C headers/libs
+task_002304_968b2431  # missing C headers/libs
+task_002498_67d5238c  # missing C headers/libs
+task_002514_202148e4  # missing C headers/libs
+task_002622_271602dc  # missing C headers/libs
+task_002648_7a83a017  # missing C headers/libs
+task_002698_4fee03e7  # missing C headers/libs
+task_002725_c8c2c3f1  # ImageMagick font missing (input not drawn)
+task_002746_262e77cc  # missing C headers/libs
+task_002799_79803b05  # overlay cross-device rename
+task_002814_5ca6250e  # missing C headers/libs
+task_002820_d864475e  # missing C headers/libs
+task_002952_2a941742  # missing C headers/libs
+task_002962_179e56ba  # overlay cross-device rename
+task_002985_486873d2  # overlay cross-device rename
+task_003008_49496c27  # missing C headers/libs
+task_003046_fb46e9bf  # missing C headers/libs
+task_003057_b8336883  # missing C headers/libs
+task_003096_98a0a0bf  # missing C headers/libs
+task_003117_aa0e2113  # missing C headers/libs
+task_003177_0687da13  # overlay cross-device rename
+task_003358_4b1b0908  # missing C headers/libs
+task_003375_9b686137  # overlay cross-device rename
+task_003437_42a8fe66  # missing C headers/libs
+task_003606_50489f5a  # missing C headers/libs
+task_003610_c7567258  # missing C headers/libs
+task_003675_10a0d939  # missing C headers/libs
+task_003776_a204cfd4  # missing C headers/libs
+task_003887_fbd561ec  # missing C headers/libs
+task_003898_2681b411  # missing C headers/libs
+task_003940_5f27fdf6  # missing C headers/libs
+task_003960_856dd564  # missing C headers/libs
+task_004139_e5dc3bff  # missing C headers/libs
+task_004227_5e870638  # missing C headers/libs
+task_004296_251060ee  # missing C headers/libs
+task_004304_e6adb22d  # missing C headers/libs
+task_004347_2aa33c3c  # missing C headers/libs
+task_004409_26f3383c  # missing C headers/libs
+task_004509_a97ee989  # missing C headers/libs
+task_004551_23c802b0  # missing C headers/libs
+task_004619_75075884  # overlay cross-device rename
+task_004632_3a321e6f  # missing C headers/libs
+task_004644_260e8a0c  # missing C headers/libs
+task_004655_02f6baa8  # missing C headers/libs
+task_004661_06033c27  # overlay cross-device rename
+task_004675_402f2345  # missing C headers/libs
+task_004760_4b8a673a  # missing C headers/libs
+task_004772_a9982fb4  # missing C headers/libs
+task_004850_3529a1f4  # ImageMagick font missing (input not drawn)
+task_004862_cd464b26  # ImageMagick font missing (input not drawn)
+task_004878_6f9cb71b  # overlay cross-device rename
+task_004894_0c4a239b  # overlay cross-device rename
+task_004985_2ffbd90c  # missing C headers/libs
+task_005002_0d603cde  # overlay cross-device rename
+task_005081_be0841af  # missing C headers/libs
+task_005131_8d5028f5  # ImageMagick font missing (input not drawn)
+task_005192_976833d1  # overlay cross-device rename
+task_005313_21296c53  # network/download
+task_005388_3c2a233f  # missing C headers/libs
+task_005432_2c19f33f  # missing C headers/libs
+task_005551_ec90c4ff  # missing C headers/libs
+task_005589_a3a4ff5d  # overlay cross-device rename
+task_005618_7b27a04f  # overlay cross-device rename
+task_005835_179daf83  # missing C headers/libs
+task_006231_a760f667  # overlay cross-device rename
+task_006332_97cd9303  # apt/dpkg
+task_006670_a4e0f1bb  # missing C headers/libs
+task_006892_3e8e8590  # missing C headers/libs
+task_007190_43982ab7  # missing C headers/libs
+task_007490_44913203  # overlay cross-device rename
+task_007526_09d63db1  # overlay cross-device rename
+task_007963_b25cba5e  # apt/dpkg
+task_008045_7b8f1968  # missing C headers/libs
+task_008340_4206e56c  # missing C headers/libs
+task_008670_018cd1e6  # overlay cross-device rename
+task_009404_c42376ed  # missing C headers/libs
+task_009417_4cf9948d  # missing C headers/libs
+# Tasks whose verifier talks to a server the agent starts on a fixed port
+# (2026-10-10). Sandboxes share the node's network namespace, and a GRPO group
+# runs its rollouts at once, so they fight over the port: 9% of rollouts in job
+# 155424 hit "Address already in use" (solved 14% vs 35%), and a verifier can
+# score another sandbox's server. Unprivileged Apptainer only offers
+# --network=none, which would also cut apt/pip; drop these until each sandbox
+# can get its own network namespace. Found with analysis/port_vs_solve.py's rule.
+task_000002_81d660f3  # verifier queries a server on fixed port 9000,9001,9002
+task_000084_2e6745ad  # verifier queries a server on fixed port 8080
+task_000094_77feb9f0  # verifier queries a server on fixed port 5000,8080
+task_000128_5892b832  # verifier queries a server on fixed port 8080
+task_000134_39daeb5b  # verifier queries a server on fixed port 8080,8081
+task_000177_c57e515d  # verifier queries a server on fixed port 5000,6379,8080
+task_000189_2844d799  # verifier queries a server on fixed port 9090
+task_000214_723bf7c4  # verifier queries a server on fixed port 8080
+task_000242_341bf3b8  # verifier queries a server on fixed port 8000
+task_000254_1f7650f6  # verifier queries a server on fixed port 8080
+task_000265_23b37d70  # verifier queries a server on fixed port 8080
+task_000292_65d6b6df  # verifier queries a server on fixed port 8888
+task_000309_7c04bb06  # verifier queries a server on fixed port 8080
+task_000331_d694b191  # verifier queries a server on fixed port 8080
+task_000335_ef900c18  # verifier queries a server on fixed port 8888
+task_000342_1c793674  # verifier queries a server on fixed port 9000
+task_000352_847c6272  # verifier queries a server on fixed port 8000
+task_000357_fe517667  # verifier queries a server on fixed port 8080,8081
+task_000374_4d76e365  # verifier queries a server on fixed port 8001,8002,8003
+task_000385_5d3a44e7  # verifier queries a server on fixed port 9090
+task_000389_78c9d173  # verifier queries a server on fixed port 8080,9090
+task_000395_1ab555d1  # verifier queries a server on fixed port 8080
+task_000405_ae5df9e6  # verifier queries a server on fixed port 8080,8081,9001
+task_000454_8ce94979  # verifier queries a server on fixed port 8080
+task_000480_9713da1a  # verifier queries a server on fixed port 5000,6379,8080
+task_000537_369a9739  # verifier queries a server on fixed port 8080
+task_000538_1f6ff4dd  # verifier queries a server on fixed port 8080
+task_000600_d032582e  # verifier queries a server on fixed port 9090
+task_000609_c095fc34  # verifier queries a server on fixed port 8080
+task_000622_75a18062  # verifier queries a server on fixed port 5000,6379
+task_000666_87b50520  # verifier queries a server on fixed port 8080
+task_000677_afb9b8e5  # verifier queries a server on fixed port 8888
+task_000683_630e99e7  # verifier queries a server on fixed port 8080
+task_000696_9e66f3a1  # verifier queries a server on fixed port 8080
+task_000704_c7a8b5a2  # verifier queries a server on fixed port 9090
+task_000717_55759ff7  # verifier queries a server on fixed port 50051
+task_000812_72e31313  # verifier queries a server on fixed port 9055
+task_000857_08dcd299  # verifier queries a server on fixed port 8080
+task_000869_8564bf59  # verifier queries a server on fixed port 6379,8080
+task_000880_e8245672  # verifier queries a server on fixed port 8080,8443
+task_000885_d5b89404  # verifier queries a server on fixed port 9090
+task_000902_c122671d  # verifier queries a server on fixed port 8000
+task_000913_abd8c2f5  # verifier queries a server on fixed port 8080,8081
+task_000930_cea3c7fa  # verifier queries a server on fixed port 8000
+task_000997_ccd13ab9  # verifier queries a server on fixed port 8080,9090
+task_001023_fd2843c7  # verifier queries a server on fixed port 8025,8080
+task_001199_17939d46  # verifier queries a server on fixed port 8080
+task_001221_157b68d4  # verifier queries a server on fixed port 8081
+task_001222_0d490c0f  # verifier queries a server on fixed port 8001,8002,8080
+task_001237_3bb323ec  # verifier queries a server on fixed port 8080
+task_001280_f21f87d7  # verifier queries a server on fixed port 8000,8080,9042
+task_001285_c68f2d42  # verifier queries a server on fixed port 3000,8080
+task_001314_908c6117  # verifier queries a server on fixed port 8080
+task_001316_071a4b11  # verifier queries a server on fixed port 8181
+task_001331_787cad37  # verifier queries a server on fixed port 9090
+task_001358_5ebf5d4e  # verifier queries a server on fixed port 8443
+task_001394_2a0afe75  # verifier queries a server on fixed port 8080
+task_001412_7487095b  # verifier queries a server on fixed port 8080
+task_001414_80b8c27d  # verifier queries a server on fixed port 9090
+task_001425_bdaeeaa3  # verifier queries a server on fixed port 8050
+task_001448_ca0f9dad  # verifier queries a server on fixed port 8080,9000
+task_001509_fb0aa47b  # verifier queries a server on fixed port 8080,9000
+task_001513_4674fd10  # verifier queries a server on fixed port 8080
+task_001518_a3122a8f  # verifier queries a server on fixed port 8080
+task_001539_b556faf2  # verifier queries a server on fixed port 8080
+task_001541_f1b79807  # verifier queries a server on fixed port 9000
+task_001542_359c4f4e  # verifier queries a server on fixed port 8080
+task_001569_f23b5063  # verifier queries a server on fixed port 5050
+task_001585_487cd26c  # verifier queries a server on fixed port 6379,8081,8082
+task_001610_d9f6306d  # verifier queries a server on fixed port 8080
+task_001612_664be1a3  # verifier queries a server on fixed port 5050
+task_001646_2da81d08  # verifier queries a server on fixed port 8080
+task_001654_02230f4e  # verifier queries a server on fixed port 5000
+task_001656_d9658218  # verifier queries a server on fixed port 8000
+task_001662_5e49cf92  # verifier queries a server on fixed port 8080,9000
+task_001692_95325401  # verifier queries a server on fixed port 6379,8080,8081
+task_001725_b40aaa3a  # verifier queries a server on fixed port 2222,8000,8080
+task_001752_9e518c8f  # verifier queries a server on fixed port 8000
+task_001769_3e790a3f  # verifier queries a server on fixed port 8443
+task_001795_45b8b144  # verifier queries a server on fixed port 8080
+task_001855_413a2bab  # verifier queries a server on fixed port 9090
+task_001870_8a377f41  # verifier queries a server on fixed port 8080
+task_001875_026926a7  # verifier queries a server on fixed port 5000,8080,9000
+task_001900_0997ead6  # verifier queries a server on fixed port 2525,8080
+task_001911_dc2b5565  # verifier queries a server on fixed port 5000,6379
+task_001918_1f50bd9a  # verifier queries a server on fixed port 8000
+task_001992_efddd807  # verifier queries a server on fixed port 6379,8080
+task_002019_5ea2ac51  # verifier queries a server on fixed port 8080,8081
+task_002021_f4330a76  # verifier queries a server on fixed port 8080
+task_002049_2d10b9f5  # verifier queries a server on fixed port 5000,6379,8080
+task_002076_9218eac0  # verifier queries a server on fixed port 8080
+task_002159_bc7fe439  # verifier queries a server on fixed port 8181
+task_002207_f7a42d13  # verifier queries a server on fixed port 9090
+task_002224_352f4b22  # verifier queries a server on fixed port 8080
+task_002252_acc8622f  # verifier queries a server on fixed port 5000,5001,5002
+task_002262_49cb697e  # verifier queries a server on fixed port 6379,8080
+task_002291_39ee10cc  # verifier queries a server on fixed port 8080
+task_002366_05d0874a  # verifier queries a server on fixed port 8000
+task_002416_7bc57858  # verifier queries a server on fixed port 8443
+task_002437_4897158b  # verifier queries a server on fixed port 8080,8081
+task_002489_6f84b6f8  # verifier queries a server on fixed port 8080
+task_002491_24932e15  # verifier queries a server on fixed port 8080
+task_002500_b3926624  # verifier queries a server on fixed port 8080
+task_002525_b48a91e2  # verifier queries a server on fixed port 8080,8081,9000
+task_002538_f23666a5  # verifier queries a server on fixed port 8080
+task_002543_70f060f9  # verifier queries a server on fixed port 8080
+task_002553_394c2ea0  # verifier queries a server on fixed port 9080,9081
+task_002612_2cf537ff  # verifier queries a server on fixed port 8080,8081
+task_002618_cdf40aa6  # verifier queries a server on fixed port 8888
+task_002692_7c17443b  # verifier queries a server on fixed port 5000,6379,8080
+task_002703_f232af26  # verifier queries a server on fixed port 8080
+task_002727_2f0ee8d0  # verifier queries a server on fixed port 9090
+task_002736_7212a1e4  # verifier queries a server on fixed port 8080,9090
+task_002770_4a33d459  # verifier queries a server on fixed port 8333
+task_002837_7ac08b2d  # verifier queries a server on fixed port 5000,8000,8080
+task_002850_41c0acf4  # verifier queries a server on fixed port 8080
+task_002863_8d4bc4a6  # verifier queries a server on fixed port 8080
+task_002892_9a3d0252  # verifier queries a server on fixed port 8080,50051
+task_002894_2ff406de  # verifier queries a server on fixed port 8080
+task_002909_c7329071  # verifier queries a server on fixed port 5000,6379,8080
+task_002948_df54b402  # verifier queries a server on fixed port 8080
+task_002998_668f249e  # verifier queries a server on fixed port 8080
+task_003001_970335b5  # verifier queries a server on fixed port 8443
+task_003059_9f3cc32b  # verifier queries a server on fixed port 8080
+task_003073_9291ca27  # verifier queries a server on fixed port 8080
+task_003075_c9d8f3ed  # verifier queries a server on fixed port 8443
+task_003101_429697e4  # verifier queries a server on fixed port 9000
+task_003104_4b65bc0b  # verifier queries a server on fixed port 8080,9000
+task_003119_df57358a  # verifier queries a server on fixed port 8080,9000
+task_003141_909dc437  # verifier queries a server on fixed port 8080
+task_003188_80481268  # verifier queries a server on fixed port 8080
+task_003201_eb12b9d8  # verifier queries a server on fixed port 8080
+task_003205_4267f918  # verifier queries a server on fixed port 8080
+task_003206_e83e5d79  # verifier queries a server on fixed port 5000,8443
+task_003269_6db37bd8  # verifier queries a server on fixed port 5000
+task_003283_52ccc96e  # verifier queries a server on fixed port 8080
+task_003291_a5f3355c  # verifier queries a server on fixed port 8080
+task_003321_0c800f36  # verifier queries a server on fixed port 8080
+task_003341_1bf4d175  # verifier queries a server on fixed port 8000,8080
+task_003367_76b969ec  # verifier queries a server on fixed port 9090
+task_003380_ec63229d  # verifier queries a server on fixed port 8080
+task_003389_6f2c451e  # verifier queries a server on fixed port 8080
+task_003411_d3223c1b  # verifier queries a server on fixed port 8080,9090
+task_003427_fb032610  # verifier queries a server on fixed port 8080
+task_003433_6831cddb  # verifier queries a server on fixed port 8080
+task_003446_7ec894d9  # verifier queries a server on fixed port 2222,8000
+task_003543_d25d6e22  # verifier queries a server on fixed port 8080
+task_003549_6ca3a6d1  # verifier queries a server on fixed port 8080,9090
+task_003573_26a90d8e  # verifier queries a server on fixed port 8080
+task_003623_b2e0bc7e  # verifier queries a server on fixed port 8080
+task_003628_fa9b4629  # verifier queries a server on fixed port 9090
+task_003650_f203f7dd  # verifier queries a server on fixed port 8080
+task_003699_245ece74  # verifier queries a server on fixed port 8080
+task_003708_60dae4ec  # verifier queries a server on fixed port 8080
+task_003741_86d9dd03  # verifier queries a server on fixed port 8080
+task_003744_7021b8a9  # verifier queries a server on fixed port 8080
+task_003751_89b7c18e  # verifier queries a server on fixed port 3000,6379
+task_003828_ce5c6472  # verifier queries a server on fixed port 9099
+task_003843_6e5dae01  # verifier queries a server on fixed port 9090
+task_003862_8483a311  # verifier queries a server on fixed port 8443
+task_003869_8dcf39d6  # verifier queries a server on fixed port 8080
+task_003882_0774190e  # verifier queries a server on fixed port 8080
+task_003894_93326402  # verifier queries a server on fixed port 8080
+task_003897_f2e4a2a5  # verifier queries a server on fixed port 9090
+task_003950_61de8dcd  # verifier queries a server on fixed port 9090
+task_003967_9369fb73  # verifier queries a server on fixed port 8000,8080
+task_004002_a5c8b85e  # verifier queries a server on fixed port 6379,8080
+task_004057_9d40f3c9  # verifier queries a server on fixed port 8080,8081
+task_004060_0027f202  # verifier queries a server on fixed port 8080
+task_004066_3407f518  # verifier queries a server on fixed port 8000
+task_004093_12604e1f  # verifier queries a server on fixed port 8080
+task_004113_65a9f742  # verifier queries a server on fixed port 6379,8081,9090
+task_004174_33d6e62f  # verifier queries a server on fixed port 8080
+task_004199_f597c6f1  # verifier queries a server on fixed port 8080,9090
+task_004277_511121b0  # verifier queries a server on fixed port 8080
+task_004279_806e5674  # verifier queries a server on fixed port 8000
+task_004297_64995fff  # verifier queries a server on fixed port 9090
+task_004308_7a13f962  # verifier queries a server on fixed port 9090
+task_004330_f1802861  # verifier queries a server on fixed port 8888
+task_004485_a9c1469e  # verifier queries a server on fixed port 5000
+task_004487_698cf749  # verifier queries a server on fixed port 8000
+task_004490_3af2a2a7  # verifier queries a server on fixed port 8888
+task_004495_748f1c06  # verifier queries a server on fixed port 8080,8081
+task_004499_162b1dbc  # verifier queries a server on fixed port 5000,5001,8080
+task_004501_759ef1e6  # verifier queries a server on fixed port 5000,5001,6379
+task_004518_dcfc0874  # verifier queries a server on fixed port 6379,8000
+task_004525_5107249d  # verifier queries a server on fixed port 8080,9090
+task_004532_ea249c54  # verifier queries a server on fixed port 8080,8081,8082
+task_004535_bdf6fd8c  # verifier queries a server on fixed port 8080
+task_004555_06ff723a  # verifier queries a server on fixed port 9090
+task_004720_959b7365  # verifier queries a server on fixed port 8080
+task_004751_a8ed7cbf  # verifier queries a server on fixed port 5000,8080
+task_004769_89e951bf  # verifier queries a server on fixed port 8080
+task_004802_dbf4ca04  # verifier queries a server on fixed port 8080
+task_004808_3c4b86bc  # verifier queries a server on fixed port 8080
+task_004823_4a02ec31  # verifier queries a server on fixed port 9090
+task_004828_b9af27fe  # verifier queries a server on fixed port 8080
+task_004831_c0c78638  # verifier queries a server on fixed port 8080
+task_004899_68b782aa  # verifier queries a server on fixed port 8080
+task_004906_89433114  # verifier queries a server on fixed port 5050,6379
+task_004907_b530aa72  # verifier queries a server on fixed port 8000
+task_004916_e4728c98  # verifier queries a server on fixed port 8080
+task_004977_e261ad07  # verifier queries a server on fixed port 8888
+task_004984_5b235e5f  # verifier queries a server on fixed port 8000,8001,8002
+task_005045_7deb58bc  # verifier queries a server on fixed port 6379,8000,8080
+task_005054_dc91503b  # verifier queries a server on fixed port 8080,8443
+task_005066_eb56aaca  # verifier queries a server on fixed port 8080,9000
+task_005090_3b00484f  # verifier queries a server on fixed port 8080
+task_005092_2231cca7  # verifier queries a server on fixed port 8080
+task_005098_50419c1e  # verifier queries a server on fixed port 8080
+task_005121_7d220445  # verifier queries a server on fixed port 8080,9090
+task_005179_20d086e5  # verifier queries a server on fixed port 8080,9337
+task_005180_40df5a87  # verifier queries a server on fixed port 8765
+task_005196_20498a31  # verifier queries a server on fixed port 8080,9000
+task_005245_423798e1  # verifier queries a server on fixed port 9090
+task_005249_6e856b44  # verifier queries a server on fixed port 8000,8001,8002
+task_005280_0b19ed66  # verifier queries a server on fixed port 8080
+task_005294_d6dcf107  # verifier queries a server on fixed port 8080
+task_005295_af99c5a4  # verifier queries a server on fixed port 8000
+task_005329_4385ccfe  # verifier queries a server on fixed port 8443,9090
+task_005346_2e2fc570  # verifier queries a server on fixed port 5432,6379,8080
+task_005367_cf1703b7  # verifier queries a server on fixed port 9090
+task_005432_c550f2d8  # verifier queries a server on fixed port 5000
+task_005440_a703b5d2  # verifier queries a server on fixed port 8080,9090
+task_005448_46fc379e  # verifier queries a server on fixed port 8000
+task_005449_edc2b0a7  # verifier queries a server on fixed port 8080,9090
+task_005510_9a7eea6f  # verifier queries a server on fixed port 8080,8081
+task_005654_603e182f  # verifier queries a server on fixed port 8443,9090
+task_005719_210d44da  # verifier queries a server on fixed port 9090
+task_005935_cd483540  # verifier queries a server on fixed port 8080,9000
+task_006285_f00f86ab  # verifier queries a server on fixed port 8080,9090
+task_006535_a0b65fca  # verifier queries a server on fixed port 8080,8443
+task_006638_fa6fb773  # verifier queries a server on fixed port 8080
+task_006764_3d6a4fea  # verifier queries a server on fixed port 8080
+task_006863_a2199916  # verifier queries a server on fixed port 8080,9090
+task_007064_0e44a942  # verifier queries a server on fixed port 5000,8080
+task_007517_8d283878  # verifier queries a server on fixed port 8080,9090
+task_007674_00e42a45  # verifier queries a server on fixed port 5000
+task_007735_d1102a46  # verifier queries a server on fixed port 7777,8888
+task_008014_05f3bc4e  # verifier queries a server on fixed port 8443
+task_008370_d7c9163e  # verifier queries a server on fixed port 8443
+task_008441_0c935d56  # verifier queries a server on fixed port 2525
+task_008648_29ec6dda  # verifier queries a server on fixed port 8080,9000
+task_008742_a1a5f8d3  # verifier queries a server on fixed port 9090,9091
+task_008794_911eb529  # verifier queries a server on fixed port 2525
+task_008990_5da55c37  # verifier queries a server on fixed port 8443
+task_009134_30f90583  # verifier queries a server on fixed port 8443
+task_009187_5615f22c  # verifier queries a server on fixed port 8888,9090
+task_009317_be37d0ac  # verifier queries a server on fixed port 8080
+task_009566_146b34f1  # verifier queries a server on fixed port 8080,9001,9002
+task_009633_30f8123c  # verifier queries a server on fixed port 8080,8443,9090
+task_009800_43486cd1  # verifier queries a server on fixed port 8443

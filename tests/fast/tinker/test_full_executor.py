@@ -386,6 +386,42 @@ def test_reset_to_base_reloads_the_startup_weights(rig):
     assert (rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng) == (False, False, False)
 
 
+def test_log_weight_movement_reports_bf16_changes_by_magnitude(rig, monkeypatch):
+    """Weights in [2^-9, 2^-8) that the step moves by a BF16 ulp count as changed; a nudge
+    below half an ulp leaves the BF16 value, and the count, unchanged."""
+    executor = rig.executor
+    sharded = torch.nn.Parameter(torch.full((4,), 2.0**-9 * 1.5, dtype=torch.bfloat16))
+    sharded.tensor_model_parallel = True
+    replicated = torch.nn.Parameter(torch.full((4,), 2.0**-6, dtype=torch.bfloat16))
+    chunk = FakeModelChunk()
+    chunk.parameters = lambda: [sharded, replicated]
+
+    class MovingOptimizer(FakeOptimizer):
+        def step(self):
+            with torch.no_grad():
+                sharded[:2] += 2.0**-9 * 2**-6  # 2 ulps of a value in [2^-9, 2^-8): changes in BF16
+                replicated.add_(2.0**-6 * 2**-12)  # far below half an ulp: rounds back
+            return super().step()
+
+    mpu = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0, get_model_parallel_group=lambda: None)
+    monkeypatch.setattr(sys.modules["megatron.core"], "mpu", mpu, raising=False)
+    monkeypatch.setattr(executor.dist, "all_reduce", lambda tensor, group=None: None)
+    rig.args.log_weight_movement = True
+
+    metrics = executor.optim_step(rig.args, [chunk], MovingOptimizer(), ADAM)
+
+    assert metrics["weights_changed_frac"] == pytest.approx(2 / 8)
+    assert metrics["weights_changed_frac/e-9"] == pytest.approx(0.5)
+    assert metrics["weights_changed_frac/e-6"] == 0.0
+    assert metrics["weights_share/e-9"] == pytest.approx(0.5)
+    assert metrics["weight_update_rel_norm"] > 0
+
+
+def test_weight_movement_is_off_by_default(rig):
+    metrics = rig.executor.optim_step(rig.args, rig.model, FakeOptimizer(), ADAM)
+    assert not any(key.startswith("weight") for key in metrics)
+
+
 @pytest.mark.parametrize("write_error", [None, RuntimeError("write failed")])
 def test_mi300_checkpoint_writer_stays_in_process_and_restores_original(rig, monkeypatch, write_error):
     monkeypatch.setattr(torch.version, "hip", "6.4")

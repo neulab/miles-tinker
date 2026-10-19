@@ -1,0 +1,42 @@
+# Terminal-Bench 2.0 eval subset (EVAL_SET=tb2-32): 32 of the 70 validated tasks
+# (tb2_eval_tasks.txt) with the full set's difficulty mix (4 easy / 41 medium /
+# 25 hard -> 2 / 19 / 11). Chosen from 156562's three TB2 evals (steps 0/10/20,
+# all sampler versions): every task any of them solved (the third solved easy
+# task, cobol-modernization, left out for its ~30 min rollouts), then the
+# never-solved tasks of the same difficulty with the shortest median rollout.
+# Base model (156562 step 0): 31/121 = 25.6% here, 33/263 = 12.5% on all 70.
+# easy
+tb2_prove-plus-comm
+tb2_fix-git
+# medium
+tb2_modernize-scientific-stack
+tb2_multi-source-data-merger
+tb2_openssl-selfsigned-cert
+tb2_log-summary-date-ranges
+tb2_git-leak-recovery
+tb2_count-dataset-tokens
+tb2_kv-store-grpc
+tb2_constraints-scheduling
+tb2_largest-eigenval
+tb2_portfolio-optimization
+tb2_custom-memory-heap-crash
+tb2_pytorch-model-cli
+tb2_sanitize-git-repo
+tb2_mteb-retrieve
+tb2_gcode-to-text
+tb2_regex-log
+tb2_mteb-leaderboard
+tb2_winning-avg-corewars
+tb2_sqlite-db-truncate
+# hard
+tb2_cancel-async-tasks
+tb2_fix-code-vulnerability
+tb2_model-extraction-relu-logits
+tb2_sparql-university
+tb2_torch-tensor-parallelism
+tb2_password-recovery
+tb2_write-compressor
+tb2_polyglot-rust-c
+tb2_make-mips-interpreter
+tb2_feal-linear-cryptanalysis
+tb2_torch-pipeline-parallelism

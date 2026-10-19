@@ -1,0 +1,34 @@
+# 32 tasks the base policy solves 20-80% of the time (155806/155834 v0 train + step-0 eval rollouts),
+# for the fixed-task learning test (TASK_LIST). columns in comments: solved/rollouts, step-limit share
+task_000739_4dc57b48  # 12/15 solved, step-limit 0%
+task_000668_885c3719  # 7/15 solved, step-limit 7%
+task_007387_cc371a66  # 6/15 solved, step-limit 7%
+task_002595_7e7008a5  # 12/15 solved, step-limit 20%
+task_009863_06c493d6  # 10/13 solved, step-limit 0%
+task_008320_c657a681  # 5/10 solved, step-limit 30%
+task_000009_dbc34e08  # 5/8 solved, step-limit 0%
+task_000033_0b133897  # 3/8 solved, step-limit 0%
+task_000226_18a13697  # 6/8 solved, step-limit 0%
+task_000997_7c67da94  # 5/8 solved, step-limit 0%
+task_001195_b9e36867  # 5/8 solved, step-limit 0%
+task_005132_650218fe  # 6/8 solved, step-limit 0%
+task_007995_2e223f7f  # 4/8 solved, step-limit 0%
+task_008644_6f685d9f  # 4/8 solved, step-limit 0%
+task_000347_cbcb86bc  # 4/8 solved, step-limit 12%
+task_001412_7691185d  # 5/8 solved, step-limit 12%
+task_002630_cbffb83d  # 5/8 solved, step-limit 12%
+task_003858_854ccdb8  # 6/8 solved, step-limit 12%
+task_009767_785f480e  # 6/8 solved, step-limit 12%
+task_000443_90a5ee10  # 6/8 solved, step-limit 25%
+task_009557_30502e21  # 4/8 solved, step-limit 25%
+task_001634_e488a410  # 2/8 solved, step-limit 50%
+task_008854_157297de  # 3/8 solved, step-limit 62%
+task_004181_21723d8b  # 3/8 solved, step-limit 75%
+task_005231_8c42f919  # 2/8 solved, step-limit 75%
+task_000404_66dd3c89  # 2/7 solved, step-limit 0%
+task_001056_ed26bb51  # 3/7 solved, step-limit 57%
+task_001288_6590c6d0  # 4/6 solved, step-limit 0%
+task_004132_94c25f9a  # 4/6 solved, step-limit 83%
+task_001748_bfc04666  # 4/5 solved, step-limit 0%
+task_001270_ecef6e54  # 1/5 solved, step-limit 20%
+task_003325_c7af0ae6  # 1/5 solved, step-limit 20%

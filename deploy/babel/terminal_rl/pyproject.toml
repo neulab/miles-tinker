@@ -1,0 +1,59 @@
+[project]
+name = "platoon-litecoder-terminal"
+version = "0.1.0"
+description = "Platoon plugin for terminal-agent RL in Apptainer sandboxes (LiteCoder, tmax-15k)."
+requires-python = "~=3.12.0"
+dependencies = [
+    "platoon >= 0.1.0",
+    "pyyaml >= 6.0",
+]
+
+[project.optional-dependencies]
+tinker = [
+    "platoon[tinker]",
+]
+wandb = [
+    "platoon[wandb]",
+]
+# The openhands recipes give the model the same tool-calling interface the
+# terminal-bench evaluation uses. Pin to the version the evaluation installs.
+openhands = [
+    # platoon-openhands supplies OpenHandsEnv/OpenHandsAgent; it lives beside
+    # this plugin in the Platoon checkout, so it resolves as a path dependency.
+    "platoon-openhands",
+    "openhands-sdk",
+    "openhands-tools",
+]
+
+[tool.uv]
+override-dependencies = [
+    "fastapi[standard]>=0.115.0",
+    "openai==1.99.6",
+    # litellm 1.102 needs an openai newer than the pin above; without this the
+    # plugin builds a venv that cannot import litellm at all.
+    "litellm==1.101.0",
+    "xgrammar==0.1.24",
+    "outlines-core==0.1.26",
+    "pyarrow==20.0.0",
+    "huggingface_hub==1.7.1",
+    "datasets==4.3.0",
+    "networkx==3.3.0",
+]
+no-build-isolation-package = ['flash-attn']
+
+[tool.uv.sources]
+platoon = { path = "../..", editable = true }
+platoon-openhands = { path = "../openhands", editable = true }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["platoon"]

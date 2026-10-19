@@ -346,6 +346,49 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable true-on-policy mode.",
             )
             parser.add_argument(
+                "--fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Compute the LM head (output layer) in FP32 on both sides to shrink the training-"
+                    "inference logprob mismatch (MiniMax-M1): Megatron multiplies FP32 hidden states by an "
+                    "FP32 copy of the weight, and SGLang gets --sglang-enable-fp32-lm-head."
+                ),
+            )
+            parser.add_argument(
+                "--log-weight-movement",
+                action="store_true",
+                default=False,
+                help=(
+                    "Full fine-tuning through the Tinker gateway: after each optim_step, report which BF16 "
+                    "weights changed, by magnitude bucket, and the relative update norm "
+                    "(optim metrics weights_changed_frac*, weight_update_rel_norm). Costs one BF16 copy "
+                    "of each rank's parameter shard during the step."
+                ),
+            )
+            parser.add_argument(
+                "--stochastic-rounding",
+                action="store_true",
+                default=False,
+                help=(
+                    "Full fine-tuning through the Tinker gateway: copy the FP32 master weights into the BF16 "
+                    "model weights with stochastic rounding instead of round-to-nearest, so small weights move "
+                    "a little every step instead of whole magnitude buckets changing at once at updates "
+                    "4, 8, 16, ... Requires the distributed optimizer; masters and checkpoints are unchanged."
+                ),
+            )
+            parser.add_argument(
+                "--stochastic-rounding-noise",
+                choices=("fresh", "fixed"),
+                default="fresh",
+                help=(
+                    "With --stochastic-rounding: 'fresh' draws new noise at every copy, so weights whose "
+                    "master sits between two BF16 values jitter every step; 'fixed' reuses the same noise "
+                    "per element (a fixed rounding threshold per weight), so a weight changes only when its "
+                    "master crosses that threshold."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-logprobs-via-prefill",
                 action="store_true",
                 default=False,
@@ -1891,6 +1934,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="LoRA: sampler adapter versions kept loaded on the engines per model (default: 3)",
             )
             parser.add_argument(
+                "--tinker-kl-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Full fine-tuning: add tinker-kl-coef * sum_t w_t * KL_t(policy || starting weights) to the "
+                    "advantage losses (importance_sampling, ppo, cispo), where w_t are the datum's loss_fn_inputs "
+                    "weights -- the client's per-token normalization (0 on prompt/tool tokens). The starting weights "
+                    "are kept in pinned CPU memory and swapped in for one forward pass per unit. 0 disables "
+                    "(default: 0)"
+                ),
+            )
+            parser.add_argument(
+                "--tinker-kl-type",
+                type=str,
+                choices=["k1", "k2", "k3", "low_var_kl"],
+                default="k3",
+                help="KL estimator for --tinker-kl-coef (default: k3, non-negative)",
+            )
+            parser.add_argument(
+                "--tinker-max-tokens-per-datum",
+                type=int,
+                default=None,
+                help="Longest training sequence the gateway accepts; terminal-agent rollouts "
+                "append every action and observation, so they can exceed the default "
+                "(default: --sglang-context-length, else 32768)",
+            )
+            parser.add_argument(
                 "--tinker-coalesce-wait-s",
                 type=float,
                 default=0.3,
@@ -2930,6 +3000,9 @@ def miles_validate_args(args):
             setattr(args, k, v)
 
     validate_dashboard_args(args)
+
+    if args.fp32_lm_head:
+        args.sglang_enable_fp32_lm_head = True
 
     args.ft_components = _resolve_ft_components(args)
     assert not ("rollout" in args.ft_components and args.eval_num_gpus > 0), (

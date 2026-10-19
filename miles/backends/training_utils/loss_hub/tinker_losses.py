@@ -18,7 +18,11 @@ from collections.abc import Callable
 import torch
 
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
-from miles.backends.training_utils.loss_hub.math_utils import _safe_exp_neg_ppo_kl, compute_clipped_value_loss
+from miles.backends.training_utils.loss_hub.math_utils import (
+    _safe_exp_neg_ppo_kl,
+    compute_approx_kl,
+    compute_clipped_value_loss,
+)
 from miles.utils.types import RolloutBatch
 
 PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2, "value_clip": 0.2}
@@ -88,6 +92,33 @@ def _drop_masked_out(batch: RolloutBatch, per_sample_loss: list[torch.Tensor]) -
     return [loss * mask.any() for loss, mask in zip(per_sample_loss, masks, strict=True)]
 
 
+def _add_kl_to_reference(
+    args: Namespace, batch: RolloutBatch, log_probs: list[torch.Tensor], per_sample_loss: list[torch.Tensor]
+) -> list[torch.Tensor]:
+    """Add --tinker-kl-coef * sum_t w_t * KL_t(policy || reference) to each datum's loss.
+
+    ``ref_log_probs`` are scored by the trainer with the starting weights
+    (full/reference.py). The per-token weights w_t are the datum's
+    ``loss_fn_inputs["weights"]``: the advantage losses do not otherwise read
+    them, and the client sends there the same normalization it folded into the
+    advantages (zero on prompt and tool-output tokens), so the penalty is
+    averaged exactly like the policy-gradient term. Without weights the term is
+    skipped rather than applied as a raw token sum.
+    """
+    coef = float(getattr(args, "tinker_kl_coef", 0.0) or 0.0)
+    reference = batch.get("ref_log_probs")
+    weights = batch.get("loss_weights")
+    if not coef or reference is None or weights is None:
+        return per_sample_loss
+    kl_type = getattr(args, "tinker_kl_type", "k3")
+    out = []
+    for loss, lp, ref_lp, w in zip(per_sample_loss, log_probs, reference, weights, strict=True):
+        kl = compute_approx_kl(lp, _like(ref_lp, lp).detach(), kl_loss_type=kl_type)
+        kl = torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
+        out.append(loss + coef * (_like(w, kl) * kl).sum())
+    return out
+
+
 def _finish(
     batch: RolloutBatch,
     logits: torch.Tensor,
@@ -130,6 +161,7 @@ def importance_sampling_loss_function(
     for lp, sampling, adv in zip(log_probs, batch["rollout_log_probs"], batch["advantages"], strict=True):
         ratio = _safe_exp_neg_ppo_kl(_like(sampling, lp) - lp)
         per_sample.append(-(ratio * _like(adv, lp)).sum())
+    per_sample = _add_kl_to_reference(args, batch, log_probs, per_sample)
     return _finish(batch, logits, log_probs, per_sample)
 
 
@@ -152,6 +184,7 @@ def ppo_loss_function(
         advantages = _like(adv, lp)
         objective = torch.minimum(ratio * advantages, torch.clamp(ratio, clip_low, clip_high) * advantages)
         per_sample.append(-objective.sum())
+    per_sample = _add_kl_to_reference(args, batch, log_probs, per_sample)
     return _finish(batch, logits, log_probs, per_sample)
 
 
@@ -195,6 +228,7 @@ def cispo_loss_function(
         ratio = torch.exp(lp - _like(sampling, lp))
         coefficient = torch.clamp(ratio, clip_low, clip_high).detach()
         per_sample.append(-(coefficient * lp * _like(adv, lp)).sum())
+    per_sample = _add_kl_to_reference(args, batch, log_probs, per_sample)
     return _finish(batch, logits, log_probs, per_sample)
 
 

@@ -33,6 +33,15 @@ Design (see scratchpad note v2_executor_full_ft_design.md, section 4):
   the HF checkpoint through the bridge, or the Megatron dir) and zeroes the
   optimizer moments and step clocks in place (same as --reset-optimizer-states;
   no optimizer re-creation).
+* Weight movement. ``--log-weight-movement`` compares the BF16 parameters
+  before and after each step and reports the share that changed by
+  magnitude bucket, plus the relative update norm, in the optim metrics.
+* Stochastic rounding. ``--stochastic-rounding`` rounds the FP32 masters into
+  the BF16 weights stochastically instead of to nearest (see
+  stochastic_rounding.py), so BF16 weights track their masters in expectation
+  rather than changing in synchronized bursts at updates 4, 8, 16, ...
+  ``--stochastic-rounding-noise fixed`` gives each weight a fixed threshold
+  instead of fresh noise per step, so weights stop jittering between neighbours.
 * Memory. The fp32 grad buffer (DDP, replicated) stays live between calls; it
   is allocated permanently anyway. Qwen3-4B at TP=1/DP=8: ~30 GB static per
   rank plus activations; a checkpoint is ~56 GB (bf16 + fp32 master + Adam).
@@ -133,8 +142,17 @@ def forward_backward(
 
 
 def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, adam_params: dict) -> dict:
+    if getattr(args, "stochastic_rounding", False):
+        from miles.backends.megatron_utils import stochastic_rounding
+
+        # idempotent; installed on first use so a resumed or reloaded optimizer gets it too
+        stochastic_rounding.install(
+            optimizer, getattr(args, "seed", 1234), getattr(args, "stochastic_rounding_noise", "fresh")
+        )
     with timer(tinker_perf.ACTOR_TRAIN_TIMER):
+        snapshot = _weight_snapshot(model) if getattr(args, "log_weight_movement", False) else None
         grad_norm, skipped = _step_accumulated_grads(model, optimizer, adam_params)
+        movement = _weight_movement(snapshot) if snapshot is not None and not skipped else {}
     if not skipped:
         _state["num_updates"] += 1
     metrics = {
@@ -143,7 +161,7 @@ def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimiz
         "lr": adam_params["learning_rate"],
         "num_updates": _state["num_updates"],
     }
-    return {**metrics, **tinker_perf.pop_optim_window_metrics(args)}
+    return {**metrics, **movement, **tinker_perf.pop_optim_window_metrics(args)}
 
 
 def _step_accumulated_grads(model, optimizer, adam_params: dict) -> tuple[float, int]:
@@ -171,6 +189,73 @@ def _step_accumulated_grads(model, optimizer, adam_params: dict) -> tuple[float,
     assert update_successful, "optimizer.step() reported failure after a finite grad norm"
     discard_grads(model, optimizer)
     return grad_norm, 0
+
+
+# |w| buckets for --log-weight-movement: [2^e, 2^(e+1)) for e in this range, with
+# smaller and larger magnitudes folded into the end buckets. With lr 1e-6 a BF16
+# weight in bucket e cannot change before update 2^(e+12), so e=-10 first moves
+# at update 4, e=-9 at 8, e=-8 at 16.
+MOVEMENT_EXP_MIN, MOVEMENT_EXP_MAX = -14, -5
+_MOVEMENT_SLICE = 1 << 24
+
+
+def _weight_snapshot(model: Sequence[DDP]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """BF16 copies of the parameters this rank counts, taken before the step.
+
+    Tensor-parallel shards are counted on every TP rank, replicated parameters
+    (norms) on TP rank 0 only, so the model-parallel sum covers each weight once.
+    Data-parallel ranks hold identical copies after the step's all-gather, and
+    the client reads rank 0, so no DP reduction is needed. Costs one BF16 copy
+    of this rank's shard (~2 GB for a 4B model at TP=4) for the length of a step.
+    """
+    from megatron.core import mpu
+
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    return [
+        (param, param.detach().clone())
+        for chunk in model
+        for param in chunk.parameters()
+        if getattr(param, "tensor_model_parallel", False) or tp_rank == 0
+    ]
+
+
+def _weight_movement(snapshot: list[tuple[torch.Tensor, torch.Tensor]]) -> dict[str, float]:
+    """Which BF16 weights this step changed, by magnitude bucket, and the update's size."""
+    from megatron.core import mpu
+
+    if not snapshot:
+        return {}
+    buckets = MOVEMENT_EXP_MAX - MOVEMENT_EXP_MIN + 1
+    device = snapshot[0][1].device
+    total = torch.zeros(buckets, dtype=torch.float64, device=device)
+    changed = torch.zeros(buckets, dtype=torch.float64, device=device)
+    norms = torch.zeros(2, dtype=torch.float64, device=device)  # |dw|^2, |w|^2
+    for param, before in snapshot:
+        # in slices, so the FP32 and index temporaries of a large shard (the embedding) stay small
+        for old, new in zip(before.flatten().split(_MOVEMENT_SLICE), param.detach().flatten().split(_MOVEMENT_SLICE)):
+            old32, new32 = old.float(), new.float()
+            _, exponent = torch.frexp(old32)
+            # frexp gives |w| = m * 2^exponent with m in [0.5, 1), so the bucket is exponent - 1;
+            # exact zeros (exponent 0) go to the smallest bucket.
+            exponent = torch.where(old32 == 0, torch.full_like(exponent, MOVEMENT_EXP_MIN + 1), exponent)
+            bucket = (exponent - 1).clamp(MOVEMENT_EXP_MIN, MOVEMENT_EXP_MAX) - MOVEMENT_EXP_MIN
+            total += torch.bincount(bucket, minlength=buckets)
+            changed += torch.bincount(bucket[new != old], minlength=buckets)
+            norms[0] += (new32 - old32).double().pow(2).sum()
+            norms[1] += old32.double().pow(2).sum()
+    stats = torch.cat([total, changed, norms])
+    dist.all_reduce(stats, group=mpu.get_model_parallel_group())
+    total, changed, norms = stats[:buckets], stats[buckets : 2 * buckets], stats[2 * buckets :]
+    metrics = {
+        "weights_changed_frac": float(changed.sum() / total.sum()),
+        "weight_update_rel_norm": float((norms[0] / norms[1]).sqrt()),
+    }
+    for index in range(buckets):
+        e = MOVEMENT_EXP_MIN + index
+        label = f"le{e}" if e == MOVEMENT_EXP_MIN else f"ge{e}" if e == MOVEMENT_EXP_MAX else f"e{e}"
+        metrics[f"weights_changed_frac/{label}"] = float(changed[index] / total[index]) if total[index] else 0.0
+        metrics[f"weights_share/{label}"] = float(total[index] / total.sum())
+    return metrics
 
 
 def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:

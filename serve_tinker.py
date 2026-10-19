@@ -29,9 +29,11 @@ logger = logging.getLogger(__name__)
 async def serve(args):
     train_mode = args.tinker_train_mode
     assert train_mode == "full" or args.multi_lora, "--tinker-train-mode lora requires --multi-lora-n-adapters > 0"
-    max_tokens_per_datum = args.sglang_context_length if args.sglang_context_length is not None else 32768
+    max_tokens_per_datum = args.tinker_max_tokens_per_datum
+    if max_tokens_per_datum is None:
+        max_tokens_per_datum = args.sglang_context_length if args.sglang_context_length is not None else 32768
     if max_tokens_per_datum <= 0:
-        raise ValueError("--sglang-context-length must be positive")
+        raise ValueError("--tinker-max-tokens-per-datum / --sglang-context-length must be positive")
     configure_logger(args, source=MainProcessIdentity())
 
     # no RolloutExecutor here; the gateway posts /generate itself

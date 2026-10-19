@@ -52,6 +52,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     mode: str = "lora"
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
+    # Megatron architecture, resolved against scripts/models/<type>.py. Must match
+    # model_name: "qwen3-4B-Instruct-2507", "qwen3.5-4B", "qwen3.5-9B", ...
+    megatron_model_type: str = "qwen3-4B-Instruct-2507"
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"
     checkpoint_root: str | None = None
@@ -91,7 +94,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     def __post_init__(self):
         if self.hf_checkpoint is None:
-            self.hf_checkpoint = f"{self.model_dir}/Qwen3-4B-Instruct-2507"
+            self.hf_checkpoint = f"{self.model_dir}/{self.model_name.split('/')[-1]}"
         if self.checkpoint_root is None:
             self.checkpoint_root = f"{self.output_dir}/tinker/{self.run_id}"
         assert self.mode in ("lora", "full"), f"--mode must be lora or full, got {self.mode!r}"
@@ -179,7 +182,7 @@ def serve(args: ScriptArgs):
         train_args=train_args,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
-        megatron_model_type="qwen3-4B-Instruct-2507",
+        megatron_model_type=args.megatron_model_type,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
     )

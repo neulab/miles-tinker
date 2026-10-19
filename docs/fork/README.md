@@ -14,6 +14,8 @@ repo root; this directory holds the operator-facing docs.
 | [DAPO-Math-17K PPO](tinker-ppo-client.md) | server/client commands, PPO flags, async training, and resume |
 | `docs/fork/acceptance.md` | the two acceptance runs (cookbook guess_number async, platoon textcraft synth) and how MFU is read |
 | `deploy/abci/README.md` | ABCI runbook: image pull, rootfs, gateway launch, endpoint file, clients, logs, stop |
+| `deploy/babel/README.md` | Babel setup and running repository training commands with Apptainer |
+| `deploy/flame/README.md` | OpenHands RL runbook: client on FLAME or Babel, Tinker server on AMD MI350 (one or two nodes), the training recipe, building a task pool |
 | `docs/examples/multi-lora.md` | protocol notes for the multi-LoRA gateway (upstream doc, kept in step by P1) |
 | `.claude/skills/upstream-sync/SKILL.md` | the upstream-sync procedure and conflict policy |
 

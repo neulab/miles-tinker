@@ -79,6 +79,60 @@ def test_pad_rows_are_inert_under_every_loss(losses):
         assert logits.grad[2].item() == 0.0, f"{name}: the pad row must not reach the weights"
 
 
+# --tinker-kl-coef: KL to the frozen starting weights, weighted by loss_fn_inputs["weights"].
+
+KL_ARGS = Namespace(tinker_kl_coef=0.1, tinker_kl_type="k3")
+
+
+def _k3(lp: float, ref: float) -> float:
+    return torch.exp(torch.tensor(ref - lp)).item() - 1 - (ref - lp)
+
+
+def test_kl_term_is_zero_at_the_reference(losses):
+    inputs = dict(rollout_log_probs=[[-1.0, -2.0]], advantages=[[0.5, 0.5]], loss_weights=[[0.25, 0.25]])
+    without, logits = _batch([[-1.0, -2.0]], [[1, 1]], **inputs)
+    with_ref, logits_ref = _batch([[-1.0, -2.0]], [[1, 1]], ref_log_probs=[torch.tensor([-1.0, -2.0])], **inputs)
+    for fn in (losses.cispo_loss_function, losses.ppo_loss_function, losses.importance_sampling_loss_function):
+        assert fn(KL_ARGS, with_ref, logits_ref, None)[0].item() == pytest.approx(fn(KL_ARGS, without, logits, None)[0].item())
+
+
+def test_kl_term_is_the_weighted_sum_of_per_token_kl(losses):
+    """Weights carry the client's normalization; zero-weight (prompt/tool) tokens add no KL."""
+    lp, ref, w = [-1.0, -2.0, -0.5], [-1.5, -1.0, -3.0], [0.2, 0.3, 0.0]
+    base = dict(rollout_log_probs=[lp], advantages=[[0.0, 0.0, 0.0]], loss_weights=[w])
+    batch, logits = _batch([lp], [[1, 1, 1]], ref_log_probs=[torch.tensor(ref)], **base)
+    loss, _ = losses.cispo_loss_function(KL_ARGS, batch, logits, None)
+    expected = 0.1 * sum(wi * _k3(a, b) for a, b, wi in zip(lp, ref, w))
+    assert loss.item() == pytest.approx(expected, rel=1e-5)
+    loss.backward()
+    assert logits.grad[2].item() == 0.0, "a zero-weight token gets no KL gradient"
+    # d/dlp of k3 = 1 - exp(ref - lp): pushes lp toward ref
+    assert logits.grad[0].item() == pytest.approx(0.1 * 0.2 * (1 - torch.exp(torch.tensor(-0.5)).item()), rel=1e-5)
+
+
+def test_kl_term_off_without_coef_or_weights(losses):
+    lp, ref = [-1.0], [-3.0]
+    with_w = dict(rollout_log_probs=[lp], advantages=[[0.0]], loss_weights=[[1.0]], ref_log_probs=[torch.tensor(ref)])
+    no_w = dict(rollout_log_probs=[lp], advantages=[[0.0]], ref_log_probs=[torch.tensor(ref)])
+    assert losses.cispo_loss_function(Namespace(tinker_kl_coef=0.0), *_batch([lp], [[1]], **with_w), None)[0].item() == 0.0
+    assert losses.cispo_loss_function(KL_ARGS, *_batch([lp], [[1]], **no_w), None)[0].item() == 0.0
+    assert losses.cispo_loss_function(KL_ARGS, *_batch([lp], [[1]], **with_w), None)[0].item() > 0.0
+
+
+def test_pad_rows_are_inert_with_the_kl_term(losses):
+    batch, logits = _batch(
+        [[-1.0, -2.0], [-9.0]],
+        [[1, 1], [0]],
+        loss_weights=[[0.5, 0.5], [0.0]],
+        rollout_log_probs=[[-1.2, -2.2], [0.0]],
+        advantages=[[0.5, 0.5], [0.0]],
+        ref_log_probs=[torch.tensor([-1.5, -1.0]), torch.tensor([-1.0])],
+    )
+    loss, _ = losses.cispo_loss_function(KL_ARGS, batch, logits, None)
+    loss.backward()
+    assert logits.grad[2].item() == 0.0
+
+
 @pytest.mark.parametrize("loss_fn", ["ppo", "importance_sampling"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("advantage", [0.0, 1.0, -1.0])

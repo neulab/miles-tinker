@@ -14,6 +14,7 @@ from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.backends.megatron_utils.full import executor as full_executor
+from miles.backends.megatron_utils.full.reference import ReferencePolicy, sampled_kl_to_reference
 from miles.backends.megatron_utils.lora import checkpoint as lora_checkpoint
 from miles.backends.megatron_utils.lora import executor as lora_executor
 from miles.backends.megatron_utils.model_provider import LinearForLastLayer
@@ -242,6 +243,15 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._enable_weight_backup:
             self.weights_backuper.backup("actor")
 
+        # --tinker-kl-coef: freeze the starting weights as the KL reference (full/reference.py).
+        self._tinker_reference: ReferencePolicy | None = None
+        if getattr(args, "tinker_kl_coef", 0.0) and getattr(args, "tinker_train_mode", "lora") == "full":
+            self._tinker_reference = ReferencePolicy(self.weights_backuper, set_active_tag=self._set_active_model_tag)
+            logger.info(
+                f"Tinker KL penalty: coef={args.tinker_kl_coef} type={args.tinker_kl_type}; "
+                "starting weights kept as the reference"
+            )
+
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
 
@@ -433,7 +443,40 @@ class MegatronTrainRayActor(TrainRayActor):
         with ExitStack() as stack:
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
             stack.enter_context(store_get_result)
+            if executor is full_executor and getattr(self, "_tinker_reference", None) is not None:
+                self._add_reference_log_probs(unit_id=unit_id, rollout_data=rollout_data)
             return executor.forward_backward(self.args, unit_id, self.model, self.optimizer, rollout_data)
+
+    def _set_active_model_tag(self, tag: str) -> None:
+        self._active_model_tag = tag
+
+    def _add_reference_log_probs(self, *, unit_id: int, rollout_data: RolloutBatch) -> None:
+        """Score the unit with the starting weights into rollout_data["ref_log_probs"] (the KL term's input)."""
+
+        def score() -> dict[str, list[torch.Tensor]]:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            return self.compute_log_prob(data_iterator, num_microbatches, rollout_id=unit_id, store_prefix="ref_")
+
+        outputs = self._tinker_reference.score(score)
+        if "ref_log_probs" not in outputs:  # stages without the LM head
+            return
+        rollout_data["ref_log_probs"] = outputs["ref_log_probs"]
+        if dist.get_rank() == 0 and "rollout_log_probs" in rollout_data:
+            self._log_kl_to_reference(unit_id=unit_id, rollout_data=rollout_data)
+
+    def _log_kl_to_reference(self, *, unit_id: int, rollout_data: RolloutBatch) -> None:
+        """The [kl-ref] drift line. A diagnostic: it must never fail the training unit."""
+        try:
+            kl = sampled_kl_to_reference(
+                rollout_data["rollout_log_probs"], rollout_data["ref_log_probs"], rollout_data.get("loss_weights")
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"[kl-ref] unit {unit_id}: could not estimate the KL ({type(error).__name__}: {error})")
+            return
+        logger.info(
+            f"[kl-ref] unit {unit_id}: KL(sampler||ref) k1={kl['kl_ref_k1']:.6f} k3={kl['kl_ref_k3']:.6f} "
+            f"over {int(kl['kl_ref_tokens'])} trained tokens"
+        )
 
     @with_logs
     def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
@@ -442,7 +485,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if not self._tinker_full_mode():
             return lora_executor.optim_step(self.args, self.model, self.optimizer, adam_params_by_slot)
         assert set(adam_params_by_slot) == {0}, f"full fine-tuning steps slot 0 only, got {set(adam_params_by_slot)}"
-        return {0: full_executor.optim_step(self.args, self.model, self.optimizer, adam_params_by_slot[0])}
+        metrics = full_executor.optim_step(self.args, self.model, self.optimizer, adam_params_by_slot[0])
+        if getattr(self, "_tinker_reference", None) is not None:
+            self._tinker_reference.weights_changed()
+        return {0: metrics}
 
     @with_logs
     def forward_only_logprobs(self, unit_id: int, rollout_data_ref: Box) -> Box | None:
@@ -503,6 +549,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.optimizer.reload_model_params()
             else:
                 full_executor.load_state(self.args, self.model, self.optimizer, ckpt_path, load_optimizer)
+            if getattr(self, "_tinker_reference", None) is not None:
+                self._tinker_reference.weights_changed()
             return
         lora_executor.load_slot(self.model, self.optimizer, slot, rank, alpha)
         if ckpt_path is None:
