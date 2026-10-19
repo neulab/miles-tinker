@@ -10,6 +10,17 @@ custom preserve-thinking HF snapshot can be passed through ``--hf-checkpoint``
 and ``--model-name``. The launcher filename is retained for compatibility with
 existing deployments.
 
+``--model-variant glimmer-30b`` is meta-models/Muse-Glimmer-30B, a dense model
+with three sliding-window (2048) layers to one global layer, 32 query and 2 KV
+heads, and a vision tower that stays frozen: TP4 training (TP up to 8, the KV
+heads replicated past 2), TP2 engines (four per node), no routing replay, no
+context parallelism (megatron-bridge's Glimmer model slices its own input for
+CP, which miles pre-shards). It needs a megatron-bridge with the builder-backed
+Glimmer bridge, the Megatron-LM APIs it uses, and transformers 5.15 (the
+overlay of ``deploy/abci/overlays/muse-glimmer``); the fused head applies its
+logit multiplier and softcap. Glimmer's position limit is 131072, so a 128K
+gateway takes ``--context-len 131066`` (the engines get 6 tokens more).
+
 Context parallelism (``--cp N``, full fine-tuning only): each datum is split
 into 2N zigzag chunks, two per CP rank, and DP shrinks to GPUs / (TP*CP).
 ``--max-tokens-per-gpu`` is then the per-rank budget; by default it is sized
@@ -60,8 +71,9 @@ Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
-  --model-variant: ``35b-a3b`` (default) or ``27b``; sets architecture,
-    model-name, parallelism and routing defaults. Explicit overrides still win.
+  --model-variant: ``35b-a3b`` (default), ``27b``, ``4b`` or ``glimmer-30b``; sets
+    architecture, model-name, parallelism and routing defaults. Explicit
+    overrides still win.
   --mode: ``full`` (full fine-tuning, emits ``--tinker-train-mode full``); ``lora``
     is not supported by this recipe yet.
   --model-name: HuggingFace id the gateway advertises.
@@ -140,13 +152,34 @@ class _Recipe:
     rollout_num_gpus_per_engine: int = 8
     # GatedDeltaNet (linear attention) key and value heads: headwise CP needs TP*CP to divide both
     linear_heads: tuple[int, int] = (16, 32)
+    # A dense model has no experts (EP 1, no routing replay); tp_sizes are the TP sizes its attention heads allow.
+    dense: bool = False
+    tp_sizes: tuple[int, ...] = (1, 2, 4)
+    # Whether the bridge's model takes miles' pre-sharded context-parallel rows (Glimmer's slices them again)
+    context_parallel: bool = True
 
 
 _RECIPES = {
     "35b-a3b": _Recipe("apurvaga/Qwen3.6-35B-A3B-preserve-thinking", "qwen3.6-35B-A3B", 1, 8, 8, True),
-    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False, linear_heads=(16, 48)),
+    # four KV heads
+    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False, linear_heads=(16, 48), dense=True),
     # tied embeddings: the fused head takes the output layer's own weight, so the standard head scores
-    "4b": _Recipe("Qwen/Qwen3.5-4B", "qwen3.5-4B", 1, 1, 1, False, fused_lm_head=False, rollout_num_gpus_per_engine=1),
+    "4b": _Recipe(
+        "Qwen/Qwen3.5-4B", "qwen3.5-4B", 1, 1, 1, False, fused_lm_head=False, rollout_num_gpus_per_engine=1, dense=True
+    ),
+    # 32 query and 2 KV heads (Megatron replicates KV heads past TP2); two GPUs per engine, one KV head each
+    "glimmer-30b": _Recipe(
+        "meta-models/Muse-Glimmer-30B",
+        "muse-glimmer-30B",
+        4,
+        1,
+        1,
+        False,
+        rollout_num_gpus_per_engine=2,
+        dense=True,
+        tp_sizes=(1, 2, 4, 8),
+        context_parallel=False,
+    ),
 }
 
 
@@ -171,7 +204,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     mode: str = "full"
-    model_variant: Literal["35b-a3b", "27b", "4b"] = "35b-a3b"
+    model_variant: Literal["35b-a3b", "27b", "4b", "glimmer-30b"] = "35b-a3b"
     model_name: str | None = None
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"
@@ -279,11 +312,17 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 setattr(self, name, getattr(recipe, name))
         if self.sglang_fp32_lm_head is None:
             self.sglang_fp32_lm_head = self.fused_lm_head
-        if self.model_variant in ("27b", "4b"):
+        if recipe.dense:
             assert not self.routing_replay, f"The dense {self.model_variant} model has no expert routes to replay"
             assert self.ep == self.etp == self.sglang_ep_size == 1, "The dense model requires expert parallelism 1"
-            assert self.tp in (1, 2, 4), "The dense model has four KV heads"
+            assert (
+                self.tp in recipe.tp_sizes
+            ), f"--tp {self.tp}: the {self.model_variant} model's attention heads split over TP {recipe.tp_sizes}"
         assert self.cp >= 1, f"--cp must be positive, got {self.cp}"
+        assert self.cp == 1 or recipe.context_parallel, (
+            f"--cp {self.cp}: the {self.model_variant} model slices its own input for context parallelism, which "
+            "miles pre-shards; train it at --cp 1"
+        )
         self._resolve_linear_cp_mode(recipe)
         if self.max_tokens_per_gpu is None:
             row = self.context_len + 1

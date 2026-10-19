@@ -510,3 +510,70 @@ def test_qwen38_128k_preset_serves_the_fcs_q38_argv_but_for_the_advertised_name(
     assert "--use-rollout-routing-replay" not in argv
     # EXTRA_ARGS come last, so their --lr 1e-6 wins over the launcher's initial --lr 3e-6
     assert argv[-len(shlex.split(values["EXTRA_ARGS"])) :] == shlex.split(values["EXTRA_ARGS"])
+
+
+# --- Muse-Glimmer-30B (--model-variant glimmer-30b) ------------------------------------------------------------------
+
+
+def test_muse_glimmer_recipe(launcher, monkeypatch):
+    """Dense TP4 training without routing replay or CP, TP2 engines, the fused fp32 head on both sides, and a 128K
+    gateway whose engines get exactly Glimmer's 131072 positions."""
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(
+        hf_checkpoint="/x/hf",
+        checkpoint_root="/x/ckpt",
+        model_variant="glimmer-30b",
+        context_len=131066,
+        max_tokens_per_datum=131067,
+        actor_num_nodes=3,
+        rollout_num_gpus=16,
+    )
+    assert captured["megatron_model_type"] == "muse-glimmer-30B"
+    argv = shlex.split(captured["train_args"])
+    assert _flag(argv, "--tinker-base-model") == "meta-models/Muse-Glimmer-30B"
+    assert _flag(argv, "--megatron-to-hf-mode") == "bridge" and "--freeze-vision-model" in argv
+    assert "--fused-lm-head-logprobs" in argv and "--sglang-enable-fp32-lm-head" in argv
+    assert "--use-rollout-routing-replay" not in argv and _flag(argv, "--expert-model-parallel-size") == "1"
+    assert _flag(argv, "--tensor-model-parallel-size") == "4" and _flag(argv, "--context-parallel-size") == "1"
+    assert "--linear-cp-mode" not in argv
+    assert _flag(argv, "--rollout-num-gpus-per-engine") == "2" and _flag(argv, "--sglang-ep-size") == "1"
+    assert _flag(argv, "--sglang-context-length") == "131072"  # max_position_embeddings of the checkpoint
+    assert _flag(argv, "--max-tokens-per-gpu") == "131067" and _flag(argv, "--rollout-max-context-len") == "131066"
+    fields = _server_args_fields()
+    assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+
+
+def test_muse_glimmer_layouts(launcher):
+    for tp in (1, 2, 4, 8):  # 32 query heads; Megatron replicates the 2 KV heads past TP2
+        assert launcher.ScriptArgs(model_variant="glimmer-30b", tp=tp).tp == tp
+    with pytest.raises(AssertionError, match=r"attention heads split over TP \(1, 2, 4, 8\)"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", tp=16)
+    with pytest.raises(AssertionError, match="slices its own input for context parallelism"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", cp=2)
+    with pytest.raises(AssertionError, match="no expert routes"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", routing_replay=True)
+    # the Qwen dense recipes keep their TP sizes
+    with pytest.raises(AssertionError, match=r"attention heads split over TP \(1, 2, 4\)"):
+        launcher.ScriptArgs(model_variant="27b", tp=8)
+
+
+def test_muse_glimmer_model_definition_matches_the_checkpoint_shape():
+    from miles.utils.external_utils.model_args_utils import load_model_args
+
+    tokens = load_model_args("muse-glimmer-30B").split()
+    flags = dict(zip(tokens, tokens[1:], strict=False))  # each flag to the token after it
+    expected = {
+        "--num-layers": "52",
+        "--hidden-size": "6656",
+        "--ffn-hidden-size": "19968",
+        "--num-attention-heads": "32",
+        "--num-query-groups": "2",
+        "--kv-channels": "128",
+        "--norm-epsilon": "1e-5",
+        "--rotary-base": "500000",
+        "--vocab-size": "202048",
+        "--make-vocab-size-divisible-by": "1",
+    }
+    assert {flag: flags[flag] for flag in expected} == expected
+    assert "--untie-embeddings-and-output-weights" in tokens and "--attention-output-gate" in tokens

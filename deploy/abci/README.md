@@ -117,6 +117,8 @@ below are `qsub` lines; these are gateways.)
 | Preset | Model (`HF_MODEL` @ `HF_REVISION`) | Gateway |
 |---|---|---|
 | `qwen3.8-27b-128k` | `apurvaga/Qwen3.8-27B-preserve-thinking` @ `97c72561` | the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it: full fine-tuning, `--model-variant 27b` with TP4 training and TP8 engines, 128K context, FA3 engines, initial lr 1e-6, the cache-aware router (thresholds 16 and 1.5), sampling timeout 1800 s. It advertises the HF id, not the snapshot path, so a trainer config names `model_name: apurvaga/Qwen3.8-27B-preserve-thinking` |
+| `muse-glimmer-30b-128k` | `meta-models/Muse-Glimmer-30B` @ `a4e59da5` | full fine-tuning on 5 nodes (`TRAIN_NODES=3`): `--model-variant glimmer-30b` with TP4 training (DP6) and eight TP2 engines, 128K context (`--context-len 131066`, the engines get Glimmer's 131072 positions), the fused fp32 head with Glimmer's multiplier and softcap, FA3 engines without the vision tower (`--sglang-language-model-only`), initial lr 1e-6, the cache-aware router, sampling timeout 1800 s. Needs the Glimmer overlay as `ROOTFS` and `EXTRA_SITE` and an `HF_HOME` with the snapshot (`deploy/abci/overlays/muse-glimmer/README.md`) |
+| `muse-glimmer-30b-64k` | `meta-models/Muse-Glimmer-30B` @ `a4e59da5` | the same on 2 nodes (TP4 x DP2, four TP2 engines) at 64K, with the first weight push checked against the engines (`--check-weight-update-equal`) |
 
 ```bash
 # fcs-q38's layout: 10 nodes, 5 train (TP4 x DP10) + 5 TP8 engines. Run from the training project: the client is
