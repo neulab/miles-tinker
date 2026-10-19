@@ -14,6 +14,9 @@ from .rollout.rollout_executor import RolloutExecutor
 
 logger = logging.getLogger(__name__)
 
+# The custom resource Ray gives the head node only (ray._common.constants.HEAD_NODE_RESOURCE_NAME).
+_RAY_HEAD_NODE_RESOURCE = "node:__internal_head__"
+
 
 @ray.remote(num_gpus=1)
 class InfoActor:
@@ -40,6 +43,24 @@ def sort_key(x):
             node_ip_parts = [ord(c) for c in node_identifier]
 
     return (node_ip_parts, gpu_id)
+
+
+def sort_bundles_head_last(bundle_infos: list[tuple], head_node_ip: str | None) -> list[tuple]:
+    """Placement order of (bundle index, node ip, gpu id) bundles: by node IP and GPU id, the Ray head node's last.
+
+    Trainer ranks take the first bundles, global rank 0 first, so the head node, which also runs the driver and,
+    in deploy/abci/tinker_gateway.pbs, the client, only gets a trainer rank when no other node is left. Rank 0
+    converts and sends every weight-sync bucket: on a head node saturated by the client it once needed 5 s per
+    bucket, and the sync lost a keep-alive race with the engines.
+    """
+    return sorted(bundle_infos, key=lambda info: (info[1] == head_node_ip, sort_key(info)))
+
+
+def _get_head_node_ip() -> str | None:
+    for node in ray.nodes():
+        if node.get("Alive") and _RAY_HEAD_NODE_RESOURCE in node.get("Resources", {}):
+            return node["NodeManagerAddress"]
+    return None
 
 
 class PlacementGroupInfo(NamedTuple):
@@ -74,7 +95,12 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
         ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+    head_node_ip = _get_head_node_ip()
+    if head_node_ip is None:
+        logger.warning("Ray reports no head node; placing bundles by IP only")
+    else:
+        logger.info(f"Ray head node {head_node_ip} sorts last: trainer ranks go to the other nodes first")
+    sorted_bundle_infos = sort_bundles_head_last(bundle_infos, head_node_ip)
     pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
     # Map from logical index -> physical GPU ID
     pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]

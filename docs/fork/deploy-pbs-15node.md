@@ -34,11 +34,14 @@ commands is `deploy/abci/README.md`.
   `$PBS_LOCALDIR/miles/tmp`, prints `init_ok <host> <IPoIB ip>` plus `init_info` lines with the
   job cgroup's `memory.max`/`memory.current` (walked up from `/proc/self/cgroup`), `PBS_LOCALDIR`,
   `nproc`, `MemTotal` and `df -h $PBS_LOCALDIR` - the facts the smoke records.
-- Trainer nodes = the `TRAIN_NODES` lowest IPoIB IPs sorted numerically per octet
-  (`sort -t. -k1,1n -k2,2n -k3,3n -k4,4n`), the same order `miles/ray/placement_group.py:sort_key`
-  uses for actor slots, so the service nodes coincide with the engine nodes. `$JOBDIR/roles.tsv`
-  holds `host  vnode-index  ip  role` in that order; the PBS head node (batch shell, Ray head,
-  gateway HTTP, client) can be either a trainer or an engine node.
+- Trainer nodes = the `TRAIN_NODES` lowest IPoIB IPs other than the head's, sorted numerically per
+  octet (`sort -t. -k1,1n -k2,2n -k3,3n -k4,4n`) with the head node last: the same order
+  `miles/ray/placement_group.py:sort_bundles_head_last` uses for actor slots, so the service nodes
+  coincide with the engine nodes. `$JOBDIR/roles.tsv` holds `host  vnode-index  ip  role` in that
+  order and `launcher.log` a `node roles:` line. The PBS head node (batch shell, Ray head, driver,
+  gateway HTTP, client) is always an engine node: trainer rank 0 converts and sends every
+  weight-sync bucket, and on a head node saturated by the client it once spaced the buckets 5 s
+  apart, which lost a keep-alive race with the engines (README section 8).
 - `TINKER_PORT = 30000 + jobid % 9000` (outside miles' dynamic 20000+ range and Toolathlon's
   8082 / 28100-28107), bumped while `ss -ltn` shows it bound. Every container gets
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
@@ -46,7 +49,7 @@ commands is `deploy/abci/README.md`.
   bound ports, never takes 28100-28107) -> Ray workers (one pbsdsh + container per node,
   `ray-worker-<host>.log` / `worker-<host>.log`) -> head container (`ray status` waits 180 x 10 s
   for `8*NODES` GPUs) -> service health quorum (<= 1200 s) -> gateway `/api/v1/healthz`
-  (<= 3600 s) -> monitor -> client.
+  (<= 3600 s; `GATEWAY_DEAD_PROBES` 503s in a row, 10 s apart, end the job) -> monitor -> client.
 - `GATEWAY_LAUNCHER` is the launcher knob (repo-relative, default the Qwen3-4B one); `LAUNCHER`
   is accepted as an alias.
 
@@ -74,12 +77,14 @@ land in the same log. On TERM: TERM the container, 90 s, KILL; TERM the guard, 1
 Health (release quorum): per host >= 1 of 4 `GET http://<ip>:8082/health` probes with an
 `X-Session-ID` header and >= 5 of 8 `GET http://<ip>:281{00..07}/health`, `--noproxy '*'`, URLs
 built from IPoIB IPs. The monitor sweeps every 30 s; 10 consecutive failures (or a dead head
-container) TERMs the batch shell -> cleanup.
+container) TERMs the batch shell -> cleanup. Every 30 s it also probes the gateway's
+`/api/v1/healthz`, which answers 503 once the trainer is dead; `GATEWAY_DEAD_PROBES` (4) 503s in a
+row TERM the batch shell the same way, and any other answer resets the count.
 
 Exports to the client, `CLIENT_SCRIPT` or `CLIENT_CMD` (C10): `TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME
 HF_HOME no_proxy MILES_SRC PLATOON_ROOT SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON
-OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`, plus a `PRESET`'s `TINKER_SAMPLE_TIMEOUT_SECONDS`; the URL lists are `http://<engine-ip>:8082` in IP
-order (empty with `SERVICES=0`). The client runs in its own session (`setsid`) so a monitor-fatal
+OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`, plus a `PRESET`'s `TINKER_SAMPLE_TIMEOUT_SECONDS`; the URL lists are `http://<engine-ip>:8082` in
+`roles.tsv` order, IP order with the head last (empty with `SERVICES=0`). The client runs in its own session (`setsid`) so a monitor-fatal
 teardown can TERM its whole process group.
 
 ## Secrets

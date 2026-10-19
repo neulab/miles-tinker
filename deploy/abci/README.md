@@ -69,15 +69,19 @@ tail -50 /home/aci18912it/miles-tinker/logs/miles-tinker-smoke.o<jobid>
 - `TRAIN_NODES` (default 4, or 1 on two nodes) nodes train (Megatron) and the other
   `N - TRAIN_NODES` sample (one SGLang engine per node, TP8 for the 35B recipe). The
   launcher always gets `--actor-num-nodes $TRAIN_NODES --rollout-num-gpus $((8*(N-TRAIN_NODES)))`
-  ahead of `LAUNCHER_ARGS`. **Trainer nodes are the `TRAIN_NODES` lowest IPoIB IPs**
-  (numeric per-octet order, exactly how `miles/ray/placement_group.py` assigns actor slots),
-  not PBS nodes 0-3; `$JOBDIR/roles.tsv` lists `host vnode ip role`.
+  ahead of `LAUNCHER_ARGS`. **Trainer nodes are the `TRAIN_NODES` lowest IPoIB IPs other than
+  the head's** (numeric per-octet order with the head node last, exactly how
+  `miles/ray/placement_group.py` assigns actor slots), not PBS nodes 0-3. So the head node, which
+  also runs the client, is always an engine node and trainer rank 0 never competes with the
+  client for CPU. `$JOBDIR/roles.tsv` lists `host vnode ip role`, and `launcher.log` prints a
+  `node roles:` line.
 - `SERVICES=1` starts one Toolathlon service (nginx `:8082`, 8 uvicorn workers
   `28100-28107`, postgres on localhost) plus the node memory guard on every engine
   node before Ray comes up, waits for the release health quorum, monitors it, and
   exports the URLs to the client (section 5). Details and contracts:
   `docs/fork/deploy-pbs-15node.md`.
-- The job ends when the client (`CLIENT_SCRIPT` or `CLIENT_CMD`) exits (or `KEEP_GATEWAY=1` keeps serving).
+- The job ends when the client (`CLIENT_SCRIPT` or `CLIENT_CMD`) exits (or `KEEP_GATEWAY=1` keeps serving),
+  and also when the gateway's trainer dies (section 8).
 
 ## 4. Launch
 
@@ -97,7 +101,9 @@ Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN
 (its `--hf-checkpoint`), `LAUNCHER_ARGS`, `EXTRA_ARGS`, `CLIENT_SCRIPT` or `CLIENT_CMD` and
 `CLIENT_DIR` (section 5), `KEEP_GATEWAY`,
 `WORKERS` (client rollout workers, 3), `PLATOON_ROOT`, `TOOLATHLON_ENV`, `TINKER_PORT`
-(default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`.
+(default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`,
+`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz that end the job, 30 s apart once the
+gateway is up and 10 s apart while the job still waits for it; 0 keeps a dead gateway's job running, to inspect it).
 
 ### Gateway presets (`PRESET=`)
 
@@ -353,6 +359,21 @@ stays flat.
   `kill-leftovers.sh` locally and via `pbsdsh` on every other node - the Toolathlon container has no PID namespace,
   so nginx/postgres/uvicorn/MCP processes are swept by name (`teardown-<host>.log`). PBS releases the nodes about
   ten seconds after the client exits.
+- "monitor: the gateway's trainer is dead; ending the job": a weight push or a training command failed
+  and took the trainer actors down (`ft op=execute phase=fail` in `head.log`). The gateway cannot rebuild
+  them, so every later command would fail: `/api/v1/healthz` answers 503 with the reason, and after
+  `GATEWAY_DEAD_PROBES` (4) such answers 30 s apart the monitor ends the job instead of leaving it idle.
+  A trainer that dies before the gateway was ever healthy (a failed warmup push) ends the job the same way,
+  with "the gateway's trainer died before the gateway was healthy; ending the job" and the end of `head.log`.
+  Resubmit with the same `RUN_NAME`; the client resumes from its last checkpoint (next bullet).
+- Engine connections: SGLang closes a keep-alive connection that stays idle for
+  `SGLANG_TIMEOUT_KEEP_ALIVE` seconds (5 by default, the same as httpx's own idle limit), and a request
+  written on a connection the engine is closing at that moment gets a TCP reset (`httpx.ReadError`). That
+  failed a full-weight sync whose buckets went out 5 s apart. miles therefore launches every engine with
+  `SGLANG_TIMEOUT_KEEP_ALIVE=600` (a value in the driver's environment wins), and the trainer's engine
+  client drops a connection after 2 s idle. The pause, continue and weight-version calls are sent once more
+  after a reset; the weight buckets and the update session's begin and end never are, because the engine may
+  already have acted on them.
 - Clients survive a gateway restart only through checkpoints: cookbook resumes
   from `checkpoints.jsonl` with `behavior_if_log_dir_exists=resume`, platoon
   through its restart wrapper; both call `/weights_info` + `load_state` on the

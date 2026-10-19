@@ -334,6 +334,17 @@ class TestControlCommands:
         ]
 
 
+class TestHealthProblem:
+    """healthz answers 503 with this reason once the trainer cannot run a command any more."""
+
+    def test_a_trainer_with_an_alive_cell_is_healthy(self):
+        assert _backend(SimpleNamespace(has_alive_cell=lambda: True)).health_problem() is None
+
+    def test_a_trainer_whose_cells_all_failed_is_reported_dead(self):
+        problem = _backend(SimpleNamespace(has_alive_cell=lambda: False)).health_problem()
+        assert problem is not None and "trainer is dead" in problem
+
+
 class TestGenerateRequest:
     def _request(self, params: dict, **payload_extra) -> dict:
         payload = {

@@ -101,6 +101,11 @@ class ExecutorBackend:
         """Periodic housekeeping from the lease sweep (R3 cache TTL / byte cap); no-op by default."""
         return None
 
+    def health_problem(self) -> str | None:
+        """Why no training command can run any more (the trainer is gone for good), or None. The gateway's healthz
+        answers 503 with it, so whatever supervises the gateway can end the job instead of leaving it idle."""
+        return None
+
 
 class TinkerService:
     def __init__(self, backend: ExecutorBackend, config: GatewayConfig) -> None:
@@ -133,6 +138,9 @@ class TinkerService:
         self._unit_counter = 0
 
     # -------- control plane --------
+
+    def health_problem(self) -> str | None:
+        return self.backend.health_problem()
 
     def create_session(self, tenant: str, payload: dict) -> str:
         session_id = f"session-{uuid.uuid4().hex}"

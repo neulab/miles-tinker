@@ -1,8 +1,9 @@
 import asyncio
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.ray.specs.train import compute_trainer_num_cells, compute_trainer_pool_id
@@ -28,6 +29,9 @@ from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
+
+if TYPE_CHECKING:
+    from miles.ray.rollout.inference_controller import UpdatableEngines
 
 logger = logging.getLogger(__name__)
 
@@ -337,17 +341,30 @@ class TrainerController:
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Fetch the updatable engines once (like V1 RayActorGroup) so all
         # ranks observe a consistent engine set.
-        info = await self._inference_controller.start_update_weights()
-        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        weight_versions = await retry(
-            lambda _: self._execute_first_alive("update_weights", info=info),
-            max_attempts=_RETRY_MAX_ATTEMPTS,
-        )
-        await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        async with self._engine_weight_update() as info:
+            # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
+            weight_versions = await retry(
+                lambda _: self._execute_first_alive("update_weights", info=info),
+                max_attempts=_RETRY_MAX_ATTEMPTS,
+            )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
 
         return weight_versions[0]
+
+    @asynccontextmanager
+    async def _engine_weight_update(self) -> AsyncIterator["UpdatableEngines"]:
+        """The inference controller's frame around one weight push: the engines it may write, its lock held and
+        engine health checks paused. However the push ends, the lock is released and the health checks are back to
+        how the push found them; a push that raised (a reset connection, a dead engine, a killed trainer cell, a
+        cancellation) marks no engine weights-ready."""
+        info = await self._inference_controller.start_update_weights()
+        try:
+            yield info
+        except BaseException:
+            await self._inference_controller.abort_update_weights()
+            raise
+        await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
     async def _maybe_log_inference_engine_weight_checksums(self, *, rollout_id: int | None) -> None:
         if not is_event_logger_initialized():
@@ -437,23 +454,25 @@ class TrainerController:
 
     async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> int | None:
         """Publish a slot to the engines; answers the engine weight version (full fine-tuning) or None (LoRA)."""
-        info = await self._inference_controller.start_update_weights()
-        versions = await self._execute_slots(
-            "push_slot", info=info, slot=slot, lora_name=lora_name, rank=rank, alpha=alpha
-        )
-        await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        async with self._engine_weight_update() as info:
+            versions = await self._execute_slots(
+                "push_slot", info=info, slot=slot, lora_name=lora_name, rank=rank, alpha=alpha
+            )
         return versions[0]
 
     async def unload_adapter(self, lora_name: str) -> None:
-        info = await self._inference_controller.start_update_weights()
-        await self._execute_slots("unload_adapter", info=info, lora_name=lora_name)
-        await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        async with self._engine_weight_update() as info:
+            await self._execute_slots("unload_adapter", info=info, lora_name=lora_name)
 
     async def set_rollout_executor(self):
         await asyncio.gather(*[cell.set_rollout_executor() for cell in self._cells])
 
     def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
+
+    def has_alive_cell(self) -> bool:
+        """Whether any cell can still run a command (False once every cell failed and had its actors killed)."""
+        return self._is_recoverable()
 
     # ------------------------ utils to forward calls to cells ------------------------
 

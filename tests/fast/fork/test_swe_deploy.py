@@ -20,7 +20,8 @@ def test_swe_services_and_client_receive_the_same_endpoint_pool(tmp_path):
     assert len(service_lines) == 6
     assert all("swe_rebench_service.sh" in line and "OPENREWARD_REWARD_MODE=binary" in line for line in service_lines)
     assert all("SWE_ENV=" in line and "env -i" in line for line in service_lines)
-    expected = ",".join(f"http://{ip}:8084" for ip in ips[2:])
+    # the head (hnode001, the lowest IP) never trains: it is the last engine node
+    expected = ",".join(f"http://{ip}:8084" for ip in ips[3:] + ips[:1])
     assert f"export OPENREWARD_SESSION_URLS_SWE_REBENCH={expected}" in output
     assert f"export OPENREWARD_SESSION_URLS={expected}" in output
     assert "export SERVICE_ENVIRONMENT=swe_rebench" in output

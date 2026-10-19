@@ -20,7 +20,8 @@ def test_frontier_services_and_client_share_port_8085_pool(tmp_path):
     assert len(service_lines) == 5
     assert all("frontier_cs_service.sh" in line and "FRONTIER_ENV=" in line for line in service_lines)
     assert all("env -i" in line for line in service_lines)
-    expected = ",".join(f"http://{ip}:8085" for ip in ips[5:])
+    # the head (hnode001, the lowest IP) never trains: it is the last engine node
+    expected = ",".join(f"http://{ip}:8085" for ip in ips[6:] + ips[:1])
     assert f"export OPENREWARD_SESSION_URLS_FRONTIER_CS={expected}" in output
     assert f"export OPENREWARD_SESSION_URLS={expected}" in output
     assert "export SERVICE_ENVIRONMENT=frontier_cs" in output

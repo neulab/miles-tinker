@@ -80,6 +80,9 @@ def build_app(service: TinkerService) -> FastAPI:
     @app.get("/api/v1/healthz")
     @app.get("/health")
     async def healthz():
+        problem = service.health_problem()
+        if problem is not None:
+            return JSONResponse(status_code=503, content={"status": "unavailable", "error": problem})
         return {"status": "ok"}
 
     @app.post("/api/v1/client/config")

@@ -178,12 +178,39 @@ class TestHealthCheckerActiveness:
         assert srv.calls == [("offload",)]
 
     @pytest.mark.asyncio
-    async def test_starting_a_weight_update_pauses_probing(self):
-        """Engines are unusable while their weights are being replaced."""
+    async def test_a_weight_update_pauses_probing_until_it_ends(self):
+        """Engines are unusable while their weights are being replaced; afterwards probing runs again as it did
+        before (the Tinker gateway never calls prepare_rollout, so nothing else would ever resume it)."""
         controller = _make_controller({"default": _RecordingServer()})
 
         info = await controller.start_update_weights()
+        assert not controller._health_checker_activeness.get().active
+
         await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        assert controller._health_checker_activeness.get().active
+
+    @pytest.mark.asyncio
+    async def test_an_aborted_weight_update_resumes_probing_too(self):
+        """A failed push leaves engines paused mid-update: probing must find them so fault tolerance can act."""
+        controller = _make_controller({"default": _RecordingServer()})
+
+        await controller.start_update_weights()
+        await controller.abort_update_weights()
+
+        assert controller._health_checker_activeness.get().active
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish", ["end", "abort"])
+    async def test_a_weight_update_leaves_probing_paused_when_it_found_it_paused(self, finish):
+        """Offloaded engines (colocated training) cannot answer a generation probe; prepare_rollout resumes them."""
+        controller = _make_controller({"default": _RecordingServer()})
+        controller._health_checker_activeness.bump_active(False)
+
+        info = await controller.start_update_weights()
+        if finish == "end":
+            await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        else:
+            await controller.abort_update_weights()
 
         assert not controller._health_checker_activeness.get().active
 
@@ -514,6 +541,59 @@ class TestUpdateWeightsLockWindow:
 
         await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
         assert not controller.context_lock.locked
+
+    @pytest.mark.asyncio
+    async def test_abort_update_weights_closes_the_window_without_marking_engines_ready(self):
+        """A failed push must release the lock (a leaked one left the tick waiting for an hour) but must not
+        register engines that may hold part of the new weights."""
+        cell = _FakeUpdatableCell(workers_hash="hash-a")
+        controller = _make_controller(
+            {"model": _RecordingServer(server_cells={"engine-0": cell}, update_weights=True)}
+        )
+
+        await controller.start_update_weights()
+        await controller.abort_update_weights()
+
+        assert not controller.context_lock.locked
+        assert cell.marked_ready == 0
+        await asyncio.wait_for(controller._reconcile("miles-router-0-0", None), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_fails_releases_the_lock_and_restores_probing(self):
+        """No update window opened, so nothing else would ever hand the lock or the probing back."""
+        controller = _make_controller(
+            {
+                "a": _RecordingServer(model_name="a", update_weights=True),
+                "b": _RecordingServer(model_name="b", update_weights=True),
+            }
+        )
+
+        with pytest.raises(ValueError, match="Multiple servers"):
+            await controller.start_update_weights()
+
+        assert not controller.context_lock.locked
+        assert controller._health_checker_activeness.get().active
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_fails_listing_the_engines_restores_probing(self):
+        """Reading the engine set (a cell's api_client) can raise after the server was chosen."""
+
+        class _BrokenEngineList(_RecordingServer):
+            @property
+            def api_clients(self):
+                raise RuntimeError("cell has no api client")
+
+            @api_clients.setter
+            def api_clients(self, _value):
+                pass
+
+        controller = _make_controller({"a": _BrokenEngineList(model_name="a", update_weights=True)})
+
+        with pytest.raises(RuntimeError, match="no api client"):
+            await controller.start_update_weights()
+
+        assert not controller.context_lock.locked
+        assert controller._health_checker_activeness.get().active
 
     @pytest.mark.asyncio
     async def test_reconcile_waits_while_the_update_weights_window_is_open(self):

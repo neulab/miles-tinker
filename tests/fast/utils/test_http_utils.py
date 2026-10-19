@@ -390,6 +390,30 @@ class TestGeneralHttpClientProvider:
         assert GeneralHttpClientProvider._LIMITS.max_connections is None
         assert GeneralHttpClientProvider._LIMITS.max_keepalive_connections is None
 
+    async def test_an_idle_connection_expires_well_before_the_engines_keep_alive(self):
+        """SGLang's uvicorn drops a keep-alive connection after SGLANG_TIMEOUT_KEEP_ALIVE seconds idle (5 by
+        default, httpx's own default expiry too): a request sent on a connection the engine is closing at that
+        moment gets a TCP reset, which once killed a weight sync whose buckets went out 5 s apart."""
+        assert GeneralHttpClientProvider._LIMITS.keepalive_expiry == GeneralHttpClientProvider._KEEPALIVE_EXPIRY
+        assert GeneralHttpClientProvider._KEEPALIVE_EXPIRY <= 2.0
+
+    async def test_a_connection_idle_past_the_expiry_is_never_reused(self):
+        """httpcore checks the expiry before it hands out a pooled connection, so a request after a longer
+        idle gap opens a new connection instead of writing on one the engine may be closing."""
+        server = _ConnectionRecordingHttpServer()
+        try:
+            client = GeneralHttpClientProvider.client()
+            await client.get(server.url)
+            await asyncio.sleep(GeneralHttpClientProvider._KEEPALIVE_EXPIRY / 2)
+            await client.get(server.url)
+            assert len(server.client_ports) == 1, "a connection idle for less than the expiry is reused"
+
+            await asyncio.sleep(GeneralHttpClientProvider._KEEPALIVE_EXPIRY + 0.3)
+            await client.get(server.url)
+            assert len(server.client_ports) == 2, "a connection idle past the expiry is replaced"
+        finally:
+            server.close()
+
     async def test_more_requests_than_httpxs_default_cap_reach_the_server_at_once(self):
         """101 engines must all arrive before the caller joins the collective, and httpx caps
         connections at 100 by default."""
@@ -508,6 +532,37 @@ class _BlockingHttpServer:
                 pass
 
         return _Handler
+
+
+class _ConnectionRecordingHttpServer:
+    """A keep-alive HTTP/1.1 server that records the client port of every connection it accepts."""
+
+    def __init__(self) -> None:
+        self.client_ports: list[int] = []
+        ports = self.client_ports
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                ports.append(self.client_address[1])
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/health_generate"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
 
 class _RecordingTransport(httpx.AsyncBaseTransport):

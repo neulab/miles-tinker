@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import ray
 
-from miles.ray.placement_group import create_rollout_components, create_training_models
+from miles.ray import placement_group as placement_group_module
+from miles.ray.placement_group import create_rollout_components, create_training_models, sort_bundles_head_last
 from miles.ray.train.group import TrainerController
 
 pytestmark = pytest.mark.asyncio
@@ -329,3 +331,49 @@ class TestUpdateWeights:
         await update_weights(actor_model, rollout_executor)
 
         rollout_executor.set_weight_version.remote.assert_not_awaited()
+
+
+class TestTheHeadNodeSortsLast:
+    """Trainer ranks take the first bundles. The head node also runs the driver and, on ABCI, the client: with a
+    trainer there, rank 0 sent weight-sync buckets 5 s apart on a saturated CPU and the sync lost a keep-alive race."""
+
+    async def test_trainer_bundles_go_to_the_other_nodes_even_when_the_head_has_the_lowest_ip(self):
+        bundles = [(0, "10.0.0.3", 0), (1, "10.0.0.1", 1), (2, "10.0.0.1", 0), (3, "10.0.0.2", 0), (4, "10.0.0.3", 1)]
+
+        ordered = sort_bundles_head_last(bundles, head_node_ip="10.0.0.1")
+
+        assert [(ip, gpu) for _, ip, gpu in ordered] == [
+            ("10.0.0.2", 0),
+            ("10.0.0.3", 0),
+            ("10.0.0.3", 1),
+            ("10.0.0.1", 0),
+            ("10.0.0.1", 1),
+        ]
+
+    async def test_ips_sort_numerically_and_an_unknown_head_changes_nothing(self):
+        bundles = [(0, "10.0.0.100", 0), (1, "10.0.0.99", 0), (2, "10.0.1.9", 0)]
+
+        assert [ip for _, ip, _ in sort_bundles_head_last(bundles, head_node_ip=None)] == [
+            "10.0.0.99",
+            "10.0.0.100",
+            "10.0.1.9",
+        ]
+
+    async def test_a_single_node_cluster_keeps_its_gpu_order(self):
+        bundles = [(0, "10.0.0.1", 1), (1, "10.0.0.1", 0)]
+
+        assert sort_bundles_head_last(bundles, head_node_ip="10.0.0.1") == [(1, "10.0.0.1", 0), (0, "10.0.0.1", 1)]
+
+    async def test_the_head_is_the_alive_node_with_rays_head_resource(self, monkeypatch):
+        nodes = [
+            {"Alive": True, "NodeManagerAddress": "10.0.0.2", "Resources": {"CPU": 8.0, "GPU": 8.0}},
+            {"Alive": False, "NodeManagerAddress": "10.0.0.9", "Resources": {"node:__internal_head__": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.0.1", "Resources": {"node:__internal_head__": 1.0}},
+        ]
+        monkeypatch.setattr(placement_group_module.ray, "nodes", lambda: nodes)
+
+        assert placement_group_module._get_head_node_ip() == "10.0.0.1"
+
+    async def test_a_real_cluster_names_its_head_by_the_ip_the_bundles_report(self, ray_local_mode):
+        """The bundles' IPs come from ray.util.get_node_ip_address(); the head lookup must use the same address."""
+        assert placement_group_module._get_head_node_ip() == ray.util.get_node_ip_address()

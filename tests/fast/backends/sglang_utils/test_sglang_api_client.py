@@ -793,3 +793,113 @@ class TestStartProfile:
 
 async def _noop_sleep(seconds):
     return None
+
+
+class TestConnectionResetRetry:
+    """A request written on a keep-alive connection the engine is closing gets a TCP reset (httpx.ReadError). A
+    call whose repeat changes nothing is sent once more; any other call fails, because the engine may have acted on
+    it: a second update_weights_from_distributed joins a broadcast that never comes, and SGLang asserts the session
+    state on begin/end_weight_update."""
+
+    @staticmethod
+    def _serve(monkeypatch, errors: list[Exception], status_code: int = 200) -> list[httpx.Request]:
+        requests: list[httpx.Request] = []
+
+        def _handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if errors:
+                raise errors.pop(0)
+            return httpx.Response(status_code, json={"success": True, "message": "Success"})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(_handle))
+        monkeypatch.setattr(GeneralHttpClientProvider, "client", lambda: http)
+        return requests
+
+    _IDEMPOTENT_CALLS = [
+        (lambda c: c.pause_generation(mode="retract"), "/pause_generation"),
+        (lambda c: c.continue_generation(), "/continue_generation"),
+        (lambda c: c.update_weight_version("7"), "/update_weight_version"),
+    ]
+    _IDEMPOTENT_IDS = ["pause_generation", "continue_generation", "update_weight_version"]
+    _RESETS = [
+        httpx.ReadError("[Errno 104] Connection reset by peer"),
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        httpx.WriteError("[Errno 32] Broken pipe"),
+    ]
+
+    @pytest.mark.parametrize("reset", _RESETS, ids=lambda e: type(e).__name__)
+    @pytest.mark.parametrize("call, path", _IDEMPOTENT_CALLS, ids=_IDEMPOTENT_IDS)
+    async def test_an_idempotent_control_call_is_sent_again_after_a_reset(
+        self, client, monkeypatch, call, path, reset
+    ):
+        requests = self._serve(monkeypatch, [reset])
+
+        await call(client)
+
+        assert [request.url.path for request in requests] == [path, path]
+
+    @pytest.mark.parametrize("call, path", _IDEMPOTENT_CALLS, ids=_IDEMPOTENT_IDS)
+    async def test_a_second_reset_in_a_row_is_raised(self, client, monkeypatch, call, path):
+        requests = self._serve(monkeypatch, [httpx.ReadError("first"), httpx.ReadError("second")])
+
+        with pytest.raises(httpx.ReadError, match="second"):
+            await call(client)
+
+        assert len(requests) == 2
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda c: c.update_weights_from_distributed(
+                names=["w"], dtypes=["bfloat16"], shapes=[[1]], group_name="g"
+            ),
+            lambda c: c.begin_weight_update(),
+            lambda c: c.end_weight_update(),
+            lambda c: c.update_weight_version("7", abort_all_requests=True),
+            lambda c: c.register_lora_adapter("l", {"r": 8}),
+            lambda c: c.load_lora_adapter_from_distributed("l", {"r": 8}, ["w"], ["bfloat16"], [[1]], "g"),
+            lambda c: c.unload_lora_adapter("l"),
+        ],
+        ids=[
+            "update_weights_from_distributed",
+            "begin_weight_update",
+            "end_weight_update",
+            "update_weight_version+abort_all_requests",
+            "register_lora_adapter",
+            "load_lora_adapter_from_distributed",
+            "unload_lora_adapter",
+        ],
+    )
+    async def test_a_call_unsafe_to_repeat_is_never_sent_twice(self, client, monkeypatch, call):
+        requests = self._serve(monkeypatch, [httpx.ReadError("[Errno 104] Connection reset by peer")])
+
+        with pytest.raises(httpx.ReadError):
+            await call(client)
+
+        assert len(requests) == 1
+
+    async def test_an_engine_error_answer_is_not_retried(self, client, monkeypatch):
+        requests = self._serve(monkeypatch, [], status_code=500)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.pause_generation()
+
+        assert len(requests) == 1
+
+    async def test_an_engine_error_answer_keeps_the_engines_reason(self, client, monkeypatch):
+        """update_weight_version answers 400 with the reason in its body; the raised error carries it, as before."""
+        self._serve(monkeypatch, [], status_code=400)
+
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            await client.update_weight_version("7")
+
+        assert any("response.text=" in note and "success" in note for note in raised.value.__notes__)
+
+    async def test_a_refused_connection_is_not_retried(self, client, monkeypatch):
+        """Not a reset of a reused connection: the engine is not listening, and a second try finds the same."""
+        requests = self._serve(monkeypatch, [httpx.ConnectError("[Errno 111] Connection refused")])
+
+        with pytest.raises(httpx.ConnectError):
+            await client.continue_generation()
+
+        assert len(requests) == 1

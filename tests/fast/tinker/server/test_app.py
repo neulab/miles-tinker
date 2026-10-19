@@ -482,6 +482,46 @@ async def test_capabilities_health_and_telemetry_shapes(client):
     assert (await client.get("/health")).json() == (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
 
 
+async def test_health_answers_503_once_the_backend_cannot_train(client, monkeypatch):
+    """A dead trainer fails every later command; healthz says so, so the job's monitor can end the job instead of
+    leaving it idle (the gateway kept answering ok for an hour after a failed weight push killed its trainer)."""
+    reason = "the trainer is dead: a failed command took down every trainer cell; restart the gateway"
+    monkeypatch.setattr(client.service.backend, "health_problem", lambda: reason)
+
+    for path in ("/api/v1/healthz", "/health"):
+        response = await client.get(path)
+        assert response.status_code == 503
+        assert response.json() == {"status": "unavailable", "error": reason}
+
+    monkeypatch.setattr(client.service.backend, "health_problem", lambda: None)
+    assert (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
+
+
+async def test_a_push_that_kills_the_trainer_turns_health_to_503(client):
+    """The incident's sequence: save_weights_for_sampler fails because the push killed the trainer cell."""
+    model_id = await _create_model(client)
+    backend = client.service.backend
+
+    async def _push_that_kills_the_trainer(slot, lora_name, rank, alpha):
+        backend.dead = True
+        raise RuntimeError("httpx.ReadError on 4 of 5 engines")
+
+    backend.dead = False
+    backend.push_slot = _push_that_kills_the_trainer
+    backend.health_problem = lambda: "the trainer is dead" if backend.dead else None
+    assert (await client.get("/api/v1/healthz")).status_code == 200
+
+    queued = await client.post(
+        "/api/v1/save_weights_for_sampler",
+        json={"model_id": model_id, "seq_id": 1, "path": "000001"},
+        headers=_headers(),
+    )
+    body = await _poll(client, queued.json()["request_id"])
+
+    assert body["category"] == "server" and "ReadError" in body["error"]
+    assert (await client.get("/api/v1/healthz")).status_code == 503
+
+
 async def test_a_session_end_event_frees_the_slots_at_once(client):
     session = await client.post("/api/v1/create_session", json={"sdk_version": "0.27.1"}, headers=_headers())
     session_id = session.json()["session_id"]
