@@ -606,3 +606,204 @@ def test_dispatch_inactive_uses_the_standard_path(monkeypatch):
         torch.zeros(3, 8, dtype=torch.bfloat16), torch.zeros(3, dtype=torch.long), None
     )
     assert seen == [torch.Size([3, 8])]
+
+
+# ---------------------------------------------------------------------------
+# The head's output transform: logits * multiplier, then softcap * tanh(. / softcap) (Muse Glimmer)
+# ---------------------------------------------------------------------------
+
+GLIMMER = fused_lm_head.LogitTransform(multiplier=0.19611613513818404, softcap=20.0)
+# The transformed log-probs reach -100 and below on these inputs: fp32 summation order alone moves them by a few 1e-6
+FP32_LOGPROB_TOL = dict(rtol=4e-6, atol=4e-6)
+TRANSFORMS = [
+    fused_lm_head.LogitTransform(multiplier=3.0, softcap=5.0),  # the cap bites on most logits of these inputs
+    GLIMMER,
+    fused_lm_head.LogitTransform(multiplier=0.5),  # a multiplier alone
+]
+
+
+def _transform_reference(z: torch.Tensor, transform) -> torch.Tensor:
+    y = z * transform.multiplier
+    return y if transform.softcap is None else transform.softcap * torch.tanh(y / transform.softcap)
+
+
+def _glimmer_scale_inputs(seed: int = 0):
+    """Hidden states large enough that Glimmer's 0.196 x projection reaches its softcap of 20 on some logits."""
+    h, w, labels, upstream = _inputs(seed=seed)
+    return (h.float() * 12).to(torch.bfloat16), w, labels, upstream
+
+
+def _reference_logprobs_transformed(h, w, labels, transform, temperature=1.0):
+    logits = _transform_reference(F.linear(h.float(), w.float()), transform) / temperature
+    return torch.log_softmax(logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+
+def _reference_grads_transformed(h, w, labels, upstream, transform, temperature=1.0):
+    """fp32 autograd through the transformed reference, and the bf16-rounded projection gradient GEMMs."""
+    h32 = h.float().requires_grad_(True)
+    w32 = w.float().requires_grad_(True)
+    z = F.linear(h32, w32)
+    z.retain_grad()
+    logits = _transform_reference(z, transform) / temperature
+    logprobs = torch.log_softmax(logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    (logprobs * upstream).sum().backward()
+    g_bf16 = z.grad.to(torch.bfloat16).float()  # dL/d(projection), rounded once as the fused backward does
+    return {
+        "hidden_fp32": h32.grad,
+        "weight_fp32": w32.grad,
+        "hidden_rounded": (g_bf16 @ w.float()).to(torch.bfloat16),
+        "weight_rounded": g_bf16.t() @ h.float(),
+        "logits_grad_bf16": g_bf16,
+    }
+
+
+@pytest.mark.parametrize("transform", TRANSFORMS, ids=lambda t: f"m{t.multiplier:g}-cap{t.softcap}")
+@pytest.mark.parametrize("chunk", CHUNK_SIZES)
+def test_forward_applies_the_output_transform(chunk, transform):
+    h, w, labels, _ = _glimmer_scale_inputs()
+    out = vocab_parallel_fused_linear_logprobs(h, w, labels, chunk_size=chunk, transform=transform)
+    torch.testing.assert_close(out, _reference_logprobs_transformed(h, w, labels, transform), **FP32_LOGPROB_TOL)
+    plain = _reference_logprobs(h, w, labels)
+    assert (out - plain).abs().max() > 0.1, "the transform must change the scored distribution"
+
+
+def test_glimmer_inputs_reach_the_softcap():
+    h, w, _, _ = _glimmer_scale_inputs()
+    z = F.linear(h.float(), w.float()) * GLIMMER.multiplier
+    assert z.abs().max() > GLIMMER.softcap, "the test inputs would not exercise the cap"
+
+
+def test_forward_transform_comes_before_the_temperature():
+    h, w, labels, _ = _glimmer_scale_inputs(seed=2)
+    out = vocab_parallel_fused_linear_logprobs(h, w, labels, temperature=0.7, chunk_size=5, transform=GLIMMER)
+    expected = _reference_logprobs_transformed(h, w, labels, GLIMMER, temperature=0.7)
+    torch.testing.assert_close(out, expected, **FP32_LOGPROB_TOL)
+
+
+@pytest.mark.parametrize("transform", TRANSFORMS, ids=lambda t: f"m{t.multiplier:g}-cap{t.softcap}")
+@pytest.mark.parametrize("chunk", CHUNK_SIZES)
+def test_backward_through_the_output_transform(chunk, transform):
+    h, w, labels, upstream = _glimmer_scale_inputs(seed=4)
+    ref = _reference_grads_transformed(h, w, labels, upstream, transform)
+    h_fused = h.clone().requires_grad_(True)
+    w_fused = w.clone().requires_grad_(True)
+    out = vocab_parallel_fused_linear_logprobs(h_fused, w_fused, labels, chunk_size=chunk, transform=transform)
+    (out * upstream).sum().backward()
+    slack = BF16_RTOL * ref["hidden_rounded"].float().abs().max()
+    torch.testing.assert_close(h_fused.grad, ref["hidden_rounded"], rtol=BF16_RTOL, atol=slack)
+    torch.testing.assert_close(
+        w_fused.grad.float(), ref["weight_rounded"], rtol=BF16_RTOL, atol=BF16_RTOL * ref["weight_rounded"].abs().max()
+    )
+    torch.testing.assert_close(
+        h_fused.grad.float(), ref["hidden_fp32"], rtol=2e-2, atol=2e-2 * ref["hidden_fp32"].abs().max()
+    )
+    torch.testing.assert_close(
+        w_fused.grad.float(), ref["weight_fp32"], rtol=2e-2, atol=2e-2 * ref["weight_fp32"].abs().max()
+    )
+
+
+def test_identity_transform_is_the_plain_head():
+    h, w, labels, upstream = _inputs()
+    plain = vocab_parallel_fused_linear_logprobs(h, w, labels, chunk_size=5)
+    identity = vocab_parallel_fused_linear_logprobs(h, w, labels, chunk_size=5, transform=fused_lm_head.IDENTITY)
+    assert torch.equal(plain, identity) and fused_lm_head.IDENTITY.is_identity
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"multiplier": 0.0}, "multiplier"),
+        ({"multiplier": float("inf")}, "multiplier"),
+        ({"softcap": 0.0}, "softcap"),
+        ({"softcap": -20.0}, "softcap"),
+    ],
+)
+def test_transform_validation(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        fused_lm_head.LogitTransform(**kwargs)
+
+
+def test_two_shard_tensor_parallel_with_the_glimmer_transform(monkeypatch):
+    monkeypatch.setattr(fused_lm_head, "dist", _FakeDist)
+    vocab = 132
+    h, w, labels, upstream = _inputs(seed=7, vocab=vocab)
+    h = (h.float() * 12).to(torch.bfloat16)
+    ref = _reference_grads_transformed(h, w, labels, upstream, GLIMMER)
+    expected = _reference_logprobs_transformed(h, w, labels, GLIMMER)
+    group = _FakeTensorParallel(2)
+    shard = vocab // 2
+
+    def rank_fn(rank):
+        w_r = w[rank * shard : (rank + 1) * shard].clone().requires_grad_(True)
+        h_r = h.clone().requires_grad_(True)
+        out = vocab_parallel_fused_linear_logprobs(h_r, w_r, labels, tp_group=group, chunk_size=5, transform=GLIMMER)
+        (out * upstream).sum().backward()
+        return out, h_r.grad, w_r.grad
+
+    results = _run_ranks(group, rank_fn)
+    for out, _, _ in results:
+        torch.testing.assert_close(out, expected, **FP32_LOGPROB_TOL)
+    hidden_sum = results[0][1].float() + results[1][1].float()
+    torch.testing.assert_close(hidden_sum, ref["hidden_fp32"], rtol=2e-2, atol=2e-2 * ref["hidden_fp32"].abs().max())
+    for rank, (_, _, w_grad) in enumerate(results):
+        expected_w = ref["weight_rounded"][rank * shard : (rank + 1) * shard]
+        torch.testing.assert_close(w_grad.float(), expected_w, rtol=BF16_RTOL, atol=BF16_RTOL * expected_w.abs().max())
+
+
+# --- which head classes the fused path knows (by the class that defines the forward the head runs)
+
+
+def _head_class(name: str, module: str, bases: tuple = ()) -> type:
+    def forward(self, input_, weight=None, runtime_gather_output=None, **kwargs):
+        return input_, None
+
+    return type(name, bases, {"forward": forward, "__module__": module})
+
+
+_ColumnParallelLinear = _head_class("ColumnParallelLinear", "megatron.core.tensor_parallel.layers")
+_MuseMixin = _head_class("MuseGlimmerOutputLayerMixin", "megatron.bridge.models.muse_glimmer.modeling_muse_glimmer")
+_GemmaMixin = _head_class("Gemma4OutputLayer", "megatron.bridge.models.gemma.gemma4_provider")
+
+
+def _extended(mixin: type) -> type:
+    """megatron-bridge's extend_instance: a new class named like the head, the mixin first."""
+    return type("ColumnParallelLinear", (mixin, _ColumnParallelLinear), {})
+
+
+def _head(cls: type, **config):
+    head = cls()
+    head.weight, head.bias, head.gather_output, head.disable_grad_reduce = None, None, False, False
+    head.sequence_parallel, head.tp_group = False, None
+    head.config = SimpleNamespace(defer_embedding_wgrad_compute=False, **config)
+    return head
+
+
+def test_output_transform_of_known_heads():
+    assert fused_lm_head.output_transform(_head(_ColumnParallelLinear)) is fused_lm_head.IDENTITY
+    assert fused_lm_head.output_transform(SimpleNamespace(forward=lambda x: x)) is fused_lm_head.IDENTITY
+    muse = _head(_extended(_MuseMixin), output_multiplier=0.196, final_logit_softcapping=20.0)
+    assert fused_lm_head.output_transform(muse) == fused_lm_head.LogitTransform(multiplier=0.196, softcap=20.0)
+    uncapped = _head(_extended(_MuseMixin), output_multiplier=0.5, final_logit_softcapping=0.0)
+    assert fused_lm_head.output_transform(uncapped) == fused_lm_head.LogitTransform(multiplier=0.5)
+
+
+def test_install_refuses_a_head_whose_forward_it_does_not_know():
+    head = _head(_extended(_GemmaMixin))
+    model = SimpleNamespace(post_process=True, output_layer=head, config=SimpleNamespace(use_mup=False))
+    with pytest.raises(RuntimeError, match="does not know what .*Gemma4OutputLayer.forward does"):
+        _install_fake(model)
+
+
+def test_install_carries_the_muse_transform_to_target_logprobs():
+    h, w, labels, _ = _glimmer_scale_inputs(seed=9)
+    head = _head(_extended(_MuseMixin), output_multiplier=GLIMMER.multiplier, final_logit_softcapping=GLIMMER.softcap)
+    head.weight = torch.nn.Parameter(w.clone())
+    model = SimpleNamespace(post_process=True, output_layer=head, config=SimpleNamespace(use_mup=False))
+    state = _install_fake(model)
+    assert state.transform == GLIMMER
+    with activate(state):
+        mapped, _ = head.forward(h.unsqueeze(1))
+        out = target_logprobs(mapped.squeeze(1), labels, None, temperature=1.0, chunk_size=5)
+    torch.testing.assert_close(out, _reference_logprobs_transformed(h, w, labels, GLIMMER), **FP32_LOGPROB_TOL)
+    # inactive, the head's own forward (here the mixin's) runs unchanged
+    assert head.forward(h)[0] is h
