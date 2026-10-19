@@ -16,6 +16,7 @@ from miles.backends.megatron_utils.lora.utils import (
     convert_target_modules_to_hf,
     convert_target_modules_to_megatron,
     is_lora_enabled,
+    is_lora_model,
     parse_exclude_modules,
 )
 from miles.utils.lora import LORA_ADAPTER_NAME, is_lora_weight_name
@@ -268,6 +269,61 @@ class TestIsAdapterParamName:
     )
     def test_negative(self, name):
         assert _is_adapter_param_name(name) is False
+
+
+# ---------------------------------------------------------------------------
+# is_lora_model
+# ---------------------------------------------------------------------------
+
+
+def _model_chunk(names: list[str], peft_config: bool = False) -> MagicMock:
+    chunk = MagicMock()
+    chunk.module = Namespace(peft_config={}) if peft_config else Namespace()
+    chunk.named_parameters.return_value = [(name, None) for name in names]
+    return chunk
+
+
+class TestIsLoraModel:
+    BASE = [
+        "module.embedding.word_embeddings.weight",
+        "module.decoder.layers.0.self_attention.linear_qkv.weight",
+        "module.decoder.layers.0.mlp.linear_fc1.weight",
+    ]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "module.decoder.layers.0.self_attention.linear_qkv.lora_A.weight",
+            "module.decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight",
+            "module.decoder.layers.0.self_attention.linear_qkv.adapter.linear_out.weight",
+            "module.decoder.layers.0.self_attention.linear_qkv.adapters.3.linear_in.weight",
+            "module.decoder.layers.0.self_attention.lora_adapter.wq_A",
+        ],
+    )
+    def test_lora_parameters(self, name):
+        assert is_lora_model([_model_chunk([*self.BASE, name])]) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Muse Glimmer's (and Llama 4's) vision adapter is the model's own module, trained or frozen as a whole
+            "module.vision_adapter.fc1.weight",
+            "module.vision_adapter.fc2.weight",
+            "module.language_model.vision_adapter_norm.weight",
+        ],
+    )
+    def test_model_modules_named_adapter_are_not_lora(self, name):
+        assert is_lora_model([_model_chunk([*self.BASE, name])]) is False
+
+    def test_plain_model(self):
+        assert is_lora_model([_model_chunk(self.BASE), _model_chunk(self.BASE)]) is False
+
+    def test_peft_config(self):
+        assert is_lora_model([_model_chunk(self.BASE, peft_config=True)]) is True
+
+    def test_any_chunk(self):
+        lora = "module.decoder.layers.9.mlp.linear_fc2.adapter.linear_out.weight"
+        assert is_lora_model([_model_chunk(self.BASE), _model_chunk([*self.BASE, lora])]) is True
 
 
 # ---------------------------------------------------------------------------
