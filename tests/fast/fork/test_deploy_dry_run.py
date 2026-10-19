@@ -41,6 +41,7 @@ SIF_SHA = "2fb0ee8ba5377a79206af36c4645c6e32242300aad5cf08677addc8e25ba468d"
 
 SHELL_SCRIPTS = sorted(
     list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("*.pbs")) + list(DEPLOY.glob("clients/*.sh"))
+    + list(DEPLOY.glob("overlays/*/*.sh"))
     + list(DEPLOY.glob("*.env")) + list(DEPLOY.glob("presets/*.env"))
     + list((REPO / "deploy" / "clients").glob("*.sh"))
 )
