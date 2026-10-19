@@ -227,6 +227,11 @@ def _rocm_checkpoint_writer():
 def load_state(
     args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str, load_optimizer: bool
 ) -> None:
+    if load_optimizer and args.no_save_optim:
+        # A server run with --no-save-optim writes weights-only checkpoints; asking Megatron for the
+        # optimizer there fails with KeyError('optimizer') and kills the trainer.
+        logger.warning(f"{path}: checkpoints are weights-only (--no-save-optim); resuming with a fresh optimizer")
+        load_optimizer = False
     overrides = {
         "load": path,
         "finetune": False,
