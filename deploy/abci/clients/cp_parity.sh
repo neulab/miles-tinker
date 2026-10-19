@@ -11,10 +11,10 @@
 set -euo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true; module load python/3.12/3.12.9 2>/dev/null || true
 PY=${COOKBOOK_PYTHON:-/home/aci18912it/miles-tinker/cookbook-venv/bin/python}
-MODEL_NAME=${MODEL_NAME:-$(grep -o -- '--tinker-base-model [^ ]*' "$JOBDIR/head.log" | head -1 | cut -d' ' -f2)}
-CP=${CP:-$(grep -o -- '--context-parallel-size [0-9]*' "$JOBDIR/head.log" | head -1 | cut -d' ' -f2)}
+MODEL_NAME=${MODEL_NAME:-$(grep -o -- '--tinker-base-model [^ ]*' "$JOBDIR/head.log" | sed -n 1p | cut -d' ' -f2)}
+CP=${CP:-$(grep -o -- '--context-parallel-size [0-9]*' "$JOBDIR/head.log" | sed -n 1p | cut -d' ' -f2)}
 CP=${CP:-1}
-TP=${TP:-$(grep -o -- '--tensor-model-parallel-size [0-9]*' "$JOBDIR/head.log" | head -1 | cut -d' ' -f2)}
+TP=${TP:-$(grep -o -- '--tensor-model-parallel-size [0-9]*' "$JOBDIR/head.log" | sed -n 1p | cut -d' ' -f2)}
 TP=${TP:-1}
 # set only through EXTRA_ARGS, so usually absent from head.log (|| true: no match is not an error)
 PAD_MULTIPLIER=${PAD_MULTIPLIER:-$( (grep -o -- '--data-pad-size-multiplier [0-9]*' "$JOBDIR/head.log" || true) | tail -1 | cut -d' ' -f2)}
