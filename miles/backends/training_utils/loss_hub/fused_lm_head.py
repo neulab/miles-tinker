@@ -28,7 +28,8 @@ Tinker full fine-tuning path (``--fused-lm-head-logprobs``).
 * Output transforms. A head whose class adds work after the projection would
   be bypassed with its ``forward``, so :func:`install` reads what the head
   class does and refuses one it does not know. Megatron's
-  ``ColumnParallelLinear`` has none; megatron-bridge's
+  ``ColumnParallelLinear`` has none, nor does GPTModel's
+  ``LinearCrossEntropyModule`` outside its fused cross-entropy; megatron-bridge's
   ``MuseGlimmerOutputLayerMixin`` (Muse Glimmer) multiplies the logits by
   ``config.output_multiplier`` and then soft-caps them,
   ``cap * tanh(logits / cap)`` with ``cap = config.final_logit_softcapping``.
@@ -419,7 +420,12 @@ def _check_head_supported(model: Any, output_layer: Any) -> None:
 
 
 # The lm head classes whose forward the fused path reproduces, by the class that defines the forward the head runs.
-_PLAIN_HEAD_FORWARDS = ("megatron.core.tensor_parallel.layers.ColumnParallelLinear",)
+# GPTModel's head (every Qwen and other GPT preset) is a LinearCrossEntropyModule: its forward is ColumnParallelLinear's
+# unless asked for Megatron's fused cross-entropy loss, which the wrapper refuses while the fused path is active.
+_PLAIN_HEAD_FORWARDS = (
+    "megatron.core.tensor_parallel.layers.ColumnParallelLinear",
+    "megatron.core.transformer.linear_cross_entropy.LinearCrossEntropyModule",
+)
 _MUSE_HEAD_FORWARDS = ("megatron.bridge.models.muse_glimmer.modeling_muse_glimmer.MuseGlimmerOutputLayerMixin",)
 
 

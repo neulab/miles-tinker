@@ -77,7 +77,9 @@ The fused path replaces the head's `forward`, so whatever that forward does afte
 without an error. `install` therefore asks which class defines the `forward` the head runs
 (`fused_lm_head.output_transform`):
 
-- Megatron's `ColumnParallelLinear` (every GPT and Qwen head): nothing after the projection.
+- Megatron's `ColumnParallelLinear`, and GPTModel's `LinearCrossEntropyModule` (every GPT and Qwen head: its
+  `forward` is `ColumnParallelLinear`'s unless asked for Megatron's fused cross-entropy loss, which the wrapper
+  refuses while active): nothing after the projection.
 - megatron-bridge's `MuseGlimmerOutputLayerMixin` (Muse Glimmer, put on the head with `extend_instance`):
   `logits * config.output_multiplier` (0.19611613513818404, 1/sqrt(26)), then
   `final_logit_softcapping * tanh(logits / final_logit_softcapping)` (cap 20).

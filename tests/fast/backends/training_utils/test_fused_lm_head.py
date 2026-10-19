@@ -761,6 +761,10 @@ def _head_class(name: str, module: str, bases: tuple = ()) -> type:
 
 
 _ColumnParallelLinear = _head_class("ColumnParallelLinear", "megatron.core.tensor_parallel.layers")
+# GPTModel's head: overrides forward only to offer Megatron's fused cross-entropy loss
+_LinearCrossEntropyModule = _head_class(
+    "LinearCrossEntropyModule", "megatron.core.transformer.linear_cross_entropy", bases=(_ColumnParallelLinear,)
+)
 _MuseMixin = _head_class("MuseGlimmerOutputLayerMixin", "megatron.bridge.models.muse_glimmer.modeling_muse_glimmer")
 _GemmaMixin = _head_class("Gemma4OutputLayer", "megatron.bridge.models.gemma.gemma4_provider")
 
@@ -780,11 +784,32 @@ def _head(cls: type, **config):
 
 def test_output_transform_of_known_heads():
     assert fused_lm_head.output_transform(_head(_ColumnParallelLinear)) is fused_lm_head.IDENTITY
+    assert fused_lm_head.output_transform(_head(_LinearCrossEntropyModule)) is fused_lm_head.IDENTITY
     assert fused_lm_head.output_transform(SimpleNamespace(forward=lambda x: x)) is fused_lm_head.IDENTITY
     muse = _head(_extended(_MuseMixin), output_multiplier=0.196, final_logit_softcapping=20.0)
     assert fused_lm_head.output_transform(muse) == fused_lm_head.LogitTransform(multiplier=0.196, softcap=20.0)
     uncapped = _head(_extended(_MuseMixin), output_multiplier=0.5, final_logit_softcapping=0.0)
     assert fused_lm_head.output_transform(uncapped) == fused_lm_head.LogitTransform(multiplier=0.5)
+
+
+def test_output_transform_of_megatrons_own_head_classes():
+    """The real classes where Megatron imports: every GPT/Qwen preset's head is GPTModel's LinearCrossEntropyModule,
+    so refusing it would stop each of them at install."""
+    try:
+        from megatron.core.models.gpt import gpt_model
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+        from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+    except Exception as exc:  # no Megatron (or no CUDA stub) here: the fakes above stand in
+        pytest.skip(f"Megatron does not import: {exc!r}")
+    assert gpt_model.LinearCrossEntropyModule is LinearCrossEntropyModule
+    for cls in (LinearCrossEntropyModule, ColumnParallelLinear):
+        assert fused_lm_head.output_transform(object.__new__(cls)) is fused_lm_head.IDENTITY, cls
+
+
+def test_install_takes_gpt_models_head():
+    head = _head(_LinearCrossEntropyModule)
+    model = SimpleNamespace(post_process=True, output_layer=head, config=SimpleNamespace(use_mup=False))
+    assert _install_fake(model).transform is fused_lm_head.IDENTITY
 
 
 def test_install_refuses_a_head_whose_forward_it_does_not_know():
