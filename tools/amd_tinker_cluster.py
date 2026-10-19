@@ -1,4 +1,4 @@
-"""SSH/tmux launcher for an existing allocation of single-GPU MI350 nodes.
+"""SSH/tmux launcher for an existing allocation of MI350 nodes (one or more GPUs each).
 
 Host Python 3.9+, standard library only. See docs/platforms/amd-tinker-cluster.md.
 This does not allocate nodes or change the training backend.
@@ -37,6 +37,19 @@ _RESERVED = {
     "--tinker-checkpoint-root", "--tinker-server-port", "--dry-run", "--colocate",
     "--rollout-external", "--debug-train-only", "--debug-rollout-only", "--eval-num-gpus",
 }
+# --roce: RCCL over the AMD HPC Fund mi3508x RoCE NICs (its docs: Running Jobs > Multi-node RoCE
+# Networking). Without them the weight push between nodes can hang or fall back to TCP sockets.
+_ROCE_ENV = {
+    "NCCL_IB_HCA": ",".join(f"bnxt_re{i}" for i in range(8)),
+    # GPU-direct RDMA breaks the lopsided weight-push group (1 trainer GPU on one node, 8 engine GPUs
+    # on the other): the image's RCCL 2.27.7 bootstrap fails with "Message truncated: received 8192
+    # bytes instead of 4096". Staging through host memory works and only slows that push.
+    "NCCL_NET_GDR_LEVEL": "0",
+    "NCCL_IB_GID_INDEX": "3",
+}
+# Every node starts from a fresh SSH shell, so settings exported on the submitting host would
+# otherwise reach only the head; start records these and each node re-applies them.
+_PASSTHROUGH_ENV = ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "NCCL_DEBUG", "NCCL_DEBUG_SUBSYS")
 
 
 def _config(spec):
@@ -59,8 +72,18 @@ def _serve_command(spec):
         "--train-gpus", str(spec["train_gpus"]), "--rollout-gpus", str(spec["rollout_gpus"]),
         "--rollout-gpus-per-engine", "1", "--port", str(spec["port"]),
         *forwarded[:split], "--", *forwarded[split + 1:],
-        "--num-gpus-per-node", "1", "--actor-num-nodes", str(spec["train_gpus"]),
-        "--actor-num-gpus-per-node", "1",
+        *_actor_layout(spec),
+    ]
+
+
+def _actor_layout(spec):
+    # Miles hands out GPUs sorted by node IP, then GPU id: the trainer takes the first
+    # train_gpus of them, so whole nodes go to training and its TP groups stay in-node.
+    per_node = spec.get("gpus_per_node", 1)
+    nodes = max(1, spec["train_gpus"] // per_node)
+    return [
+        "--num-gpus-per-node", str(per_node), "--actor-num-nodes", str(nodes),
+        "--actor-num-gpus-per-node", str(spec["train_gpus"] // nodes),
     ]
 
 
@@ -131,8 +154,9 @@ def _probe(spec):
         props = dict(line.split(maxsplit=1) for line in p.read_text().splitlines() if " " in line)
         if int(props.get("simd_count", "0")):
             devices.append(props.get("gfx_target_version"))
-    if devices != ["90500"]:
-        raise ValueError(f"Expected exactly one MI350 GPU; found gfx targets {devices}")
+    per_node = spec.get("gpus_per_node", 1)
+    if devices != ["90500"] * per_node:
+        raise ValueError(f"Expected exactly {per_node} MI350 GPU(s); found gfx targets {devices}")
     foreign = _foreign_processes(spec)
     if foreign:
         raise ValueError(f"Unmanaged Ray/Tinker/SGLang processes {foreign}; stop the manual deployment first")
@@ -148,6 +172,7 @@ def _probe(spec):
 
 
 def _node_environment(spec, index):
+    passthrough = {**(_ROCE_ENV if spec.get("roce", False) else {}), **spec.get("env", {})}
     return {
         _MARKER: spec["id"],
         f"APPTAINERENV_{_MARKER}": spec["id"],
@@ -156,10 +181,14 @@ def _node_environment(spec, index):
         "APPTAINERENV_GLOO_SOCKET_IFNAME": spec["interface"],
         "APPTAINERENV_RAY_ADDRESS": f"{spec['ips'][0]}:{spec['ray_port']}",
         "PYTHONUNBUFFERED": "1",
+        **{f"APPTAINERENV_{key}": value for key, value in passthrough.items()},
     }
 
 
 def _run_node(spec, index, role):
+    # tools/amd_tinker.py reads the allocator settings from this process's environment when it
+    # builds the container command, so apply the recorded ones here, not only in env below.
+    os.environ.update(spec.get("env", {}))
     config = _config(spec)
     _prepare_dirs(config)
     env = {**_host_env(config), **_node_environment(spec, index)}
@@ -176,8 +205,9 @@ def _run_node(spec, index, role):
         )
         command = _container_command(config, [
             config.python, "-m", "ray.scripts.scripts", "start", *topology,
-            f"--node-ip-address={spec['ips'][index]}", "--num-gpus=1", f"--num-cpus={spec['cpus']}",
-            "--object-store-memory=2147483648", "--min-worker-port=40000", "--max-worker-port=40999",
+            f"--node-ip-address={spec['ips'][index]}", f"--num-gpus={spec.get('gpus_per_node', 1)}",
+            f"--num-cpus={spec['cpus']}", f"--object-store-memory={spec.get('object_store_gb', 2) << 30}",
+            "--min-worker-port=40000", "--max-worker-port=40999",
             "--disable-usage-stats", "--block",
         ])
     # Server/relay logs are handled by amd_tinker.py; capture Ray startup separately.
@@ -340,11 +370,18 @@ def _remote(spec, index, action):
         "python3", str(Path(spec["repo"]) / "tools/amd_tinker_cluster.py"), "_node",
         action, str(index), json.dumps(spec),
     ]
-    result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-         spec["nodes"][index], shlex.join(command)],
-        capture_output=True, text=True, timeout=45,
-    )
+    # sshd drops bursts of new connections ("Connection closed by ... port 22"); those fail before
+    # the command runs, so retrying them cannot repeat an action.
+    for attempt in range(4):
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+             spec["nodes"][index], shlex.join(command)],
+            capture_output=True, text=True, timeout=45,
+        )
+        refused = result.returncode == 255 and re.search(r"Connection (closed|refused|timed out)", result.stderr)
+        if not refused or attempt == 3:
+            break
+        time.sleep(5 * (attempt + 1))
     if result.returncode:
         raise RuntimeError(f"{spec['nodes'][index]} ({action}): {result.stderr[-2500:]}")
     return _decode_result(result.stdout)
@@ -362,7 +399,8 @@ def _wait_for_ray(spec, *, head_only=False):
             actual = {n["ip"] for n in nodes}
             if actual - set(spec["ips"]):
                 raise ValueError(f"Unexpected Ray nodes: {actual - set(spec['ips'])}")
-            if expected <= actual and all(n["gpu"] == 1 and n["cpu"] == spec["cpus"] for n in nodes):
+            per_node = spec.get("gpus_per_node", 1)
+            if expected <= actual and all(n["gpu"] == per_node and n["cpu"] == spec["cpus"] for n in nodes):
                 return
             print(f"Waiting for Ray: {nodes}", flush=True)
         time.sleep(3)
@@ -377,8 +415,8 @@ def _start(spec):
     state = _state_path(Path(spec["root"]))
     if state.exists():
         old = json.loads(state.read_text())
-        for key in ("nodes", "repo", "cpus", "interface", "ray_port", "checkpoint_root"):
-            if old[key] != spec[key]:
+        for key in ("nodes", "repo", "cpus", "interface", "ray_port", "checkpoint_root", "gpus_per_node"):
+            if old.get(key, 1) != spec[key]:
                 raise ValueError(f"Existing cluster differs in {key}; stop it before changing nodes/settings")
     print("Checking all nodes before starting processes...", flush=True)
     probes = [_remote(spec, i, "probe") for i in range(len(spec["nodes"]))]
@@ -432,8 +470,11 @@ def _parse_args(argv):
     parser.add_argument("--nodes", nargs="+")
     parser.add_argument("--train-gpus", type=int)
     parser.add_argument("--rollout-gpus", type=int)
+    parser.add_argument("--gpus-per-node", type=int, default=1, help="GPUs on each node (all of them are used)")
     parser.add_argument("--cpus-per-node", type=int, default=24)
+    parser.add_argument("--object-store-gb", type=int, default=2, help="Ray object store per node")
     parser.add_argument("--interface", default="eth0")
+    parser.add_argument("--roce", action="store_true", help="Add the mi3508x RoCE NCCL settings on every node")
     parser.add_argument("--ray-port", type=int, default=16379)
     parser.add_argument("--port", type=int, default=11613)
     parser.add_argument("--startup-timeout", type=int, default=900, help="Seconds to wait for Tinker/relay readiness")
@@ -447,12 +488,14 @@ def _parse_args(argv):
         return args, None
     if not args.nodes or not args.train_gpus or not args.rollout_gpus:
         parser.error("start requires --nodes, --train-gpus, and --rollout-gpus")
-    if min(args.train_gpus, args.rollout_gpus, args.cpus_per_node) < 1:
-        parser.error("GPU counts and CPUs per node must be positive")
+    if min(args.train_gpus, args.rollout_gpus, args.gpus_per_node, args.cpus_per_node, args.object_store_gb) < 1:
+        parser.error("GPU counts, CPUs per node and the object store must be positive")
     if args.startup_timeout < 1:
         parser.error("--startup-timeout must be positive")
-    if args.train_gpus + args.rollout_gpus != len(args.nodes):
-        parser.error("Single-GPU nodes: train-gpus + rollout-gpus must equal the node count")
+    if args.train_gpus + args.rollout_gpus != len(args.nodes) * args.gpus_per_node:
+        parser.error("train-gpus + rollout-gpus must equal nodes x gpus-per-node")
+    if args.train_gpus > args.gpus_per_node and args.train_gpus % args.gpus_per_node:
+        parser.error("Training spanning nodes must take whole nodes (train-gpus a multiple of gpus-per-node)")
     if len(set(args.nodes)) != len(args.nodes) or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", n) for n in args.nodes):
         parser.error("Use distinct hostnames or IPv4 addresses, without user@ prefixes")
     if not all(0 < p < 65536 for p in (args.ray_port, args.port)) or args.ray_port == args.port:
@@ -467,9 +510,11 @@ def _parse_args(argv):
         "id": hashlib.sha256(str(root).encode()).hexdigest()[:12], "repo": str(_REPO),
         "root": str(root), "checkpoint_root": str((args.checkpoint_root or root / "checkpoints").resolve()),
         "nodes": args.nodes, "train_gpus": args.train_gpus, "rollout_gpus": args.rollout_gpus,
+        "gpus_per_node": args.gpus_per_node, "object_store_gb": args.object_store_gb,
         "cpus": args.cpus_per_node, "interface": args.interface, "ray_port": args.ray_port,
         "port": args.port, "serve_args": forwarded,
-        "startup_timeout": args.startup_timeout,
+        "startup_timeout": args.startup_timeout, "roce": args.roce,
+        "env": {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ},
     }
 
 
@@ -483,7 +528,13 @@ def main():
     if args.action == "start":
         if args.dry_run:
             print("Nodes (head first):", ", ".join(spec["nodes"]))
-            print(f"Ray: 1 GPU and {spec['cpus']} CPUs per node, interface {spec['interface']}")
+            print(f"Ray: {spec['gpus_per_node']} GPU(s), {spec['cpus']} CPUs and {spec['object_store_gb']} GB "
+                  f"object store per node, interface {spec['interface']}")
+            print("Node environment:", " ".join(
+                f"{k.removeprefix('APPTAINERENV_')}={v}" for k, v in
+                _node_environment({**spec, "ips": ["<ip>"] * len(spec["nodes"])}, 0).items()
+                if k.startswith("APPTAINERENV_NCCL") or k.removeprefix("APPTAINERENV_") in _PASSTHROUGH_ENV
+            ))
             print(shlex.join(_serve_command(spec)))
         else:
             _start(spec)
