@@ -683,6 +683,48 @@ def test_a_preset_renders_exactly_like_its_job_variables(tmp_path):
     assert lines == expected_lines
 
 
+# PBS node 0, the head, has the lowest IP here: it still serves, and the trainers are the next three
+GLIMMER_FIVE = ([f"hnode{n}" for n in (728, 733, 731, 730, 729)], [f"10.0.7.{n}" for n in (28, 33, 31, 30, 29)])
+
+
+@pytest.mark.parametrize(
+    "preset, layout, train_nodes, trainer_hosts",
+    [
+        ("muse-glimmer-30b-128k", GLIMMER_FIVE, "3", ["hnode729", "hnode730", "hnode731"]),
+        ("muse-glimmer-30b-64k", TWO, "", ["hnode001"]),
+    ],
+    ids=["128k-5-nodes", "64k-2-nodes"],
+)
+def test_glimmer_presets_render_with_the_overlay(tmp_path, preset, layout, train_nodes, trainer_hosts):
+    """The Muse-Glimmer-30B presets on their layouts (5 nodes with 3 training, 2 nodes with 1; the head node serves),
+    with the overlay as the job's ROOTFS and EXTRA_SITE and the snapshot under the job's HF_HOME."""
+    values = source_preset(PRESETS / f"{preset}.env")
+    hf_home, snapshot = fake_hf_home(
+        tmp_path / "hf", values["HF_MODEL"], values["HF_REVISION"], refs_main=values["HF_REVISION"]
+    )
+    rootfs, extra_site = tmp_path / "overlay" / "rootfs", tmp_path / "overlay" / "extra-site"
+    hosts, ips = layout
+    out, jobdir = run_pbs_dry(
+        tmp_path, hosts, ips, PRESET=preset, HF_SNAPSHOT="", HF_HOME=str(hf_home), ROOTFS=str(rootfs),
+        EXTRA_SITE=str(extra_site), **({"TRAIN_NODES": train_nodes} if train_nodes else {}),
+    )
+    nodes, trainers = len(hosts), int(train_nodes or 1)
+    rollout_gpus = 8 * (nodes - trainers)
+    assert f"nodes={nodes} train_nodes={trainers} rollout_gpus={rollout_gpus} services=0 " in out
+    roles = [line.split("\t") for line in (jobdir / "roles.tsv").read_text().splitlines()]
+    assert [r[3] for r in roles] == ["train"] * trainers + ["engine"] * (nodes - trainers)
+    assert [r[0] for r in roles[:trainers]] == trainer_hosts and roles[-1][0] == hosts[0]
+    head = dry_argv(out, "bg[head.log]")
+    assert f"{rootfs}:/root" in head and f"PYTHONPATH=/root/miles:/root/Megatron-LM:{extra_site}" in head
+    assert f"HF_HOME={hf_home}" in head
+    serve = dry_argv(out, "serve (inside the head container)")
+    assert serve[3:7] == ["--mode", "full", "--hf-checkpoint", str(snapshot)]
+    split = ["--actor-num-nodes", str(trainers), "--rollout-num-gpus", str(rollout_gpus)]
+    expected = [*split, *shlex.split(values["LAUNCHER_ARGS"]), "--extra-args", values["EXTRA_ARGS"]]
+    assert serve[serve.index("--actor-num-nodes") :] == expected
+    assert "--model-variant glimmer-30b" in values["LAUNCHER_ARGS"] and "note:" not in out
+
+
 def test_job_variables_replace_the_preset_values(tmp_path):
     out, _ = run_pbs_dry(
         tmp_path,

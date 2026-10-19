@@ -6,6 +6,7 @@ TP4/EP1 training, TP8/EP1 inference, and no routing replay. Pass a custom
 preserve-thinking checkpoint with `--hf-checkpoint`, and advertise its tokenizer
 path or model identifier with `--model-name`. The default `35b-a3b` variant keeps
 the existing MoE recipe. Node counts remain explicit launcher arguments.
+`--model-variant glimmer-30b` serves meta-models/Muse-Glimmer-30B (below).
 
 The `--tinker-*` flags of `serve_tinker.py`, the two fused-head flags, the
 serve-time validation they trigger, the launcher that emits them for the
@@ -117,6 +118,21 @@ Through `run_qwen3_6_35b_a3b_gateway.py serve` its options give:
 | `--max-tokens-per-datum 131073 --unit-token-budget 1310730` | `--tinker-max-tokens-per-datum 131073 --tinker-unit-token-budget 1310730`: ten rows per unit |
 | `--extra-env-vars NCCL_DEBUG=INFO` | `NCCL_DEBUG=INFO` in the Ray job's environment |
 | `EXTRA_ARGS` | appended last, so they win: `--sglang-attention-backend fa3`, `--lr 1e-6` (the optimizer's initial lr; every `optim_step` sends its own Adam parameters), `--router-policy cache_aware --router-balance-abs-threshold 16 --router-balance-rel-threshold 1.5` |
+
+`muse-glimmer-30b-128k` (5 nodes, `TRAIN_NODES=3`) and `muse-glimmer-30b-64k` (2 nodes) serve
+meta-models/Muse-Glimmer-30B at `a4e59da5`. They need the overlay of `deploy/abci/overlays/muse-glimmer`
+(`ROOTFS`, `EXTRA_SITE` and an `HF_HOME` with the snapshot, as job variables):
+
+| Preset option | `serve_tinker.py` argv |
+|---|---|
+| `--model-variant glimmer-30b` | Megatron model `muse-glimmer-30B` (shape only: megatron-bridge's ModelBuilder builds the model), TP4/EP1 training without routing replay or CP, the fused fp32 head with Glimmer's multiplier and softcap on both sides (`--fused-lm-head-logprobs`, `--sglang-enable-fp32-lm-head`), TP2 engines (`--rollout-num-gpus-per-engine 2`, four per node), the vision tower frozen |
+| `--context-len 131066` | `--rollout-max-context-len 131066` and `--sglang-context-length 131072`, Glimmer's `max_position_embeddings` (131072 would ask SGLang for 131078 positions, which it refuses) |
+| `--max-tokens-per-gpu 131067 --max-tokens-per-datum 131067 --unit-token-budget 1310670` | one 128K row per microbatch, ten per unit |
+| `EXTRA_ARGS` | as the Qwen3.8 preset's, plus `--sglang-language-model-only` (the engines skip the vision tower and the pushed vision weights; HF exports keep it) |
+
+The 64k preset is the two-node layout, a smoke of the 5-node gateway: it checks the first weight push against the
+engines (`--check-weight-update-equal`). There two DP ranks hold half of the optimizer state each; a training GPU
+peaks at 101 GiB on a 64K row and at 120.5 GiB on a 131K row.
 
 `tests/fast/fork/test_qwen36_gateway_launcher.py` builds both argvs through the launcher's CLI and
 requires that only `--tinker-base-model` differs, and requires every preset's options to parse with
