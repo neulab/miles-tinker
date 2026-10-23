@@ -124,11 +124,16 @@ def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, ski
 
         if inherit:
             final_kwargs["default"] = argparse.SUPPRESS
-            if final_kwargs.get("action") in ("store_true", "store_false"):
+            action = final_kwargs.get("action")
+            is_store_bool = action in ("store_true", "store_false") or (
+                isinstance(action, type) and action.__name__ in ("_StoreTrueAction", "DeprecatedStoreTrueAction")
+            )
+            if is_store_bool:
                 # store_true can only turn a field on; an override must also turn one off.
                 final_kwargs["action"] = argparse.BooleanOptionalAction
                 final_kwargs.pop("const", None)
                 final_kwargs.pop("nargs", None)
+                final_kwargs.pop("new_flag", None)
 
         old_add_argument(*new_name_or_flags_list, **final_kwargs)
 

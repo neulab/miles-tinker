@@ -83,7 +83,7 @@ PERF_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8 --sglang-mem-fraction-static 0.8 --sglang-ep-size 8
    --sglang-watchdog-timeout 1800 --sglang-enable-metrics --sglang-attention-backend fa3
-   --sglang-cuda-graph-bs 1 2 4 8 16 32 --use-rollout-routing-replay
+   --sglang-cuda-graph-bs-decode 1 2 4 8 16 32 --use-rollout-routing-replay
    --sglang-mamba-scheduler-strategy extra_buffer
 )
 MISC_ARGS=(
