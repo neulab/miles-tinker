@@ -154,8 +154,12 @@ def conflict_report(
         lines.append(f"    upstream side: {upstream.strip()}")
         lines.append(f"    fork side:     {fork.strip()}")
         why = rationale.get(path)
-        lines.append(f"    FORK.md: {why}" if why else "    FORK.md: not listed -> prefer upstream, keep any fork test passing")
-    lines.append("Policy: keep every upstream fix; re-apply the fork intent for files FORK.md lists; prefer upstream otherwise.")
+        lines.append(
+            f"    FORK.md: {why}" if why else "    FORK.md: not listed -> prefer upstream, keep any fork test passing"
+        )
+    lines.append(
+        "Policy: keep every upstream fix; re-apply the fork intent for files FORK.md lists; prefer upstream otherwise."
+    )
     return "\n".join(lines)
 
 
@@ -212,7 +216,11 @@ def describe_plan(plan: SyncPlan, branch: str, rebase: bool) -> str:
     lines = [
         f"stack merged into main: {plan.stack_merged}",
         f"sync base: {plan.base_ref} @ {plan.base_commit[:12]}",
-        "fork already contains the base: nothing to do" if plan.up_to_date else f"would {action} {plan.base_ref} into {branch}",
+        (
+            "fork already contains the base: nothing to do"
+            if plan.up_to_date
+            else f"would {action} {plan.base_ref} into {branch}"
+        ),
     ]
     if plan.conflicts:
         lines.append(f"expected conflicts ({len(plan.conflicts)}): " + ", ".join(plan.conflicts))

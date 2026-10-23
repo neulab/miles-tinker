@@ -21,14 +21,12 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
-
 import asyncio
 import os
 from pathlib import Path
 
 import chz
-
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
 from tinker_cookbook import cli_utils
 from tinker_cookbook.recipes.multiplayer_rl.guess_number.env import GuessNumberDatasetBuilder
 from tinker_cookbook.rl import train

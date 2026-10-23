@@ -93,7 +93,9 @@ class TinkerService:
         self._wake = asyncio.Event()
         self._backend_lock = asyncio.Lock()
         self._sample_slots = asyncio.Semaphore(config.max_concurrent_samples)
-        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
+        self._sample_tasks: dict[str, tuple] = (
+            {}
+        )  # request_id -> (task, tenant, sampling_session_id, lora_name, dedup_key)
         self._sample_by_seq: dict[tuple, tuple[str, list[str]]] = {}  # (sampling_session_id, seq_id) -> reply
         self._model_by_seq: dict[tuple, tuple[str, str]] = {}  # (session_id, model_seq_id) -> reply
         self._background_tasks: set = set()
@@ -786,7 +788,9 @@ def _plain_metrics(metrics) -> dict:
     flag carries the meaning)."""
     if not isinstance(metrics, dict):
         metrics = {"grad_norm": metrics}
-    return {key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()}
+    return {
+        key: (_finite_float(value) if isinstance(value, (int, float)) else value) for key, value in metrics.items()
+    }
 
 
 def _finite_float(value) -> float:

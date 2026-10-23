@@ -87,14 +87,22 @@ def test_fork_rationale_matches_files_and_directory_prefixes():
 
 def test_fork_rationale_reads_qualified_and_multi_path_rows():
     found = sync.fork_rationale(FORK_MD, ("miles/tinker/runtime.py", "miles/utils/flops_utils.py"))
-    assert found == {"miles/tinker/runtime.py": "seed offset | dp padding", "miles/utils/flops_utils.py": "per-unit MFU"}
+    assert found == {
+        "miles/tinker/runtime.py": "seed offset | dp padding",
+        "miles/utils/flops_utils.py": "per-unit MFU",
+    }
 
 
 def test_fork_rationale_covers_every_row_of_the_real_fork_md():
     fork_md = (Path(__file__).resolve().parents[3] / "FORK.md").read_text()
     listed = [row for row in fork_md.splitlines() if row.startswith("| `")]
     assert listed, "FORK.md tables not found"
-    sample = ("miles/tinker/runtime.py", "miles/utils/timer.py", "tests/fast/tinker/test_runtime.py", "deploy/abci/x.pbs")
+    sample = (
+        "miles/tinker/runtime.py",
+        "miles/utils/timer.py",
+        "tests/fast/tinker/test_runtime.py",
+        "deploy/abci/x.pbs",
+    )
     assert set(sync.fork_rationale(fork_md, sample)) == set(sample)
 
 

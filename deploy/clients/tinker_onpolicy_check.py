@@ -24,17 +24,18 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
-
 import argparse
 import os
 import random
 from pathlib import Path
 
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
+
 os.environ.setdefault("TINKER_API_KEY", "tml-onpolicy-check")
 os.environ.setdefault("HF_HOME", "/groups/gai51740/aci18912it/rasp/cache/huggingface")
 
 import numpy as np  # noqa: E402
+
 import tinker  # noqa: E402
 from tinker import types  # noqa: E402
 
@@ -59,7 +60,9 @@ def resolve_base_url(args) -> str:
 
 
 def chat_tokens(tokenizer, text: str) -> list[int]:
-    rendered = tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, tokenize=False)
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=False
+    )
     return [int(t) for t in tokenizer.encode(rendered, add_special_tokens=False)]
 
 
@@ -104,7 +107,11 @@ def main() -> int:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--keep-model", action="store_true", help="leave the model loaded at exit (default: unload so single-tenant gateways free the slot)")
+    parser.add_argument(
+        "--keep-model",
+        action="store_true",
+        help="leave the model loaded at exit (default: unload so single-tenant gateways free the slot)",
+    )
     args = parser.parse_args()
     base_url = resolve_base_url(args)
 
@@ -127,19 +134,26 @@ def main() -> int:
     probe_datums, sampled_logprobs = [], []
     for prompt in PROMPTS[: args.num_prompts]:
         prompt_ids = chat_tokens(tokenizer, prompt)
-        seq = sampler.sample(types.ModelInput.from_ints(prompt_ids), num_samples=1, sampling_params=params).result().sequences[0]
+        seq = (
+            sampler.sample(types.ModelInput.from_ints(prompt_ids), num_samples=1, sampling_params=params)
+            .result()
+            .sequences[0]
+        )
         tokens = prompt_ids + list(seq.tokens)
         probe_datums.append(
             types.Datum(
                 model_input=types.ModelInput.from_ints(tokens[:-1]),
-                loss_fn_inputs={"target_tokens": tokens[1:], "weights": [0.0] * (len(prompt_ids) - 1) + [1.0] * len(seq.tokens)},
+                loss_fn_inputs={
+                    "target_tokens": tokens[1:],
+                    "weights": [0.0] * (len(prompt_ids) - 1) + [1.0] * len(seq.tokens),
+                },
             )
         )
         sampled_logprobs.append(np.asarray(seq.logprobs, dtype=np.float64))
 
     scored = training.forward(probe_datums, "cross_entropy").result()
     deltas, ratios = [], []
-    for datum, sampled, output in zip(probe_datums, sampled_logprobs, scored.loss_fn_outputs):
+    for datum, sampled, output in zip(probe_datums, sampled_logprobs, scored.loss_fn_outputs, strict=True):
         trainer_lp = output["logprobs"].to_numpy().astype(np.float64)
         weights = datum.loss_fn_inputs["weights"].to_numpy()
         completion_lp = trainer_lp[weights > 0]
@@ -152,13 +166,19 @@ def main() -> int:
             f"| max |delta| {np.abs(delta).max():.3f} | mean ratio {np.exp(delta).mean():.4f}"
         )
     all_delta = np.concatenate(deltas)
-    kl_est = float(np.mean(np.exp(all_delta) - 1 - all_delta))  # E_sampler[ratio - 1 - log ratio] (k3 estimator of KL(sampler || trainer))
+    kl_est = float(
+        np.mean(np.exp(all_delta) - 1 - all_delta)
+    )  # E_sampler[ratio - 1 - log ratio] (k3 estimator of KL(sampler || trainer))
     print(
         f"overall: {len(all_delta)} tokens | mean delta {all_delta.mean():+.5f} | mean |delta| {np.abs(all_delta).mean():.5f} "
         f"| kl(sampler||trainer) ~ {kl_est:.5f} | p95 |delta| {np.percentile(np.abs(all_delta), 95):.4f}"
     )
     verdict = "PASS" if np.abs(all_delta).mean() < 0.02 and kl_est < 0.005 else "FAIL"
-    print(f"{verdict}: sampler and trainer agree at the same version" if verdict == "PASS" else f"{verdict}: systematic sampler/trainer gap")
+    print(
+        f"{verdict}: sampler and trainer agree at the same version"
+        if verdict == "PASS"
+        else f"{verdict}: systematic sampler/trainer gap"
+    )
     if not args.keep_model:
         unload_model(base_url, model_id)
     return 0 if verdict == "PASS" else 1

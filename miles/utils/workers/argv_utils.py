@@ -43,8 +43,29 @@ def parse_config_argv(config_cls: type[_ConfigT], argv: list[str] | None) -> _Co
     return config_cls.model_validate_json(args.config_json)
 
 
+def record_field_names(args_obj: object) -> list[str]:
+    """Field names of a dataclass or msgspec Struct record (SGLang's ServerArgs is the latter)."""
+    cls = args_obj if isinstance(args_obj, type) else type(args_obj)
+    if dataclasses.is_dataclass(cls):
+        return [field.name for field in dataclasses.fields(cls)]
+    try:
+        import msgspec
+
+        if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
+            return [field.name for field in msgspec.structs.fields(cls)]
+    except ImportError:
+        pass
+    # SGLang exposes its own helper that handles both record kinds without a hard msgspec dependency.
+    try:
+        from sglang.srt.arg_groups.arg_utils import record_fields
+
+        return [field.name for field in record_fields(cls)]
+    except Exception:
+        return []
+
+
 def dataclass_to_values(args_obj: object) -> dict[str, object]:
-    return {field.name: getattr(args_obj, field.name) for field in dataclasses.fields(args_obj)}
+    return {name: getattr(args_obj, name) for name in record_field_names(args_obj)}
 
 
 def render_cli_argv(
@@ -93,9 +114,9 @@ def render_cli_argv(
 
 def _describe_mismatch(parsed: _ArgsT, wanted: _ArgsT, *, uncompared_fields: frozenset[str]) -> str:
     return ", ".join(
-        f"{field.name}: parsed {getattr(parsed, field.name)!r} != wanted {getattr(wanted, field.name)!r}"
-        for field in dataclasses.fields(wanted)
-        if field.name not in uncompared_fields and getattr(parsed, field.name) != getattr(wanted, field.name)
+        f"{name}: parsed {getattr(parsed, name)!r} != wanted {getattr(wanted, name)!r}"
+        for name in record_field_names(wanted)
+        if name not in uncompared_fields and getattr(parsed, name) != getattr(wanted, name)
     )
 
 
