@@ -52,9 +52,7 @@ def test_cross_entropy_is_the_weighted_sum_of_datums(losses):
 def test_masked_out_datums_contribute_nothing_under_dro(losses):
     """DRO's divergence penalty does not vanish with advantage 0; the mask must remove the pad row."""
     real = _batch([[-1.0]], [[1]], rollout_log_probs=[[-1.5]], advantages=[[0.7]])
-    padded = _batch(
-        [[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]]
-    )
+    padded = _batch([[-1.0], [-9.0]], [[1], [0]], rollout_log_probs=[[-1.5], [0.0]], advantages=[[0.7], [0.0]])
     losses.start_per_datum_outputs()
     loss_real, _ = losses.dro_loss_function(Namespace(), *real, None)
     loss_padded, _ = losses.dro_loss_function(Namespace(), *padded, None)

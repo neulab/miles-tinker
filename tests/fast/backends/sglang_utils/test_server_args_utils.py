@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import functools
 import json
 from argparse import Namespace
@@ -17,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 
 from miles.backends.sglang_utils.server_args_utils import parse_server_args_argv, server_args_to_argv
 from miles.backends.sglang_utils.sglang_engine import _compute_server_args
-from miles.utils.workers.argv_utils import _actions_by_dest, _render_action_argv, _resolve_action
+from miles.utils.workers.argv_utils import _actions_by_dest, _render_action_argv, _resolve_action, record_field_names
 
 _FIELDS_WITHOUT_A_RENDERABLE_CLI: dict[str, str] = {
     "custom_sigquit_handler": "A Python-only callable hook; sglang registers no CLI option for it.",
@@ -30,6 +29,18 @@ _FIELDS_WITHOUT_A_RENDERABLE_CLI: dict[str, str] = {
         "The CLI parses a validated per-phase JSON object while ServerArgs holds a CudaGraphConfig "
         "instance, so no generically rendered token parses back to the same value."
     ),
+    "grpc_worker_threads": "Declared no_cli in current sglang; sglang registers no CLI option for it.",
+    "_radix_eviction_policy_explicitly_set": "Declared no_cli in current sglang; sglang registers no CLI option for it.",
+    "_swa_full_tokens_ratio_explicitly_set": "Declared no_cli in current sglang; sglang registers no CLI option for it.",
+    "speculative_boundary_reduction": "Declared no_cli in current sglang; sglang registers no CLI option for it.",
+    "enable_cp_tp_group_sharing": "Declared no_cli in current sglang; sglang registers no CLI option for it.",
+    "watermark_key": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_key_b": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_context_window": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_mixing_probability": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_max_probability": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_default_enabled": "Nested watermark config field; sglang registers no flat CLI option for it.",
+    "watermark_enforce_all": "Nested watermark config field; sglang registers no flat CLI option for it.",
 }
 
 
@@ -71,9 +82,9 @@ def _assert_roundtrips(server_args_dict: dict) -> None:
     parsed = parse_server_args_argv(server_args_to_argv(server_args_dict))
     wanted = ServerArgs(**server_args_dict)
     differing = [
-        field.name
-        for field in dataclasses.fields(wanted)
-        if getattr(parsed, field.name) != getattr(wanted, field.name)
+        name
+        for name in record_field_names(wanted)
+        if getattr(parsed, name) != getattr(wanted, name) and not (name == "device" and wanted.device is None)
     ]
     assert differing == []
 
@@ -93,7 +104,7 @@ class TestServerArgsToArgv:
 
     def test_an_unspecified_device_renders_the_auto_detected_accelerator(self, monkeypatch):
         """An unset device renders the accelerator chosen by ServerArgs instead of the text None."""
-        monkeypatch.setattr("sglang.srt.server_args.get_device", lambda: "cuda")
+        monkeypatch.setattr("sglang.srt.arg_groups.serving_hook.get_device", lambda: "cuda")
         server_args = _server_args(sglang_overrides={"device": None})
         argv = server_args_to_argv(server_args)
 
@@ -143,13 +154,17 @@ class TestServerArgsToArgv:
             num_gpus_per_engine=2,
         )
         expected = ServerArgs(**server_args)
+        expected.resolve_once()
+        expected_resolved = expected.resolved_dict()
         argv = server_args_to_argv(server_args)
         parsed = parse_server_args_argv(argv)
+        parsed.resolve_once()
+        parsed_resolved = parsed.resolved_dict()
 
         assert "--schedule-conservativeness" not in argv
         assert argv[argv.index("--chunked-prefill-size") + 1] == "4096"
-        assert parsed.schedule_conservativeness == expected.schedule_conservativeness == 0.3
-        assert parsed.chunked_prefill_size == expected.chunked_prefill_size == 2048
+        assert parsed_resolved["schedule_conservativeness"] == expected_resolved["schedule_conservativeness"] == 0.3
+        assert parsed_resolved["chunked_prefill_size"] == expected_resolved["chunked_prefill_size"] == 2048
         _assert_roundtrips(server_args)
 
     def test_sglang_overrides_roundtrip(self):
@@ -208,14 +223,14 @@ class TestEveryServerArgsFieldIsRenderable:
         [
             (
                 pytest.param(
-                    field.name,
-                    marks=pytest.mark.xfail(reason=_FIELDS_WITHOUT_A_RENDERABLE_CLI[field.name], strict=True),
-                    id=field.name,
+                    name,
+                    marks=pytest.mark.xfail(reason=_FIELDS_WITHOUT_A_RENDERABLE_CLI[name], strict=True),
+                    id=name,
                 )
-                if field.name in _FIELDS_WITHOUT_A_RENDERABLE_CLI
-                else pytest.param(field.name, id=field.name)
+                if name in _FIELDS_WITHOUT_A_RENDERABLE_CLI
+                else pytest.param(name, id=name)
             )
-            for field in dataclasses.fields(ServerArgs)
+            for name in record_field_names(ServerArgs)
         ],
     )
     def test_a_field_renders_to_argv_that_parses_back_to_the_same_value(self, field_name: str) -> None:

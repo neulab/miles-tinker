@@ -8,9 +8,13 @@ _ALWAYS_RENDER_FIELDS = ("trust_remote_code", "model_path", "host", "port", "dev
 
 
 def server_args_to_argv(server_args_dict: dict) -> list[str]:
+    expected = ServerArgs(**server_args_dict)
+    expected.resolve_once()
+    resolved = expected.resolved_dict()
+    values = {**server_args_dict, "device": resolved.get("device", server_args_dict.get("device"))}
     return render_cli_argv(
-        server_args_dict,
-        expected_obj=ServerArgs(**server_args_dict),
+        values,
+        expected_obj=ServerArgs(**values),
         make_parser=_make_cli_parser,
         from_parsed=ServerArgs.from_cli_args,
         always_render_fields=_ALWAYS_RENDER_FIELDS,

@@ -23,13 +23,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
-
 import argparse
 import os
 import sys
 import time
 from pathlib import Path
+
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
 
 os.environ.setdefault("TINKER_API_KEY", "tml-local")
 os.environ.setdefault("HF_HOME", "/groups/gai51740/aci18912it/rasp/cache/huggingface")
@@ -66,7 +66,7 @@ def resolve_base_url(args: argparse.Namespace) -> str:
 def make_datums(tokenizer) -> list[types.Datum]:
     """Prompt + completion datums with the completion weighted 1.0 (cross_entropy inputs)."""
     datums = []
-    for prompt, target in zip(PROMPTS, TARGETS):
+    for prompt, target in zip(PROMPTS, TARGETS, strict=True):
         prompt_ids = tokenizer.encode(prompt)
         target_ids = tokenizer.encode(target)
         tokens = prompt_ids + target_ids
@@ -88,7 +88,8 @@ def train_rounds(checks: Checks, client, datums: list[types.Datum], steps: int, 
         fb = fb_future.result()
         optim = optim_future.result()
         lengths_ok = all(
-            len(out["logprobs"].to_numpy()) == datum.model_input.length for out, datum in zip(fb.loss_fn_outputs, datums)
+            len(out["logprobs"].to_numpy()) == datum.model_input.length
+            for out, datum in zip(fb.loss_fn_outputs, datums, strict=True)
         )
         checks.check(
             f"{label} forward_backward {step}",
@@ -115,7 +116,9 @@ def check_stop_ids(checks: Checks, tokenizer, sampling_client) -> None:
     stop_ids = [tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.eos_token_id]
     seq = sample_once(sampling_client, chat_prompt(tokenizer, "Reply with only the word OK."), stop=stop_ids)
     if seq.stop_reason != "stop":
-        checks.warn("sample with stop token ids", f"stop_reason={seq.stop_reason}; model did not stop within max_tokens")
+        checks.warn(
+            "sample with stop token ids", f"stop_reason={seq.stop_reason}; model did not stop within max_tokens"
+        )
         return
     checks.check(
         "sample with stop token ids returns the stop token",
@@ -153,7 +156,11 @@ def main() -> int:
     parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--steps", type=int, default=3)
-    parser.add_argument("--unload-before-resume", action="store_true", help="free the first model before resuming (full fine-tuning gateways serve one model at a time)")
+    parser.add_argument(
+        "--unload-before-resume",
+        action="store_true",
+        help="free the first model before resuming (full fine-tuning gateways serve one model at a time)",
+    )
     args = parser.parse_args()
     base_url = resolve_base_url(args)
     checks = Checks()
@@ -162,7 +169,11 @@ def main() -> int:
     service = tinker.ServiceClient(base_url=base_url)
     client = service.create_lora_training_client(base_model=args.base_model, rank=args.lora_rank)
     info = client.get_info()
-    checks.check("create_lora_training_client", bool(info.model_id), f"model_id={info.model_id} is_lora={info.is_lora} rank={info.lora_rank}")
+    checks.check(
+        "create_lora_training_client",
+        bool(info.model_id),
+        f"model_id={info.model_id} is_lora={info.is_lora} rank={info.lora_rank}",
+    )
     tokenizer = client.get_tokenizer()
     datums = make_datums(tokenizer)
 

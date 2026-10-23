@@ -435,6 +435,9 @@ class TrainerController:
     async def discard_grads(self, slot: int) -> None:
         await self._execute_slots("discard_grads", slot=slot)
 
+    async def reconcile_adapters(self) -> None:
+        await asyncio.gather(*[cell.execute("reconcile_adapters") for cell in self._cells])
+
     async def push_slot(self, slot: int, lora_name: str, rank: int, alpha: float) -> int | None:
         """Publish a slot to the engines; answers the engine weight version (full fine-tuning) or None (LoRA)."""
         info = await self._inference_controller.start_update_weights()

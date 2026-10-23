@@ -262,8 +262,9 @@ def test_sglang_parallel_sizes_keep_server_args_destinations():
 class TestEvalSglangOverrides:
     """Unset means "inherit --sglang-*", so an unset flag must leave no attribute at all."""
 
-    def _parse(self, argv):
-        return add_sglang_arguments(argparse.ArgumentParser()).parse_args(argv)
+    def _parse(self, argv, *, allow_abbrev=True):
+        parser = add_sglang_arguments(argparse.ArgumentParser(allow_abbrev=allow_abbrev))
+        return parser.parse_args(argv)
 
     def test_unset_flags_produce_no_overrides(self):
         args = self._parse(["--sglang-mem-fraction-static", "0.7"])
@@ -278,7 +279,9 @@ class TestEvalSglangOverrides:
         assert args.sglang_mem_fraction_static == 0.7
 
     def test_boolean_can_be_turned_back_off(self):
-        args = self._parse(["--sglang-enable-dp-attention", "--no-eval-sglang-enable-dp-attention"])
+        args = self._parse(
+            ["--sglang-enable-dp-attention", "--no-eval-sglang-enable-dp-attention"], allow_abbrev=False
+        )
 
         assert args.sglang_enable_dp_attention is True
         assert collect_eval_sglang_overrides(args) == {"enable_dp_attention": False}
@@ -1275,6 +1278,34 @@ class TestValidateSkipActorForwardOnly:
                 use_dynamic_global_batch_size=True,
             )
         )
+
+
+class TestRefillGranularity:
+    def _parse(self, size):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(
+            [
+                "--num-rollout",
+                "1",
+                "--rollout-batch-size",
+                "32",
+                "--over-sampling-batch-size",
+                str(size),
+            ]
+        )
+
+    @pytest.mark.parametrize("size", [1, 8, 32, 64])
+    def test_positive_refill_granularity_is_independent_of_batch(self, size):
+        args = self._parse(size)
+        miles_validate_args(args)
+        assert args.rollout_batch_size == 32
+        assert args.over_sampling_batch_size == size
+
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_nonpositive_refills_are_rejected(self, size):
+        with pytest.raises(AssertionError, match="over_sampling_batch_size must be positive"):
+            miles_validate_args(self._parse(size))
 
 
 class TestRunUuidResolution:

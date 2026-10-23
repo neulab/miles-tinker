@@ -59,7 +59,14 @@ def client_steps(log_path: Path | None) -> dict[int, dict]:
         match = re.search(r"stats_logger \|\s+([\w/.@-]+): ([-\d.]+)$", line)
         if match and current is not None:
             key, value = match.groups()
-            if key in ("task_reward/avg", "elapsed_seconds", "grad_norm", "kl_sample_train_v1", "optim/grad_norm", "optim/kl_sample_train_v1"):
+            if key in (
+                "task_reward/avg",
+                "elapsed_seconds",
+                "grad_norm",
+                "kl_sample_train_v1",
+                "optim/grad_norm",
+                "optim/kl_sample_train_v1",
+            ):
                 try:
                     steps[current][key] = float(value)
                 except ValueError:
@@ -84,7 +91,9 @@ def main() -> None:
     client = client_steps(Path(args.client_log) if args.client_log else None)
 
     print(f"slot {slot}: {len(rows)} optimizer steps (records after {args.since:.0f})")
-    print(f"{'step':>4} {'tokens':>8} {'datums':>6} {'train_s':>7} {'mfu%':>5} {'tok/s':>8} {'gap_s':>7} {'grad_norm':>9} {'reward':>7} {'elapsed_s':>9}")
+    print(
+        f"{'step':>4} {'tokens':>8} {'datums':>6} {'train_s':>7} {'mfu%':>5} {'tok/s':>8} {'gap_s':>7} {'grad_norm':>9} {'reward':>7} {'elapsed_s':>9}"
+    )
     gaps = []
     for i, r in enumerate(rows):
         gap = r["time"] - rows[i - 1]["time"] if i else float("nan")
@@ -104,9 +113,13 @@ def main() -> None:
     print("\nsummary")
     print(f"  tokens/step        mean {statistics.mean(tokens):,.0f}  (min {min(tokens):,} max {max(tokens):,})")
     print(f"  train time/step    mean {statistics.mean(train):.2f} s  median {statistics.median(train):.2f} s")
-    print(f"  training MFU       mean {100 * statistics.mean(mfu):.1f}%  median {100 * statistics.median(mfu):.1f}%  (peak {PEAK_TFLOPS_H200:.0f} TFLOPS/GPU x 8)")
+    print(
+        f"  training MFU       mean {100 * statistics.mean(mfu):.1f}%  median {100 * statistics.median(mfu):.1f}%  (peak {PEAK_TFLOPS_H200:.0f} TFLOPS/GPU x 8)"
+    )
     if gaps:
-        print(f"  wall time/step     mean {statistics.mean(gaps):.1f} s  median {statistics.median(gaps):.1f} s  (gap between optimizer steps: rollouts + training + push)")
+        print(
+            f"  wall time/step     mean {statistics.mean(gaps):.1f} s  median {statistics.median(gaps):.1f} s  (gap between optimizer steps: rollouts + training + push)"
+        )
         print(f"  training share     {100 * sum(train[1:]) / sum(gaps):.1f}% of wall time")
     if client:
         rewards = [c["task_reward/avg"] for c in client.values() if "task_reward/avg" in c]

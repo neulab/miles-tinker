@@ -26,14 +26,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
-
 import argparse
 import json
 import os
 import random
 import time
 from pathlib import Path
+
+import hostguard  # noqa: E402,F401  (refuses login nodes; MILES_ALLOW_LOGIN_NODE=1 overrides)
 
 os.environ.setdefault("TINKER_API_KEY", "tml-mfu-bench")
 os.environ.setdefault("HF_HOME", "/groups/gai51740/aci18912it/rasp/cache/huggingface")
@@ -116,7 +116,9 @@ def main() -> None:
     tokens_per_step = args.num_datums * args.seq_len
     adam = types.AdamParams(learning_rate=args.learning_rate)
     perf_path = Path(args.perf_jsonl) if args.perf_jsonl else None
-    print(f"bench: {args.num_datums} datums x {args.seq_len} tokens = {tokens_per_step} tokens/step, loss {args.loss_fn}")
+    print(
+        f"bench: {args.num_datums} datums x {args.seq_len} tokens = {tokens_per_step} tokens/step, loss {args.loss_fn}"
+    )
 
     for step in range(args.steps + 1):
         started = time.time()

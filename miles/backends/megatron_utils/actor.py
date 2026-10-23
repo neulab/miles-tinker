@@ -502,6 +502,11 @@ class MegatronTrainRayActor(TrainRayActor):
             lora_executor.discard_grads(self.model, slot)
 
     @with_logs
+    def reconcile_adapters(self) -> None:
+        """No-op in the fork's slot model: adapters are pushed/unloaded explicitly via push_slot/unload_adapter."""
+        self._heartbeat.bump()
+
+    @with_logs
     @event_logger_context(
         lambda _self, rollout_id, rollout_data_ref, witness_info=None, attempt=0, external_data=None: dict(
             rollout_id=rollout_id, attempt=attempt

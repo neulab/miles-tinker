@@ -313,7 +313,7 @@ def _train(args: ScriptArgs):
                 "--sglang-mem-fraction-static 0.80 "
                 "--sglang-max-running-requests 128 "
                 "--sglang-max-total-tokens 655360 "
-                "--sglang-cuda-graph-max-bs 128 "
+                "--sglang-cuda-graph-max-bs-decode 128 "
             )
         else:
             sglang_args = (
@@ -342,7 +342,7 @@ def _train(args: ScriptArgs):
             "--sglang-mem-fraction-static 0.65 "
             "--sglang-max-running-requests 32 "
             "--sglang-max-total-tokens 320000 "
-            "--sglang-cuda-graph-max-bs 64 "
+            "--sglang-cuda-graph-max-bs-decode 64 "
             "--sglang-max-mamba-cache-size 256 "
         )
         if args.rollout_num_gpus_per_engine >= 16:
