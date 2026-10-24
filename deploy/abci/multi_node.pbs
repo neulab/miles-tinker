@@ -1,0 +1,231 @@
+#!/bin/bash
+#PBS -P gai51740
+#PBS -q R9920261300
+#PBS -v RTYPE=rt_HF,USE_SSH=1
+#PBS -l select=2:mpiprocs=8
+#PBS -l place=scatter
+#PBS -l walltime=54:00:00
+#PBS -N my_job
+#PBS -j oe
+
+# Settings: edit these and the node count in #PBS -l select above.
+MODEL_ID=Qwen/Qwen3-4B-Instruct-2507
+MODEL_TYPE=qwen3-4B-Instruct-2507
+TRAIN_GPUS=8                 # Total GPUs shared by actor and critic.
+TRAIN_NODES=1                # TRAIN_GPUS must divide evenly across these.
+ROLLOUT_GPUS=8               # Total inference GPUs.
+ROLLOUT_GPUS_PER_ENGINE=1
+ENABLE_CRITIC=true
+OFFLOAD_TRAIN=true
+TP=1
+PP=1
+CP=1                        # Keep 1 when the critic is enabled.
+CONTEXT_LENGTH=66000
+MAX_TOKENS_PER_GPU=65000
+INFERENCE_MEM_FRACTION=0.95
+
+set -euo pipefail
+umask 077
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load singularity-ce/4.4.1 2>/dev/null || true
+
+# Paths and logs.
+PROJECT_ROOT=${PROJECT_ROOT:-$HOME/miles-env}
+SIF=${MILES_SIF:-$PROJECT_ROOT/images/miles-sglang-a359142-cu13.sif}
+ROOTFS=$PROJECT_ROOT/rootfs
+MILES_SRC=${MILES_SRC:-$HOME/miles}
+EXTRA_SITE=$PROJECT_ROOT/extra-site
+HF_HOME=$PROJECT_ROOT/hf-home
+HF_SNAPSHOT=$PROJECT_ROOT/models/$MODEL_ID
+JOBDIR=$PROJECT_ROOT/jobs/tinker-$PBS_JOBID
+NODE_LOCAL=$PBS_LOCALDIR/miles
+TINKER_PORT=${TINKER_PORT:-10613}
+RAY_PORT=6379; DASH_PORT=8265
+mkdir -p "$JOBDIR" "$PROJECT_ROOT/checkpoints"
+declare -p MODEL_ID MODEL_TYPE TRAIN_GPUS TRAIN_NODES ROLLOUT_GPUS \
+  ROLLOUT_GPUS_PER_ENGINE ENABLE_CRITIC OFFLOAD_TRAIN TP PP CP \
+  CONTEXT_LENGTH MAX_TOKENS_PER_GPU INFERENCE_MEM_FRACTION > "$JOBDIR/server-args.sh"
+export TMPDIR=$NODE_LOCAL/tmp SINGULARITY_TMPDIR=$NODE_LOCAL/singularity-tmp
+export SINGULARITY_CACHEDIR=$NODE_LOCAL/singularity-cache
+mkdir -p "$TMPDIR" "$SINGULARITY_TMPDIR" "$SINGULARITY_CACHEDIR"
+
+# Find the allocated nodes and their InfiniBand network addresses.
+awk '!seen[$1]++ { printf "%s\t%d\n", $1, NR-1 }' "$PBS_NODEFILE" > "$JOBDIR/nodes.tsv"
+mapfile -t HOSTS < <(cut -f1 "$JOBDIR/nodes.tsv"); mapfile -t VIDX < <(cut -f2 "$JOBDIR/nodes.tsv")
+# The node's own hostname resolves to an IPv6 link-local address on the node itself, so pick the
+# IPoIB hostname network (10.0.x.y) from the interface list instead of getent.
+node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}'; }
+node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
+HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
+exec >> "$JOBDIR/launcher.log" 2>&1
+echo "job=$PBS_JOBID head=$HEAD_HOST nodes=${HOSTS[*]} port=$TINKER_PORT"
+EXPECTED_GPUS=$((8 * ${#HOSTS[@]}))
+
+# Same GPU container on both nodes; container /tmp is backed by local scratch.
+export NVIDIA_VISIBLE_DEVICES=all     # nvidia-container-cli + --contain: required or no GPUs are visible
+CONTAINER_ARGS=(
+  --nv --cleanenv --containall --no-mount cwd
+  --bind /dev/infiniband:/dev/infiniband
+  --bind "$NODE_LOCAL/tmp:/tmp"
+  --home "$ROOTFS:/root"
+  --bind "$MILES_SRC:/root/miles"
+  --bind "$PROJECT_ROOT:$PROJECT_ROOT"
+  --pwd /root/miles
+  --env TMPDIR=/tmp --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 --env PYTHONNOUSERSITE=1
+  --env "PYTHONPATH=/root/miles:/root/Megatron-LM:$EXTRA_SITE"
+  --env "HF_HOME=$HF_HOME" --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1
+  --env XDG_CACHE_HOME=/tmp/xdg --env TRITON_CACHE_DIR=/tmp/triton --env TORCHINDUCTOR_CACHE_DIR=/tmp/inductor
+  --env FLASHINFER_WORKSPACE_DIR=/tmp/flashinfer --env TORCH_EXTENSIONS_DIR=/tmp/torch-ext --env CUDA_CACHE_PATH=/tmp/nv-cache
+  --env DG_JIT_CACHE_DIR=/tmp/deepgemm --env RAY_TMPDIR=/tmp/ray --env RAY_memory_monitor_refresh_ms=0
+  --env "NCCL_SOCKET_IFNAME=$IFNAME" --env "GLOO_SOCKET_IFNAME=$IFNAME" --env "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
+  --env TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  --env "MASTER_ADDR=$HEAD_IP" --env CUDA_DEVICE_MAX_CONNECTIONS=1
+  --env "JOBDIR=$JOBDIR"
+)
+printf '%q ' "${CONTAINER_ARGS[@]}" > "$JOBDIR/container_args.txt"
+
+# Create scratch on each node.
+for i in "${!HOSTS[@]}"; do
+  pbsdsh -n "${VIDX[$i]}" -- /bin/bash -c "mkdir -p '$NODE_LOCAL/tmp' && chmod 1777 '$NODE_LOCAL/tmp' && echo init_ok \$(hostname -s)"
+done
+
+# Ray worker and head commands (inside the containers).
+cat > "$JOBDIR/worker-inner.sh" <<'EOF'
+#!/bin/bash
+set -uo pipefail
+for t in $(seq 1 60); do
+  ray start --address="$HEAD_IP:$RAY_PORT" --node-ip-address="$WORKER_IP" --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats --block && break
+  echo "worker join retry $t"; sleep 10
+done
+EOF
+cat > "$JOBDIR/head-inner.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+ray start --head --node-ip-address="$HEAD_IP" --port="$RAY_PORT" --dashboard-host=127.0.0.1 --dashboard-port="$DASH_PORT" \
+          --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats
+for t in $(seq 1 90); do ray status 2>/dev/null | grep -Fq "/${EXPECTED_GPUS}.0 GPU" && break; echo "waiting for $EXPECTED_GPUS GPUs ($t/90)"; sleep 10; done
+ray status | grep -Fq "/${EXPECTED_GPUS}.0 GPU" || { echo "worker never joined" >&2; ray status; exit 1; }
+source "$JOBDIR/server-args.sh"
+export RAY_ADDRESS=$HEAD_IP:$RAY_PORT
+MODEL_FLAGS=$(python -m miles.utils.external_utils.model_args_utils "$MODEL_TYPE")
+read -r -a MODEL_ARGS <<< "$MODEL_FLAGS"
+PPO_ARGS=()
+if [[ $ENABLE_CRITIC == true ]]; then PPO_ARGS+=(--tinker-enable-critic); fi
+if [[ $OFFLOAD_TRAIN == true ]]; then
+  PPO_ARGS+=(--offload-train)
+else
+  PPO_ARGS+=(--no-offload-train)
+fi
+exec python serve_tinker.py "${MODEL_ARGS[@]}" "${PPO_ARGS[@]}" \
+  --hf-checkpoint "$HF_SNAPSHOT" --megatron-to-hf-mode bridge \
+  --tinker-base-model "$MODEL_ID" --tinker-train-mode full \
+  --tinker-server-port "$TINKER_PORT" \
+  --tinker-checkpoint-root "$CHECKPOINT_ROOT" --tinker-checkpoints-to-keep 3 \
+  --tinker-unit-token-budget 1048576 --tinker-coalesce-wait-s 1.0 \
+  --tinker-max-concurrent-samples 512 \
+  --num-gpus-per-node 8 --actor-num-nodes "$TRAIN_NODES" \
+  --actor-num-gpus-per-node "$((TRAIN_GPUS / TRAIN_NODES))" \
+  --rollout-num-gpus "$ROLLOUT_GPUS" --rollout-num-gpus-per-engine "$ROLLOUT_GPUS_PER_ENGINE" \
+  --tensor-model-parallel-size "$TP" --pipeline-model-parallel-size "$PP" --context-parallel-size "$CP" \
+  --use-dynamic-batch-size --max-tokens-per-gpu "$MAX_TOKENS_PER_GPU" \
+  --log-probs-chunk-size 8192 \
+  --sglang-context-length "$CONTEXT_LENGTH" --sglang-mem-fraction-static "$INFERENCE_MEM_FRACTION" \
+  --sglang-chunked-prefill-size 4096 --sglang-max-running-requests 128 \
+  --pause-generation-mode retract --update-weight-buffer-size 1073741824 \
+  --bf16 --optimizer adam --lr 1e-6 --seed 1234 \
+  --attention-dropout 0.0 --hidden-dropout 0.0 \
+  --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash \
+  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
+  --balance-data
+EOF
+chmod +x "$JOBDIR/worker-inner.sh" "$JOBDIR/head-inner.sh"
+
+# Worker command, reused on each additional node.
+cat > "$JOBDIR/worker.sh" <<EOF
+exec >> "$JOBDIR/worker-\$(hostname -s).log" 2>&1
+ulimit -n \$(ulimit -Hn) 2>/dev/null || true; ulimit -s unlimited 2>/dev/null || true
+export NVIDIA_VISIBLE_DEVICES=all
+export TMPDIR="$NODE_LOCAL/tmp" SINGULARITY_TMPDIR="$NODE_LOCAL/singularity-tmp"
+export SINGULARITY_CACHEDIR="$NODE_LOCAL/singularity-cache"
+mkdir -p "\$SINGULARITY_TMPDIR" "\$SINGULARITY_CACHEDIR"
+WORKER_IP=\$(ip -o -4 addr show | awk '\$4 ~ /^10\\.0\\./ {split(\$4, a, "/"); print a[1]; exit}')
+echo "worker \$(hostname -s) ip=\$WORKER_IP joining $HEAD_IP:$RAY_PORT \$(date)"
+exec /usr/bin/singularity exec $(cat "$JOBDIR/container_args.txt") \\
+  --env HEAD_IP=$HEAD_IP --env RAY_PORT=$RAY_PORT --env WORKER_IP=\$WORKER_IP \\
+  "$SIF" /bin/bash "$JOBDIR/worker-inner.sh"
+EOF
+HEAD_PID= RELAY_PID=
+WORKER_PIDS=()
+cleanup() {
+  local status=$?
+  trap - EXIT TERM INT
+  for pid in "$RELAY_PID" "$HEAD_PID" "${WORKER_PIDS[@]}"; do
+    [[ -z $pid ]] || kill -TERM "$pid" 2>/dev/null || true
+  done
+  # Allow the relay to remove its sandbox. PBS reaps remaining node processes.
+  if [[ -n $RELAY_PID ]]; then
+    for ((i=0; i<30; i++)); do
+      kill -0 "$RELAY_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "$RELAY_PID" 2>/dev/null || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
+
+for ((i=1; i<${#HOSTS[@]}; i++)); do
+  pbsdsh -n "${VIDX[$i]}" -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$HOME" \
+    /bin/bash "$JOBDIR/worker.sh" > "$JOBDIR/ray-worker-${HOSTS[$i]}.log" 2>&1 &
+  WORKER_PIDS+=("$!")
+done
+
+# Start the head container and server.
+/usr/bin/singularity exec "${CONTAINER_ARGS[@]}" \
+  --env "HEAD_IP=$HEAD_IP,RAY_PORT=$RAY_PORT,DASH_PORT=$DASH_PORT,EXPECTED_GPUS=$EXPECTED_GPUS" \
+  --env "TINKER_PORT=$TINKER_PORT,HF_SNAPSHOT=$HF_SNAPSHOT" \
+  --env "CHECKPOINT_ROOT=$PROJECT_ROOT/checkpoints" \
+  "$SIF" /bin/bash "$JOBDIR/head-inner.sh" > "$JOBDIR/head.log" 2>&1 &
+HEAD_PID=$!
+
+# Wait for model loading before starting the relay.
+for ((i=0; i<360; i++)); do
+  curl -sf --noproxy '*' --max-time 5 "http://127.0.0.1:$TINKER_PORT/health" >/dev/null && break
+  kill -0 "$HEAD_PID" "${WORKER_PIDS[@]}" || exit 1
+  sleep 5
+done
+curl -sf --noproxy '*' --max-time 5 "http://127.0.0.1:$TINKER_PORT/health" >/dev/null
+module load python/3.12/3.12.9
+# One initial attempt plus three retries if the relay fails.
+run_relay() (
+  trap - EXIT
+  relay_child=
+  stop_relay() {
+    trap '' TERM INT
+    if [[ -n $relay_child ]]; then
+      kill -TERM "$relay_child" 2>/dev/null || true
+      wait "$relay_child" || true
+    fi
+    exit 143
+  }
+  trap stop_relay TERM INT
+  for attempt in 1 2 3 4; do
+    echo "Starting Modal relay (attempt $attempt/4)"
+    "$PROJECT_ROOT/venvs/modal/bin/python" -u "$MILES_SRC/tools/amd_tinker_modal.py" \
+      --root "$JOBDIR/relay" --port "$TINKER_PORT" --ssh-over-tls &
+    relay_child=$!
+    if wait "$relay_child"; then exit 0; fi
+    relay_child=
+    if ((attempt == 4)); then
+      echo "Modal relay failed after four attempts."
+      exit 1
+    fi
+    echo "Relay failed; retrying in 10 seconds."
+    sleep 10
+  done
+)
+run_relay > "$JOBDIR/relay.log" 2>&1 &
+RELAY_PID=$!
+echo "Server running; relay URL and key will appear in $JOBDIR/relay.log"
+wait -n "$HEAD_PID" "${WORKER_PIDS[@]}" "$RELAY_PID" || true
+exit 1

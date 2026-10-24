@@ -126,6 +126,8 @@ SERVER_ARGS=(
   --tinker-enable-critic --offload-train
   --tinker-server-port 10613
   --tinker-checkpoint-root "$CHECKPOINT_ROOT" --tinker-checkpoints-to-keep 3
+  --tinker-unit-token-budget 1048576 --tinker-coalesce-wait-s 1.0
+  --tinker-max-concurrent-samples 512
 
   # GPU allocation and parallelism.
   --num-gpus-per-node 8 --actor-num-nodes 1 --actor-num-gpus-per-node "$TRAIN_GPUS"
@@ -140,7 +142,8 @@ SERVER_ARGS=(
   # Weight transfer.
   --pause-generation-mode retract --update-weight-buffer-size 1073741824
 
-  # Optimizer initialization; the client supplies per-step Adam parameters.
+  # Log-prob memory and optimizer initialization; the client supplies per-step Adam parameters.
+  --log-probs-chunk-size 8192
   --bf16 --optimizer adam --lr 1e-6 --seed 1234
 
   # Precision, activation memory and workload balance.
