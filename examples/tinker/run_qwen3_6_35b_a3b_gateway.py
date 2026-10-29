@@ -2,7 +2,10 @@
 
 The default ``--model-variant 35b-a3b`` retains the existing MoE recipe.
 ``--model-variant 27b`` selects the dense model definition, TP4/EP1 training,
-TP8/EP1 inference, and disables routing replay. ``--model-variant 4b`` is the
+TP8/EP1 inference, and disables routing replay. ``--model-variant 9b`` is
+apurvaga/Qwen3.5-9B-preserve-thinking, the dense Qwen3.5-9B with the
+preserve-thinking template: TP2 training, TP2 engines (four per node), no
+routing replay. ``--model-variant 4b`` is the
 small dense Qwen3.5-4B (same hybrid GDN/attention VL family, built through the
 bridge): TP1 training, one TP1 engine per GPU, no routing replay, and the
 standard lm head (its embeddings are tied, which the fused head rejects). A
@@ -71,7 +74,7 @@ Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
-  --model-variant: ``35b-a3b`` (default), ``27b``, ``4b`` or ``glimmer-30b``; sets
+  --model-variant: ``35b-a3b`` (default), ``27b``, ``9b``, ``4b`` or ``glimmer-30b``; sets
     architecture, model-name, parallelism and routing defaults. Explicit
     overrides still win.
   --mode: ``full`` (full fine-tuning, emits ``--tinker-train-mode full``); ``lora``
@@ -163,6 +166,10 @@ _RECIPES = {
     "35b-a3b": _Recipe("apurvaga/Qwen3.6-35B-A3B-preserve-thinking", "qwen3.6-35B-A3B", 1, 8, 8, True),
     # four KV heads
     "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False, linear_heads=(16, 48), dense=True),
+    # four KV heads, untied embeddings; two GPUs per engine, two KV heads each
+    "9b": _Recipe(
+        "apurvaga/Qwen3.5-9B-preserve-thinking", "qwen3.5-9B", 2, 1, 1, False, rollout_num_gpus_per_engine=2, dense=True
+    ),
     # tied embeddings: the fused head takes the output layer's own weight, so the standard head scores
     "4b": _Recipe(
         "Qwen/Qwen3.5-4B", "qwen3.5-4B", 1, 1, 1, False, fused_lm_head=False, rollout_num_gpus_per_engine=1, dense=True
@@ -204,7 +211,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     mode: str = "full"
-    model_variant: Literal["35b-a3b", "27b", "4b", "glimmer-30b"] = "35b-a3b"
+    model_variant: Literal["35b-a3b", "27b", "9b", "4b", "glimmer-30b"] = "35b-a3b"
     model_name: str | None = None
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"

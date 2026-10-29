@@ -392,6 +392,32 @@ def test_cp_rejects_a_budget_that_cannot_hold_one_row(launcher):
         launcher.ScriptArgs(linear_cp_mode="ringwise")
 
 
+def test_qwen35_9b_recipe(launcher, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(
+        hf_checkpoint="/x/hf",
+        checkpoint_root="/x/ckpt",
+        model_variant="9b",
+        context_len=131072,
+        max_tokens_per_datum=131073,
+        actor_num_nodes=1,
+        rollout_num_gpus=8,
+    )
+    assert captured["megatron_model_type"] == "qwen3.5-9B"
+    argv = shlex.split(captured["train_args"])
+    assert _flag(argv, "--tinker-base-model") == "apurvaga/Qwen3.5-9B-preserve-thinking"
+    # untied embeddings: the fused fp32 head, and fp32 logits on the engines to match it
+    assert "--fused-lm-head-logprobs" in argv and "--sglang-enable-fp32-lm-head" in argv
+    assert "--use-rollout-routing-replay" not in argv
+    assert _flag(argv, "--rollout-num-gpus-per-engine") == "2" and _flag(argv, "--sglang-ep-size") == "1"
+    assert _flag(argv, "--tensor-model-parallel-size") == "2" and _flag(argv, "--max-tokens-per-gpu") == "131073"
+    fields = _server_args_fields()
+    assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+    with pytest.raises(AssertionError, match="no expert routes"):
+        launcher.ScriptArgs(model_variant="9b", routing_replay=True)
+
+
 def test_qwen35_4b_recipe(launcher, monkeypatch):
     captured = {}
     monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
