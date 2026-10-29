@@ -19,7 +19,7 @@ def _format(recording, sandbox):
     return "\n".join(line.rstrip() for line in format_recording(recording, sandbox=sandbox).splitlines()) + "\n"
 
 
-@pytest.mark.parametrize("variant", ["35b-a3b", "27b", "4b"])
+@pytest.mark.parametrize("variant", ["35b-a3b", "27b", "9b", "4b"])
 @pytest.mark.parametrize("entrypoint", ["prepare", "serve"])
 def test_qwen36_gateway_recipe(monkeypatch, tmp_path: Path, variant: str, entrypoint: str):
     freeze_environment(monkeypatch)

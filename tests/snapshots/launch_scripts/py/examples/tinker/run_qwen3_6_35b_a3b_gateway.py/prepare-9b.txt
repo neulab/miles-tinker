@@ -1,0 +1,6 @@
+### 0
+mkdir -p /root/models
+
+### 1
+hf download apurvaga/Qwen3.5-9B-preserve-thinking
+  --local-dir /root/models/Qwen3.5-9B-preserve-thinking
