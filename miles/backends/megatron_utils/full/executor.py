@@ -68,6 +68,7 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
+from miles.utils.memory_utils import clear_memory
 from miles.utils.timer import Timer, timer
 from miles.utils.types import RolloutBatch
 
@@ -126,6 +127,13 @@ def forward_backward(
         per_datum_outputs = drain_per_datum_outputs()
     dumper_phase_util.finalize(model)
     tinker_perf.note_unit(Timer().seq_lens)
+
+    # The last microbatch's logits leave most of the GPU cached in the allocator, and NCCL allocates outside
+    # it, so the loss reduce below can fail with ~0 GB free. Native training clears here through
+    # finalize_model_grads_with_empty_cache; _deferred_finalize moves that check to optim_step.
+    free, total = torch.cuda.mem_get_info()
+    if free / total < 0.1:
+        clear_memory()
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
