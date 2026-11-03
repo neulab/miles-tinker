@@ -127,11 +127,15 @@ def rig(monkeypatch):
             "miles.backends.training_utils.data",
             get_data_iterator=lambda args, model, rollout_data: ([SimpleNamespace(reset=lambda: None)], [1]),
         ),
-        "miles.backends.training_utils.log_utils": _module("miles.backends.training_utils.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}),
+        "miles.backends.training_utils.log_utils": _module(
+            "miles.backends.training_utils.log_utils", aggregate_train_losses=lambda losses, n: {"loss": 1.0}
+        ),
         "miles.backends.training_utils.loss_hub.tinker_losses": _module(
             "miles.backends.training_utils.loss_hub.tinker_losses",
             start_per_datum_outputs=lambda: None,
-            drain_per_datum_outputs=lambda: [{"sample_index": 0, "loss": torch.tensor(1.0), "logprobs": torch.tensor([-1.0])}],
+            drain_per_datum_outputs=lambda: [
+                {"sample_index": 0, "loss": torch.tensor(1.0), "logprobs": torch.tensor([-1.0])}
+            ],
         ),
         "miles.backends.training_utils.parallel": _module(
             "miles.backends.training_utils.parallel",
@@ -501,3 +505,46 @@ def test_the_optimizer_step_is_charged_inside_the_train_timer(rig, monkeypatch):
 
     _, stages = tinker_perf.pop_diagnostics()
     assert stages == {tinker_perf.STAGE_OPTIM: pytest.approx(3.0)}
+
+
+@pytest.mark.parametrize("failure", [None, "exception", "nonfinite_output"])
+def test_mtp_normalizes_once_before_dp_finalize_and_resets_on_discard(rig, monkeypatch, failure):
+    from contextlib import nullcontext
+
+    class Window:
+        def normalize_gradients(self, model, *, dp_group):
+            assert dp_group == "dp"
+            rig.log.append("mtp_normalize")
+            return {"mtp_loss": 2.5, "mtp_tokens": 12}
+
+        def reset(self):
+            rig.log.append("mtp_reset")
+
+    monkeypatch.setattr(rig.executor, "_mtp_window", Window())
+    monkeypatch.setattr(rig.executor.tinker_mtp, "loss_context", lambda enabled: nullcontext())
+    monkeypatch.setattr(
+        rig.executor,
+        "get_parallel_state",
+        lambda: SimpleNamespace(is_pp_last_stage=True, intra_dp=SimpleNamespace(group="dp")),
+    )
+    rig.args.enable_mtp_training = True
+    optimizer = FakeOptimizer()
+    for unit in (1, 2):
+        rig.executor.forward_backward(rig.args, unit, rig.model, optimizer, {})
+    assert "mtp_normalize" not in rig.log and "mtp_reset" not in rig.log
+    if failure == "nonfinite_output":
+        bad = [{"sample_index": 0, "loss": torch.tensor(float("nan")), "logprobs": torch.tensor([-1.0])}]
+        rig.executor._check_per_datum_outputs(3, bad, {})
+    else:
+        rig.executor._state["dirty"] = failure is not None
+    result = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    if failure:
+        assert "mtp_normalize" not in rig.log
+        assert result["skipped"] == 1 and "mtp_loss" not in result
+        if failure == "nonfinite_output":
+            assert result["nonfinite_output"] == 1
+    else:
+        assert rig.log.index("mtp_normalize") < rig.log.index("finalize") < rig.log.index("mtp_reset")
+        assert result["mtp_loss"] == 2.5 and result["mtp_tokens"] == 12
+    assert rig.log.count("mtp_reset") == 1
+    assert rig.executor._state["nonfinite_output"] is False

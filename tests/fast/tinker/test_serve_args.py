@@ -151,7 +151,6 @@ def test_fused_head_accepts_the_recipe():
     [
         (dict(loss_type="sft_loss"), "policy_loss"),
         (dict(true_on_policy_mode=True), "true-on-policy"),
-        (dict(enable_mtp_training=True, mtp_num_layers=1), "MTP"),
         (dict(mtp_num_layers=1), "MTP"),
         (dict(untie_embeddings_and_output_weights=False), "tied"),
     ],
@@ -168,6 +167,29 @@ def test_fused_head_rejects_per_token_loss_before_the_head_check():
 
 def test_fused_head_off_skips_its_checks():
     arguments.validate_tinker_serve_args(_fused_args(fused_lm_head_logprobs=False, mtp_num_layers=1))
+
+
+def test_fused_head_accepts_full_ft_mtp_training():
+    arguments.validate_tinker_serve_args(_fused_args(enable_mtp_training=True, mtp_num_layers=1))
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        (dict(pipeline_model_parallel_size=2), "PP=1"),
+        (dict(context_parallel_size=2), "CP=1"),
+        (dict(mtp_num_layers=0), "mtp-num-layers"),
+        (dict(mtp_num_layers=-1), "mtp-num-layers"),
+        (dict(mtp_loss_scaling_factor=-0.1), "nonnegative"),
+        (dict(mtp_loss_scaling_factor=float("inf")), "finite"),
+        (dict(tinker_train_mode="lora", multi_lora_n_adapters=2, lora_rank=8), "full fine-tuning"),
+    ],
+)
+def test_mtp_rejects_unsupported_executor_configs(overrides, match):
+    settings = dict(enable_mtp_training=True, mtp_num_layers=1)
+    settings.update(overrides)
+    with pytest.raises(AssertionError, match=match):
+        arguments.validate_tinker_serve_args(_fused_args(**settings))
 
 
 # -------- per-datum token cap against the per-rank budget (CP-aware, from radixark/miles #3320) --------

@@ -48,7 +48,7 @@ import torch.distributed as dist
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.optimizer import MegatronOptimizer
 
-from miles.backends.megatron_utils import tinker_perf
+from miles.backends.megatron_utils import tinker_mtp, tinker_perf
 from miles.backends.megatron_utils.adam_params import apply_adam_params, set_clip_grad, should_veto_step
 from miles.backends.megatron_utils.checkpoint import load_checkpoint
 from miles.backends.megatron_utils.cp_model_config import check_per_token_loss_flag
@@ -81,6 +81,7 @@ SAVE_ITERATION = 1
 
 # Single tenant: one accumulation window per process.
 _state = {"pending_finalize": False, "dirty": False, "nonfinite_output": False, "num_updates": 0}
+_mtp_window = tinker_mtp.MTPWindow()
 
 
 def _deferred_finalize(*_args, **_kwargs) -> None:
@@ -124,6 +125,9 @@ def forward_backward(
         # ExitStack, not a nested `with`, only so the R3 fill (the context's __enter__:
         # ~29 GB of int32 routing per step) is timed apart from the pass it wraps.
         with ExitStack() as stack:
+            if getattr(args, "enable_mtp_training", False):
+                stack.enter_context(tinker_mtp.accumulate(_mtp_window))
+                stack.enter_context(tinker_mtp.loss_context(True))
             with tinker_perf.stage(tinker_perf.STAGE_REPLAY_FILL):
                 stack.enter_context(
                     rollout_replay_stage(
@@ -151,6 +155,9 @@ def forward_backward(
 
 def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, adam_params: dict) -> dict:
     nonfinite_output = _state["nonfinite_output"]
+    mtp_metrics = {}
+    if getattr(args, "enable_mtp_training", False) and _state["pending_finalize"] and not _state["dirty"]:
+        mtp_metrics = _mtp_window.normalize_gradients(model, dp_group=get_parallel_state().intra_dp.group)
     with timer(tinker_perf.ACTOR_TRAIN_TIMER), tinker_perf.stage(tinker_perf.STAGE_OPTIM):
         grad_norm, skipped = _step_accumulated_grads(model, optimizer, adam_params)
     if not skipped:
@@ -163,7 +170,7 @@ def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimiz
     }
     if nonfinite_output:
         metrics["nonfinite_output"] = 1
-    return {**metrics, **tinker_perf.pop_optim_window_metrics(args)}
+    return {**metrics, **mtp_metrics, **tinker_perf.pop_optim_window_metrics(args)}
 
 
 def _check_per_datum_outputs(unit_id: int, outputs: list[dict], rollout_data: RolloutBatch) -> list[dict]:
@@ -223,6 +230,7 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
     _state["pending_finalize"] = False
     _state["nonfinite_output"] = False
     _state["dirty"] = False
+    _mtp_window.reset()
 
 
 def save_state(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str) -> None:

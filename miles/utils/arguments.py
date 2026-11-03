@@ -490,7 +490,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Compute target-token logprobs with a fused chunked lm head (fp32 logits per chunk, never a "
-                    "materialized [T, V] tensor); policy_loss only, no entropy, no true-on-policy, no MTP"
+                    "materialized [T, V] tensor); policy_loss and detached MTP CE, no entropy or true-on-policy"
                 ),
             )
             parser.add_argument(

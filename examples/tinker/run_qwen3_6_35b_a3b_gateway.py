@@ -1,4 +1,4 @@
-"""Tinker gateway launcher for Qwen3.6 hybrid GDN/attention models, MTP block unused.
+"""Tinker gateway launcher for Qwen3.6 hybrid GDN/attention models.
 
 The default ``--model-variant 35b-a3b`` retains the existing MoE recipe.
 ``--model-variant 27b`` selects the dense model definition, TP4/EP1 training,
@@ -45,14 +45,16 @@ the HF snapshot is a ``Qwen3_5MoeForConditionalGeneration`` wrapper, which the
 bridge maps to its Qwen3.5-VL MoE provider (language model + vision tower + the
 MTP block read from ``mtp_num_hidden_layers``), so no torch_dist conversion is
 needed. Model args come from ``scripts/models/qwen3.6-35B-A3B.py``; the
-launcher overrides its ``--mtp-num-layers 1`` with ``0`` (argparse last wins)
-and never passes ``--enable-mtp-training``: the engines run without EAGLE, the
-fused lm head cannot serve the MTP block's logits, and one layer of activations
-is saved. The bridge itself derives ``mtp_num_layers=1`` from the HF config, so
+launcher defaults to ``--mtp-num-layers 0`` (argparse last wins), saving the
+MTP training activations. ``--enable-mtp-training`` instead loads and trains
+the checkpoint's MTP block using the fused chunked head. Speculative decoding
+is independent: ``--mtp-speculative-decoding`` enables the pretrained or
+trained MTP draft on the engines and requires routing replay to be disabled.
+The bridge itself derives ``mtp_num_layers=1`` from the HF config, so
 it is ``_apply_bridge_runtime_config`` (miles/backends/megatron_utils/
 model_provider.py) that carries the 0 onto the provider and skips the MTP block;
 the unused HF ``mtp.*`` tensors are never requested by the Megatron-param-driven
-bridge load. The engines load the MTP weights from HF and never use them.
+bridge load when training is disabled.
 
 Numerics are matched across the two sides: the engines run with
 ``--sglang-enable-fp32-lm-head`` and the trainer scores the same fp32 logits
@@ -94,7 +96,8 @@ Args:
     tokens. The gateway gets ``--rollout-max-context-len context_len`` (prompts
     up to ``context_len - 1`` tokens, generation clamped to ``context_len``) and
     the engines ``context_len + 6`` as context length: SGLang refuses a prompt
-    of ``context_length - 6`` tokens or more (``engine_context_length``).
+    of ``context_length - 6`` tokens or more (``engine_context_length``). MTP
+    decoding reserves another three draft tokens on top of that margin.
   --max-tokens-per-datum / --unit-token-budget / --coalesce-wait-s /
     --coalesce-max-wait-s / --max-concurrent-samples / --lease-timeout-s: the
     gateway limits (``--tinker-*`` flags).
@@ -102,6 +105,10 @@ Args:
     --routing-cache-ttl-s / --routing-prefix-stride / --r3-check: R3 knobs.
   --fused-lm-head / --fused-lm-head-chunk-size: the fused fp32 head; with
     ``--no-fused-lm-head`` the trainer falls back to ``--log-probs-chunk-size``.
+  --enable-mtp-training / --mtp-num-layers / --mtp-loss-scaling-factor:
+    opt-in Qwen MTP training at CP1 (one layer, loss factor 0.2); disabled by default.
+  --mtp-speculative-decoding: opt-in EAGLE decoding with two draft steps,
+    top-k 1, and three verification tokens; independent of MTP training.
   --balance-data: Karmarkar-Karp token balancing across DP ranks per unit.
   --recompute-args: Megatron recompute flags (default full uniform, 1 layer).
   --moe-token-dispatcher-type: Megatron MoE dispatcher (``alltoall``).
@@ -125,11 +132,12 @@ Example:
 
   MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
     python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --model-variant 27b \\
-      --actor-num-nodes 2 --rollout-num-gpus 96 --tinker-port 20613
+      --actor-num-nodes 2 --rollout-num-gpus 48 --enable-mtp-training --mtp-speculative-decoding
 """
 
 import shlex
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal
 
 import typer
@@ -157,6 +165,7 @@ class _Recipe:
     tp_sizes: tuple[int, ...] = (1, 2, 4)
     # Whether the bridge's model takes miles' pre-sharded context-parallel rows (Glimmer's slices them again)
     context_parallel: bool = True
+    mtp: bool = True
 
 
 _RECIPES = {
@@ -179,6 +188,7 @@ _RECIPES = {
         dense=True,
         tp_sizes=(1, 2, 4, 8),
         context_parallel=False,
+        mtp=False,
     ),
 }
 
@@ -257,6 +267,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     log_probs_chunk_size: int = 2048  # only without the fused head
     sglang_fp32_lm_head: bool | None = None  # None: follows the trainer head
 
+    # Training the draft and using it for inference are independent opt-ins.
+    enable_mtp_training: bool = False
+    mtp_num_layers: int = 1
+    mtp_loss_scaling_factor: float = 0.2
+    mtp_speculative_decoding: bool = False
+
     # Weight pushes: a full-weight push must drop the engines' prefix cache, so retract.
     pause_generation_mode: str = "retract"
     update_weight_buffer_size: int = 2 * 1024**3
@@ -323,6 +339,16 @@ class ScriptArgs(U.ExecuteTrainConfig):
             f"--cp {self.cp}: the {self.model_variant} model slices its own input for context parallelism, which "
             "miles pre-shards; train it at --cp 1"
         )
+        if self.enable_mtp_training or self.mtp_speculative_decoding:
+            assert recipe.mtp, f"The {self.model_variant} recipe does not support Qwen MTP"
+        if self.enable_mtp_training:
+            assert self.cp == 1, "Tinker MTP training currently requires --cp 1"
+            assert self.mtp_num_layers > 0, "--enable-mtp-training requires --mtp-num-layers > 0"
+            assert (
+                isfinite(self.mtp_loss_scaling_factor) and self.mtp_loss_scaling_factor > 0
+            ), "--mtp-loss-scaling-factor must be finite and positive"
+        if self.mtp_speculative_decoding:
+            assert not self.routing_replay, "MTP speculative decoding requires --no-routing-replay"
         self._resolve_linear_cp_mode(recipe)
         if self.max_tokens_per_gpu is None:
             row = self.context_len + 1
@@ -375,8 +401,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     @property
     def sglang_context_length(self) -> int:
         """The engines' context: the gateway admits prompts up to ``context_len - 1`` tokens and clamps
-        generation to ``context_len``, and SGLang refuses the last 6 tokens of its context to prompts."""
-        return engine_context_length(self.context_len)
+        generation to ``context_len``, and SGLang refuses the last 6 tokens of its context to prompts.
+        EAGLE additionally reserves the three draft tokens configured below."""
+        return engine_context_length(self.context_len) + (3 if self.mtp_speculative_decoding else 0)
 
     @property
     def deterministic_env_vars(self) -> dict[str, str]:
@@ -411,7 +438,9 @@ def serve(args: ScriptArgs):
         f"{args.rollout_num_gpus} rollout GPUs ({args.rollout_num_gpus_per_engine} per engine), "
         f"port {args.tinker_port}, checkpoints {args.checkpoint_root}, "
         f"r3={'on' if args.routing_replay else 'off'}/{args.routing_policy}, "
-        f"fused_lm_head={'on' if args.fused_lm_head else 'off'}"
+        f"fused_lm_head={'on' if args.fused_lm_head else 'off'}, "
+        f"mtp_training={'on' if args.enable_mtp_training else 'off'}, "
+        f"mtp_decoding={'on' if args.mtp_speculative_decoding else 'off'}"
     )
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
@@ -460,9 +489,14 @@ def serve(args: ScriptArgs):
         f"--moe-token-dispatcher-type {args.moe_token_dispatcher_type} "
     )
 
-    # last-wins over the model definition's --mtp-num-layers 1; no --enable-mtp-training.
+    # Last-wins over the model definition; keep the default recipe's MTP block absent.
     # The bridge provider only sees it through _apply_bridge_runtime_config (model_provider.py).
-    mtp_args = "--mtp-num-layers 0 "
+    mtp_args = (
+        f"--enable-mtp-training --mtp-num-layers {args.mtp_num_layers} "
+        f"--mtp-loss-scaling-factor {args.mtp_loss_scaling_factor} "
+        if args.enable_mtp_training
+        else "--mtp-num-layers 0 "
+    )
 
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
@@ -477,6 +511,13 @@ def serve(args: ScriptArgs):
     )
     if args.sglang_max_total_tokens is not None:
         sglang_args += f"--sglang-max-total-tokens {args.sglang_max_total_tokens} "
+    if args.mtp_speculative_decoding:
+        sglang_args += (
+            "--sglang-speculative-algorithm EAGLE "
+            "--sglang-speculative-num-steps 2 --sglang-speculative-eagle-topk 1 "
+            "--sglang-speculative-num-draft-tokens 3 "
+            "--sglang-mamba-radix-cache-strategy extra_buffer "
+        )
 
     update_weight_args = (
         f"--pause-generation-mode {args.pause_generation_mode} "

@@ -29,6 +29,7 @@ from miles.backends.training_utils.loss_hub.fused_lm_head import (
     is_active,
     maybe_activate,
     target_logprobs,
+    vocab_parallel_fused_linear_cross_entropy,
     vocab_parallel_fused_linear_logprobs,
 )
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy
@@ -469,8 +470,8 @@ def test_conditional_forward_when_active():
         assert state.active_weight is other and state.fused_forward_calls == 2
         with pytest.raises(RuntimeError, match="runtime_gather_output"):
             layer.forward(x, runtime_gather_output=True)
-        with pytest.raises(RuntimeError, match="output_cross_entropy_loss"):
-            layer.forward(x, output_cross_entropy_loss=True, labels=x)
+        with pytest.raises(ValueError, match="output_cross_entropy_loss requires labels"):
+            layer.forward(x, output_cross_entropy_loss=True)
         with pytest.raises(RuntimeError, match="unsupported output_layer kwargs"):
             layer.forward(x, labels=x)
     assert not is_active()
@@ -536,6 +537,127 @@ def test_maybe_activate_installs_once_and_sets_chunk_size(monkeypatch):
 def test_maybe_activate_on_a_rank_without_head():
     with maybe_activate(Namespace(fused_lm_head_logprobs=True), [SimpleNamespace(post_process=False)]) as state:
         assert state is None and not is_active()
+
+
+# ---------------------------------------------------------------------------
+# MTP linear cross-entropy interface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chunk", CHUNK_SIZES)
+def test_mtp_cross_entropy_layout_mask_and_gradients(chunk):
+    """MTP supplies shifted labels; the head preserves batch/sequence order and unreduced losses."""
+    g = torch.Generator().manual_seed(12)
+    steps, batch = 7, 3
+    hidden = torch.randn(steps, batch, H, generator=g, requires_grad=True)
+    weight = torch.randn(V, H, generator=g, requires_grad=True)
+    labels = torch.randint(V, (steps, batch), generator=g).transpose(0, 1)
+    # Different prompt and packed-boundary masks in each row expose accidental transposes.
+    mask = torch.tensor([[0, 0, 1, 1, 1, 1, 0], [0, 1, 1, 0, 1, 1, 0], [1, 1, 1, 0, 0, 1, 0]])
+    reference_hidden = hidden.detach().clone().requires_grad_(True)
+    reference_weight = weight.detach().clone().requires_grad_(True)
+    reference = -_reference_logprobs(reference_hidden, reference_weight, labels.transpose(0, 1)).transpose(0, 1)
+
+    losses = vocab_parallel_fused_linear_cross_entropy(hidden, weight, labels, chunk_size=chunk)
+    torch.testing.assert_close(losses, reference, rtol=1e-6, atol=2e-6)
+    assert losses.shape == labels.shape and losses.dtype == torch.float32
+    (losses * mask).sum().backward()
+    (reference * mask).sum().backward()
+
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-5, atol=3e-6)
+    torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=1e-5, atol=3e-6)
+    assert torch.count_nonzero(hidden.grad[mask.transpose(0, 1) == 0]) == 0
+
+
+def test_mtp_cross_entropy_rejects_non_megatron_layout():
+    hidden, weight, labels, _ = _inputs()
+    with pytest.raises(ValueError, match="hidden states \\[S, B, H\\]"):
+        vocab_parallel_fused_linear_cross_entropy(hidden, weight, labels)
+    with pytest.raises(ValueError, match="leading dimensions"):
+        vocab_parallel_fused_linear_cross_entropy(hidden.unsqueeze(1), weight, labels.unsqueeze(1))
+
+
+def test_mtp_frozen_shared_head_does_not_receive_main_grad_or_replace_policy_weight():
+    hidden, w, labels, _ = _inputs(tokens=12)
+    weight = torch.nn.Parameter(w)
+    weight.main_grad = torch.full_like(weight, 0.5, dtype=torch.float32)
+    weight.grad_added_to_main_grad = False
+    model, layer = _fake_output_layer(weight, None, sequence_parallel=False)
+    model.mtp_process = True
+    model.config.mtp_detach_heads = True
+    state = _install_fake(model)
+    state.chunk_size = 5
+    draft_hidden = hidden.reshape(6, 2, H).clone().requires_grad_(True)
+    detached_weight = weight.detach()
+    # Even if a wrapper carries the DDP attributes onto the detached view,
+    # requires_grad=False must prevent writes to the policy's gradient buffer.
+    detached_weight.main_grad = weight.main_grad
+    detached_weight.grad_added_to_main_grad = False
+    with activate(state):
+        layer.forward(hidden.unsqueeze(1))
+        assert state.active_weight is weight
+        mtp_losses = layer.forward(
+            draft_hidden,
+            weight=detached_weight,
+            output_cross_entropy_loss=True,
+            labels=labels.reshape(6, 2).transpose(0, 1),
+        )
+        assert state.active_weight is weight and state.fused_forward_calls == 1
+    mtp_losses.mean().backward()
+
+    assert draft_hidden.grad is not None and torch.count_nonzero(draft_hidden.grad) > 0
+    assert weight.grad is None and detached_weight.grad is None
+    assert weight.grad_added_to_main_grad is False and detached_weight.grad_added_to_main_grad is False
+    torch.testing.assert_close(weight.main_grad, torch.full_like(weight.main_grad, 0.5))
+
+
+def test_mtp_wrapper_uses_explicit_weight_without_setting_policy_state():
+    hidden, w, labels, _ = _inputs(tokens=12)
+    model, layer = _fake_output_layer(torch.nn.Parameter(torch.zeros_like(w)), None, sequence_parallel=False)
+    state = _install_fake(model)
+    state.chunk_size = 5
+    with activate(state):
+        losses = layer.forward(
+            hidden.reshape(6, 2, H),
+            weight=w,
+            output_cross_entropy_loss=True,
+            labels=labels.reshape(6, 2).transpose(0, 1),
+        )
+        assert state.active_weight is None and state.fused_forward_calls == 0
+    expected = -_reference_logprobs(hidden, w, labels).reshape(6, 2).transpose(0, 1)
+    torch.testing.assert_close(losses, expected, rtol=0, atol=1e-6)
+
+
+def test_mtp_cross_entropy_tensor_and_sequence_parallel(monkeypatch):
+    """The MTP CE path uses the same TP vocab reduction and SP reduce-scatter as the policy head."""
+    monkeypatch.setattr(fused_lm_head, "dist", _FakeDist)
+    vocab, steps, batch = 132, 6, 2
+    h, w, flat_labels, upstream = _inputs(seed=14, tokens=steps * batch, vocab=vocab)
+    labels = flat_labels.reshape(steps, batch).transpose(0, 1)
+    ref = _reference_grads(h, w, flat_labels, -upstream)
+    expected = -_reference_logprobs(h, w, flat_labels).reshape(steps, batch).transpose(0, 1)
+    group = _FakeTensorParallel(2)
+    shard, half = vocab // 2, steps // 2
+
+    def rank_fn(rank):
+        weight = torch.nn.Parameter(w[rank * shard : (rank + 1) * shard].clone())
+        model, layer = _fake_output_layer(weight, group, sequence_parallel=True)
+        state = _install_fake(model)
+        state.chunk_size = 5
+        local_hidden = h.reshape(steps, batch, H)[rank * half : (rank + 1) * half].clone().requires_grad_(True)
+        with activate(state):
+            losses = layer.forward(local_hidden, weight=weight.detach(), output_cross_entropy_loss=True, labels=labels)
+        (losses * upstream.reshape(steps, batch).transpose(0, 1)).sum().backward()
+        return losses, local_hidden.grad, weight.grad
+
+    results = _run_ranks(group, rank_fn)
+    partials = _shard_hidden_partials(ref, w, [slice(0, shard), slice(shard, vocab)])
+    reduced = (partials[0] + partials[1]).to(torch.bfloat16).reshape(steps, batch, H)
+    slack = BF16_RTOL * max(p.abs().max() for p in partials)
+    for rank, (losses, hidden_grad, weight_grad) in enumerate(results):
+        torch.testing.assert_close(losses, expected, rtol=0, atol=1e-6)
+        torch.testing.assert_close(hidden_grad, reduced[rank * half : (rank + 1) * half], rtol=BF16_RTOL, atol=slack)
+        assert weight_grad is None
 
 
 # ---------------------------------------------------------------------------
@@ -832,3 +954,29 @@ def test_install_carries_the_muse_transform_to_target_logprobs():
     torch.testing.assert_close(out, _reference_logprobs_transformed(h, w, labels, GLIMMER), **FP32_LOGPROB_TOL)
     # inactive, the head's own forward (here the mixin's) runs unchanged
     assert head.forward(h)[0] is h
+
+
+@pytest.mark.parametrize("transform", TRANSFORMS, ids=lambda t: f"m{t.multiplier:g}-cap{t.softcap}")
+def test_mtp_cross_entropy_preserves_head_transform_and_hidden_gradients(transform):
+    h, w, labels, upstream = _glimmer_scale_inputs(seed=11)
+    hidden = h.float().unsqueeze(1).requires_grad_(True)
+    reference_hidden = hidden.detach().clone().requires_grad_(True)
+    head = _head(
+        _extended(_MuseMixin), output_multiplier=transform.multiplier, final_logit_softcapping=transform.softcap
+    )
+    head.weight = torch.nn.Parameter(w.float())
+    model = SimpleNamespace(
+        post_process=True, mtp_process=True, output_layer=head, config=SimpleNamespace(mtp_detach_heads=True)
+    )
+    state = _install_fake(model)
+    state.chunk_size = 5
+    with activate(state):
+        losses = head.forward(
+            hidden, weight=head.weight.detach(), output_cross_entropy_loss=True, labels=labels.unsqueeze(0)
+        )
+    expected = -_reference_logprobs_transformed(reference_hidden.squeeze(1), w, labels, transform).unsqueeze(0)
+    torch.testing.assert_close(losses, expected, **FP32_LOGPROB_TOL)
+    (losses * upstream).sum().backward()
+    (expected * upstream).sum().backward()
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=2e-5, atol=4e-6)
+    assert head.weight.grad is None

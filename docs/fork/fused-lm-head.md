@@ -78,8 +78,8 @@ without an error. `install` therefore asks which class defines the `forward` the
 (`fused_lm_head.output_transform`):
 
 - Megatron's `ColumnParallelLinear`, and GPTModel's `LinearCrossEntropyModule` (every GPT and Qwen head: its
-  `forward` is `ColumnParallelLinear`'s unless asked for Megatron's fused cross-entropy loss, which the wrapper
-  refuses while active): nothing after the projection.
+  `forward` is `ColumnParallelLinear`'s unless asked for fused cross-entropy loss, which the wrapper
+  implements with chunked CE for MTP): nothing after the projection.
 - megatron-bridge's `MuseGlimmerOutputLayerMixin` (Muse Glimmer, put on the head with `extend_instance`):
   `logits * config.output_multiplier` (0.19611613513818404, 1/sqrt(26)), then
   `final_logit_softcapping * tanh(logits / final_logit_softcapping)` (cap 20).
@@ -101,13 +101,12 @@ a capped logit), the fused head in fp32 (2e-6 against SGLang's fp32 head).
   `--log-probs-chunk-size` is not used while the fused head is active.
 - Requirements checked at install time (`RuntimeError`): exactly one lm head
   per pipeline rank (VPP=1), no lm-head bias, `gather_output=False`, no
-  `disable_grad_reduce`, no `defer_embedding_wgrad_compute`, no MuP, no MTP
-  (`mtp_process`; run with `--mtp-num-layers 0`, the MTP block calls
-  `output_layer` for its own logits), and a head class whose output transform
-  it knows (above).
+  `disable_grad_reduce`, no `defer_embedding_wgrad_compute`, no MuP, and a
+  head class whose output transform it knows (above). An MTP block must use
+  detached heads (`mtp_detach_heads=True`).
 - Unsupported while active (`AssertionError`/`RuntimeError`): entropy
   (`use_rollout_entropy`), `--true-on-policy-mode`, sampling masks,
-  `runtime_gather_output`, `output_cross_entropy_loss` (Megatron's fused CE).
+  `runtime_gather_output`. MTP's `output_cross_entropy_loss` uses chunked CE.
   The Tinker losses use none of them; serve-time validation should reject the
   combinations (`validate_tinker_serve_args`).
 - Activation is scoped: `fused_lm_head.maybe_activate(args, model)` wraps the
@@ -117,6 +116,52 @@ a capped logit), the fused head in fp32 (2e-6 against SGLang's fp32 head).
   forward (sampler pushes, checkpointing and the LoRA executor are untouched).
   The wrapper is installed lazily on the first activated call and is
   idempotent.
+
+## MTP training
+
+The Tinker full-fine-tuning path can train the checkpoint's MTP block while
+keeping this memory-efficient policy head. MTP uses a separate chunked
+target-logprob loss rather than asking the policy wrapper to return a full
+vocabulary tensor. Policy hidden states and the shared embedding/output-head
+weights are detached on the draft path, so its auxiliary next-token loss
+updates the MTP block without introducing an imitation gradient into the main
+policy.
+
+`--mtp-loss-scaling-factor` weights a token-mean draft loss over the entire
+optimizer window. Its normalization is independent of how clients split data
+across `forward_backward` calls or how the server packs microbatches. This
+is separate from the Tinker policy loss and its caller-supplied weights.
+Only targets with nonzero client weights or advantages participate; prompt,
+tool-observation, padding, and zero-advantage positions are excluded. Masks
+are aligned to Miles' next-token prediction rows before the extra MTP shift.
+`optim/mtp_loss` reports unscaled draft cross-entropy and `optim/mtp_tokens`
+counts the supervised future-token targets in the optimizer window.
+
+Gradient clipping follows the Megatron runtime: recent versions tag detached
+MTP parameters with `grad_norm_group='mtp'` and clip them separately. Older
+versions with a shared clipping norm can couple the policy's update magnitude
+to the draft gradient despite the detached loss.
+
+The initial MTP integration supports full fine-tuning with pipeline and context
+parallelism both set to 1; the ordinary policy path still supports context
+parallelism greater than 1. It requires a Megatron runtime whose MTP loss path
+accepts a linear-cross-entropy implementation hook; older runtimes fail the
+capability check instead of falling back to a full-vocabulary allocation.
+
+MTP training and speculative inference are independent. In the Qwen gateway
+launcher, `--enable-mtp-training` enables one MTP layer by default;
+`--mtp-speculative-decoding` separately enables the SGLang draft. Leave
+training disabled to benchmark the frozen pretrained draft. When training is
+enabled, weight pushes include the updated MTP weights. With no trainer MTP
+block, Miles updates the target model and leaves the draft block frozen.
+
+The Qwen3.6-27B recipe is selected by `--model-variant 27b`. Speculative
+decoding requires routing replay to be off; the dense recipe already does
+that. Enabling MTP changes checkpoint contents and optimizer state, so an
+existing checkpoint saved without the MTP block needs explicit migration or
+a fresh initialization. A production canary should check accepted draft
+length and throughput before and after a weight push, target logprobs,
+long-context memory use, and save/resume before replacing a running job.
 
 ## Validation
 

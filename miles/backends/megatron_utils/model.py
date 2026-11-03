@@ -521,13 +521,18 @@ def run_forward_backward_pass(args, dumper_phase_util, data_iterator, model, num
                 loss_mask=batch["full_loss_masks"],
             )
         else:
+            mtp_loss_mask = batch["full_loss_masks"]
+            if getattr(args, "enable_mtp_training", False) and batch.get("loss_fn") is not None:
+                from miles.backends.megatron_utils.tinker_mtp import target_mask
+
+                mtp_loss_mask = target_mask(batch, qkv_format=args.qkv_format)
             forward_kwargs = {
                 "input_ids": batch["tokens"],
                 "position_ids": None,
                 "attention_mask": None,
                 "labels": None,
                 "packed_seq_params": get_packed_seq_params(batch, args),
-                "loss_mask": batch["full_loss_masks"],
+                "loss_mask": mtp_loss_mask,
                 **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
             }
 

@@ -5,6 +5,7 @@ imports that ``miles.utils.arguments`` pulls in.
 """
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,13 @@ def validate_tinker_serve_args(args) -> None:
         _validate_routing_replay(args)
     if getattr(args, "fused_lm_head_logprobs", False):
         _validate_fused_lm_head(args)
+    if getattr(args, "enable_mtp_training", False):
+        assert args.tinker_train_mode == "full", "Tinker MTP training currently requires full fine-tuning"
+        assert getattr(args, "pipeline_model_parallel_size", 1) == 1, "Tinker MTP training currently requires PP=1"
+        assert args.context_parallel_size == 1, "Tinker MTP training currently requires CP=1"
+        assert (getattr(args, "mtp_num_layers", 0) or 0) > 0, "--enable-mtp-training requires --mtp-num-layers > 0"
+        scale = getattr(args, "mtp_loss_scaling_factor", 0.2)
+        assert math.isfinite(scale) and scale >= 0, "MTP loss scaling must be finite and nonnegative"
 
 
 def _validate_context_parallel(args) -> None:
@@ -187,9 +195,9 @@ def _validate_routing_replay(args) -> None:
 
 def _validate_fused_lm_head(args) -> None:
     """The fused chunked head only yields target-token logprobs of the policy loss."""
-    assert not getattr(args, "use_rollout_entropy", False), (
-        "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
-    )
+    assert not getattr(
+        args, "use_rollout_entropy", False
+    ), "--fused-lm-head-logprobs cannot compute entropy; drop --use-rollout-entropy"
     assert (
         getattr(args, "loss_type", "policy_loss") == "policy_loss"
     ), f"--fused-lm-head-logprobs serves policy_loss only, got --loss-type {args.loss_type!r}"
@@ -199,10 +207,9 @@ def _validate_fused_lm_head(args) -> None:
     assert not getattr(
         args, "true_on_policy_mode", False
     ), "--fused-lm-head-logprobs computes fp32 logits per chunk; --true-on-policy-mode is not supported"
-    assert not getattr(args, "enable_mtp_training", False) and not getattr(args, "mtp_num_layers", None), (
-        "--fused-lm-head-logprobs cannot serve the MTP block's logits; drop --enable-mtp-training and pass "
-        "--mtp-num-layers 0"
-    )
+    assert not getattr(args, "mtp_num_layers", None) or getattr(
+        args, "enable_mtp_training", False
+    ), "--fused-lm-head-logprobs with MTP layers requires --enable-mtp-training for detached draft training"
     assert getattr(
         args, "untie_embeddings_and_output_weights", True
     ), "--fused-lm-head-logprobs takes the output layer's own weight; tied embeddings are not supported"

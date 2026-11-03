@@ -10,7 +10,8 @@ Qwen3.6-35B-A3B full fine-tuning at 64k context on 15 nodes with rollout routing
 replay (R3) and a fused fp32 lm head (`docs/fork/r3.md`, `fused-lm-head.md`,
 `deploy-pbs-15node.md`).
 
-Branch: `miles-tinker`. Base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
+Active development branch: `apga/dev`; current fork PRs target this branch.
+Original base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
 `upstream/yueming/multi-lora-example` @ `06716481e`), see
 `tools/fork/upstream_state.json` for the recorded sync state.
 
@@ -18,8 +19,9 @@ Branch: `miles-tinker`. Base: upstream PR stack "multi-LoRA v2" (#2839-#2849,
 
 | Branch | Content | Rule |
 |---|---|---|
-| `miles-tinker` (default) | upstream base + every fork commit | all fork work lands here; PRs target it |
-| `main` | untouched mirror of `radixark/miles` `main` | never commit to it; refreshed by `upstream_sync.py --push-mirror` (or `git push origin upstream/main:main`) so GitHub's compare view (`main...miles-tinker`) shows the fork delta |
+| `apga/dev` | active fork development | current fork PRs target it |
+| `miles-tinker` | earlier fork integration branch | historical base; use `apga/dev` for current development |
+| `main` | untouched mirror of `radixark/miles` `main` | never commit to it; refreshed by `upstream_sync.py --push-mirror` (or `git push origin upstream/main:main`) so GitHub's compare view (`main...apga/dev`) shows the current fork delta |
 | `upstream/multi-lora-v2` | the upstream PR-stack head the fork is currently based on | bookkeeping only; dropped once the stack merges upstream |
 
 Remotes on a working clone: `origin` = neulab/miles-tinker, `upstream` = https://github.com/radixark/miles.git.
@@ -71,6 +73,7 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/backends/megatron_utils/full/` | full fine-tuning executor for slot 0 (E7): reuses `run_forward_backward_pass`, defers `finalize_model_grads` to optim_step, Megatron dist-ckpt save/load, `update_weights()` as the sampler push; R3: `run_forward_backward_pass` wrapped in `rollout_replay_stage(stage="replay_backward")` | yes |
 | `miles/backends/megatron_utils/actor.py` | executor selection by `--tinker-train-mode`; FFT commands no longer assert `multi_lora`; `forward_only_logprobs` replays rollout routing (`rollout_replay_stage(stage="replay_forward")`); `--tinker-r3-check` (like `--ci-test`) turns on the replay managers' `enable_check_replay_result` | yes |
 | `miles/backends/megatron_utils/model.py` | grad finalize hook split so LoRA and FFT executors share it | yes |
+| `miles/backends/megatron_utils/tinker_mtp.py` | detached MTP loss with a token mean over the complete Tinker optimizer window; target masks and native packed-token rolling; only draft gradients are normalized before DP reduction; PP1/CP1 | yes |
 | `miles/backends/megatron_utils/checkpoint.py` | FFT checkpoint directory layout under `<checkpoint_root>/<model_id>/weights/<name>/` | yes |
 | `miles/backends/megatron_utils/lora/executor.py` | `actor_train` timer + `log_perf_data` on the tinker path (MFU instrumentation, E5); `discard_grads` | yes |
 | `miles/backends/megatron_utils/lora/optimizer.py` | non-finite step veto (`skipped` metric) and per-slot metrics dict returned from optim_step | yes |
@@ -81,7 +84,7 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
 | `miles/tinker/runtime.py` (MilesBackend) | dp padding of units and output stripping; FFT `train_data` without `adapter_slots`; optim_step metrics passthrough and `<checkpoint_root>/perf.jsonl` (per-slot MFU records) | yes |
 | `serve_tinker.py` | uvloop when installed, no uvicorn access log, 60 s keep-alive; `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode; `--tinker-max-tokens-per-datum`, `--tinker-max-tokens-per-request`, `--tinker-coalesce-max-wait-s`, `--tinker-routing-replay-policy`, `--tinker-routing-cache-max-bytes`, `--tinker-routing-cache-ttl-s`, `--tinker-routing-prefix-stride`, `--tinker-r3-check` wired into `GatewayConfig` (`max_tokens_per_datum`, `max_tokens_per_request`, `coalesce_max_wait_s`, `routing_replay_policy`) | yes |
-| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above plus `--fused-lm-head-logprobs` / `--fused-lm-head-chunk-size`; serve-mode validation: full mode forces `retract` pausing, warns on TP*EP>1 for LoRA; R3 requires `--num-experts`, rejects speculative decoding, warns on `--mtp-num-layers`; the fused head requires `policy_loss`, no per-token loss, no true-on-policy, no `--use-rollout-entropy`, no MTP, untied embeddings; `--sglang-context-length` must be at least `--rollout-max-context-len` + 6 (SGLang refuses the last 6 tokens of its context to prompts) | yes |
+| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above plus `--fused-lm-head-logprobs` / `--fused-lm-head-chunk-size`; serve-mode validation: full mode forces `retract` pausing, warns on TP*EP>1 for LoRA; R3 requires `--num-experts`, rejects speculative decoding, warns on `--mtp-num-layers`; the fused head requires `policy_loss`, no per-token loss, no true-on-policy, no `--use-rollout-entropy`, untied embeddings; MTP training has a separate chunked auxiliary loss at PP1/CP1; `--sglang-context-length` must be at least `--rollout-max-context-len` + 6 (SGLang refuses the last 6 tokens of its context to prompts) | yes |
 | `miles/utils/train_metric_utils.py`, `miles/utils/timer.py` | per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`); the FLOPs model itself is `miles/utils/flops_utils.py` below | yes |
 | `tests/fast/tinker/test_runtime.py`, `tests/fast/tinker/test_full_executor.py`, `tests/fast/backends/` | padding, FFT executor and metrics tests | yes |
 
@@ -184,7 +187,7 @@ Operator docs: `deploy/abci/overlays/muse-glimmer/README.md`, `docs/fork/flags-a
 | `deploy/clients/` | client launchers (refuse login nodes via `hostguard`; run them through `CLIENT_SCRIPT`): cookbook guess_number async, math_rl arithmetic smoke, platoon textcraft synth, raw SDK smoke, `tinker_mfu_bench.py` (training-MFU benchmark with RL-shaped datums) | no |
 | `deploy/clients/tinker_r3_probe.py` | SDK 0.16.1 R3 probe: `routing_id` on every sequence, `routing_handle` datum, `routing_covered/uncovered_datums` metrics | no |
 | `examples/tinker/run_qwen3_4b_gateway.py` | `execute_train`-shaped launcher for the gateway (lora/full) on 8 + 8 GPUs | maybe (as `examples/tinker/`) once FFT lands upstream |
-| `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` | Qwen3.6-35B-A3B full-FT gateway recipe (bridge load, TP1/EP8/DP32, `--mtp-num-layers 0` without MTP training, R3 on, fused fp32 head + `--sglang-enable-fp32-lm-head`, 64k gateway limits, `--balance-data`, `--tp 2` fallback, no `--sglang-mamba-*` flag) | maybe (as `examples/tinker/`) once FFT lands upstream |
+| `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` | Qwen3.6 full-FT gateway recipes: the default 35B-A3B recipe retains bridge load, TP1/EP8/DP32, R3, fused fp32 head, and 64k limits; `--model-variant 27b` selects dense TP4/EP1 without R3; MTP training and speculative decoding are independent opt-ins | maybe (as `examples/tinker/`) once FFT lands upstream |
 | `docs/fork/` | operator docs: `README.md` (overview), `full-finetuning.md`, `acceptance.md`, `r3.md`, `r3-trainer.md`, `fused-lm-head.md`, `mfu.md`, `flags-and-launcher.md`, `deploy-pbs-15node.md` | no |
 | `docs/fork/r3.md` | R3 protocol, capture/cache/materialization semantics, metrics, run-checklist notes | no |
 | `docs/fork/r3-trainer.md` | trainer-side R3: data contract, the one context manager around the pass, natural fallback, SP note | no |
