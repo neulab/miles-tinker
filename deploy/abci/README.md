@@ -13,10 +13,10 @@ against it with tinker-cookbook or platoon from inside the job. Cluster facts us
 | Fork checkout | `/home/aci18912it/source/miles` bound at `/root/miles` (`MILES_SRC`; the job serves whichever checkout `MILES_SRC` names) |
 | Extra site | `extra-site/` = `pip --target` dir with `tinker` 0.27.1 (the gateway's proto codec needs it); prepended to `PYTHONPATH` |
 | HF cache | `HF_HOME=/groups/gai51740/aci18912it/rasp/cache/huggingface` (`Qwen/Qwen3-4B-Instruct-2507`, `apurvaga/Qwen3.6-35B-A3B-preserve-thinking`), `HF_HUB_OFFLINE=1` in jobs |
-| Toolathlon | derived SIF `/groups/gai51740/aci18912it/rasp/images/openreward-toolathlon-18e62c0d-pbs-53541066e97b.sif` (sha256 `11d158f7...`, pinned in `deploy/abci/toolathlon.env`), entrypoint + PGDATA stager from `$PLATOON_ROOT/plugins/openreward/scripts` |
+| Toolathlon | derived SIF `/groups/gai51740/aci18912it/platoon-next/toolathlon-audit/ghcr-c66ff0d/abci-sif/openreward-toolathlon-c66ff0d-pbs-7034e1a61a4a.sif` (`ghcr.io/apga/toolathlon-gym:c66ff0d` with the PBS portability patch: the grader fixes and the snowflake tools; sha256 `2fb0ee8b...`, pinned in `deploy/abci/toolathlon.env`), entrypoint + PGDATA stager from `$PLATOON_ROOT/plugins/openreward/scripts` |
 | Platoon | `PLATOON_ROOT=/home/aci18912it/source/platoon-tinker` (branch `miles-tinker-toolathlon`), venv `plugins/openreward/.venv` (tinker 0.16.1) |
 | Logs | `/home/aci18912it/miles-tinker/logs/<job>.OU` (PBS), `$PROJECT_ROOT/jobs/<run>/` (launcher, head, workers, services, client) |
-| Clients | the gateway job's head node via `CLIENT_SCRIPT` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1) |
+| Clients | the gateway job's head node via `CLIENT_SCRIPT` or `CLIENT_CMD` (never a login node); cookbook venv `/home/aci18912it/miles-tinker/cookbook-venv` (tinker 0.27.1) |
 
 Commands below are typed on a login node (qsub, tail, git) but every client and probe runs inside the job on the head compute node: the launchers in `deploy/clients/` and the client scripts in `deploy/abci/clients/` refuse to start on a `login*` host (`MILES_ALLOW_LOGIN_NODE=1` only for a seconds-long smoke).
 
@@ -69,15 +69,19 @@ tail -50 /home/aci18912it/miles-tinker/logs/miles-tinker-smoke.o<jobid>
 - `TRAIN_NODES` (default 4, or 1 on two nodes) nodes train (Megatron) and the other
   `N - TRAIN_NODES` sample (one SGLang engine per node, TP8 for the 35B recipe). The
   launcher always gets `--actor-num-nodes $TRAIN_NODES --rollout-num-gpus $((8*(N-TRAIN_NODES)))`
-  ahead of `LAUNCHER_ARGS`. **Trainer nodes are the `TRAIN_NODES` lowest IPoIB IPs**
-  (numeric per-octet order, exactly how `miles/ray/placement_group.py` assigns actor slots),
-  not PBS nodes 0-3; `$JOBDIR/roles.tsv` lists `host vnode ip role`.
+  ahead of `LAUNCHER_ARGS`. **Trainer nodes are the `TRAIN_NODES` lowest IPoIB IPs other than
+  the head's** (numeric per-octet order with the head node last, exactly how
+  `miles/ray/placement_group.py` assigns actor slots), not PBS nodes 0-3. So the head node, which
+  also runs the client, is always an engine node and trainer rank 0 never competes with the
+  client for CPU. `$JOBDIR/roles.tsv` lists `host vnode ip role`, and `launcher.log` prints a
+  `node roles:` line.
 - `SERVICES=1` starts one Toolathlon service (nginx `:8082`, 8 uvicorn workers
   `28100-28107`, postgres on localhost) plus the node memory guard on every engine
   node before Ray comes up, waits for the release health quorum, monitors it, and
   exports the URLs to the client (section 5). Details and contracts:
   `docs/fork/deploy-pbs-15node.md`.
-- The job ends when `CLIENT_SCRIPT` exits (or `KEEP_GATEWAY=1` keeps serving).
+- The job ends when the client (`CLIENT_SCRIPT` or `CLIENT_CMD`) exits (or `KEEP_GATEWAY=1` keeps serving),
+  and also when the gateway's trainer dies (section 8).
 
 ## 4. Launch
 
@@ -92,11 +96,71 @@ qsub -v MODE=full,RUN_NAME=gw-full deploy/abci/tinker_gateway.pbs
 qsub -v MODE=lora,LAUNCHER_ARGS="--n-adapters 8 --max-tokens-per-gpu 24576",EXTRA_ARGS="--tinker-lease-timeout-s 7200" deploy/abci/tinker_gateway.pbs
 ```
 
-Every knob is a `qsub -v` variable: `MODE`, `RUN_NAME`, `TRAIN_NODES`, `SERVICES`,
+Every knob is a `qsub -v` variable: `PRESET` (below), `MODE`, `RUN_NAME`, `TRAIN_NODES`, `SERVICES`,
 `GATEWAY_LAUNCHER` (repo-relative launcher; `LAUNCHER` is an alias), `HF_SNAPSHOT`
-(its `--hf-checkpoint`), `LAUNCHER_ARGS`, `EXTRA_ARGS`, `CLIENT_SCRIPT`, `KEEP_GATEWAY`,
+(its `--hf-checkpoint`), `LAUNCHER_ARGS`, `EXTRA_ARGS`, `CLIENT_SCRIPT` or `CLIENT_CMD` and
+`CLIENT_DIR` (section 5), `KEEP_GATEWAY`,
 `WORKERS` (client rollout workers, 3), `PLATOON_ROOT`, `TOOLATHLON_ENV`, `TINKER_PORT`
-(default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`.
+(default `30000 + jobid % 9000`, bumped while bound), `MILES_SRC`, `MILES_SIF`, `WANDB_MODE`,
+`GATEWAY_DEAD_PROBES` (4: consecutive 503s from the gateway's healthz that end the job, 30 s apart once the
+gateway is up and 10 s apart while the job still waits for it; 0 keeps a dead gateway's job running, to inspect it).
+
+### Gateway presets (`PRESET=`)
+
+A preset pins one model's gateway: the launcher, its options, the engine flags and the client's
+sampling timeout. `PRESET=<name>` reads `deploy/abci/presets/<name>.env` in `MILES_SRC`, the
+checkout the job serves, whatever checkout you run `qsub` from. So a launch that serves a checkout
+of its own passes `MILES_SRC`; without it, the job reads the default checkout's presets and serves
+its code. `PRESET=<path>` reads a file of your own in the same format. (The Toolathlon "presets"
+below are `qsub` lines; these are gateways.)
+
+| Preset | Model (`HF_MODEL` @ `HF_REVISION`) | Gateway |
+|---|---|---|
+| `qwen3.8-27b-128k` | `apurvaga/Qwen3.8-27B-preserve-thinking` @ `97c72561` | the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it: full fine-tuning, `--model-variant 27b` with TP4 training and TP8 engines, 128K context, FA3 engines, initial lr 1e-6, the cache-aware router (thresholds 16 and 1.5), sampling timeout 1800 s. It advertises the HF id, not the snapshot path, so a trainer config names `model_name: apurvaga/Qwen3.8-27B-preserve-thinking` |
+| `muse-glimmer-30b-128k` | `meta-models/Muse-Glimmer-30B` @ `a4e59da5` | full fine-tuning on 5 nodes (`TRAIN_NODES=3`): `--model-variant glimmer-30b` with TP4 training (DP6) and eight TP2 engines, 128K context (`--context-len 131066`, the engines get Glimmer's 131072 positions), the fused fp32 head with Glimmer's multiplier and softcap, FA3 engines without the vision tower (`--sglang-language-model-only`), initial lr 1e-6, the cache-aware router, sampling timeout 1800 s. Needs the Glimmer overlay as `ROOTFS` and `EXTRA_SITE` and an `HF_HOME` with the snapshot (`deploy/abci/overlays/muse-glimmer/README.md`) |
+| `muse-glimmer-30b-64k` | `meta-models/Muse-Glimmer-30B` @ `a4e59da5` | the same on 2 nodes (TP4 x DP2, four TP2 engines) at 64K, with the first weight push checked against the engines (`--check-weight-update-equal`) |
+
+```bash
+# fcs-q38's layout: 10 nodes, 5 train (TP4 x DP10) + 5 TP8 engines. Run from the training project: the client is
+# its command line and runs in this directory. MILES is the miles-tinker checkout the job serves.
+qsub -l select=10:mpiprocs=8 -l walltime=72:00:00 \
+  -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,TRAIN_NODES=5,RUN_NAME=my-run,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" \
+  $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+- A preset holds `KEY=value` lines for `GATEWAY_LAUNCHER MODE HF_MODEL HF_REVISION LAUNCHER_ARGS
+  EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS`; a value with spaces goes in one pair of quotes. The job
+  reads the file and never sources it, so nothing in it is expanded, and an unknown key, a second
+  value for a key or a line it cannot read fails the job before any node starts.
+- A non-empty job variable replaces the preset's value; it does not add to it, so changing one
+  launcher option means passing the whole `LAUNCHER_ARGS`. `launcher.log` lists every key with the
+  value used and marks the job's own.
+- `HF_MODEL` and `HF_REVISION` select `$HF_HOME/hub/models--<org>--<name>/snapshots/<revision>` as
+  `HF_SNAPSHOT`, unless the job gives `HF_SNAPSHOT`. A missing snapshot fails the job with the
+  `hf download` command that fetches it.
+- `TINKER_SAMPLE_TIMEOUT_SECONDS` is the client's deadline for one sample request; the job exports it
+  to the client with the section 5 variables.
+- The gateway loads the snapshot by path. A client that names the model by id resolves it through
+  `refs/main` of the hub cache, so with `HF_HUB_OFFLINE=1` it needs `refs/main` to name the
+  revision; `launcher.log` prints a note when it does not (the rasp cache has no `refs/` for
+  `apurvaga/Qwen3.8-27B-preserve-thinking`).
+
+Flag by flag, with the `serve_tinker.py` argv it produces: `docs/fork/flags-and-launcher.md`.
+
+### Context parallelism (full fine-tuning, `run_qwen3_6_35b_a3b_gateway.py`)
+
+`--cp N` in `LAUNCHER_ARGS` splits every datum over N trainer ranks (zigzag chunks;
+DP becomes GPUs / (TP * N)). `--max-tokens-per-gpu` is then a per-rank budget and
+defaults to the shard of one `--context-len + 1` row. The GatedDeltaNet layers run
+headwise unless `--linear-cp-mode chunkwise` is given (headwise needs TP*CP to
+divide the 16 linear key heads). The two-node Qwen3.5-4B parity gateway
+(`--model-variant 4b`, a bridge VL model with GDN layers):
+
+```bash
+qsub -v MODE=full,GATEWAY_LAUNCHER=examples/tinker/run_qwen3_6_35b_a3b_gateway.py,HF_SNAPSHOT=$(ls -d /groups/gai51740/aci18912it/rasp/cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*),LAUNCHER_ARGS="--model-variant 4b --cp 2 --context-len 8192 --max-tokens-per-datum 8193" deploy/abci/tinker_gateway.pbs
+```
+
+Layouts, budgets and limits: `docs/fork/full-finetuning.md` (section "Context parallelism").
 
 ### Qwen3.6-35B-A3B Toolathlon presets (5 / 15 nodes)
 
@@ -116,6 +180,15 @@ All presets use `MODE=full SERVICES=1 TRAIN_NODES=4 GATEWAY_LAUNCHER=examples/ti
 with the `apurvaga/Qwen3.6-35B-A3B-preserve-thinking` snapshot; the jobs run
 `clients/platoon_toolathlon.sh` with the recursive / non-recursive platoon yaml
 (`platoon/openreward/configs/tinker/abci_toolathlon_15node_{recursive,nonrecursive}_qwen36_miles_tinker_r3_v1.yaml`).
+
+For deterministic inference, set `LAUNCHER_ARGS=--sglang-deterministic-inference`.
+The launcher matches `NCCL_ALGO=allreduce:tree` and eight NCCL channels on the
+trainer and engines, including the shared weight-broadcast communicator. The
+channel count can be changed with `--deterministic-nccl-nchannels`. Passing only
+`--sglang-enable-deterministic-inference` through `EXTRA_ARGS` configures only the
+engines and can fail the first weight push with an NCCL bootstrap size mismatch.
+Full routing is selected independently with
+`EXTRA_ARGS='--tinker-routing-capture-mode full'`.
 
 Startup takes a few minutes on two nodes and longer on 15 (Ray join of 14 workers, bridge-mode
 HF load, TP8 engines, `warmup`, the ~50 s Toolathlon services). Watch it:
@@ -150,15 +223,41 @@ addresses and are reached by the driver only.
 ## 5. Run clients inside the job (head node)
 
 ABCI login nodes are shared and monitored; a Tinker client (rollouts, rendering, per-token logprobs) pins a
-core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`; the
-launcher starts it (in its own process group) once the gateway and the services are healthy, with these exports:
+core for hours, so it runs on the gateway job's head compute node. Pass a bash script with `CLIENT_SCRIPT`, or a
+command line with `CLIENT_CMD`; the launcher starts it (in its own process group) once the gateway and the services
+are healthy, with these exports:
 
 `TINKER_BASE_URL TINKER_API_KEY ENDPOINT_FILE JOBDIR RUN_NAME HF_HOME no_proxy MILES_SRC PLATOON_ROOT
 SERVICE_NODES OPENREWARD_SESSION_URLS_TOOLATHLON OPENREWARD_SESSION_URLS PBS_LOCALDIR WORKERS`
 
-(the URL lists are `http://<engine-IPoIB-ip>:8082,...` in IP order, empty with `SERVICES=0`), logs it to
-`$JOBDIR/client.log` (exit code in `client.status`), and ends the job when the client finishes (the nodes are
-released about ten seconds later; `KEEP_GATEWAY=1` keeps serving). Ready-made scripts:
+(the URL lists are `http://<engine-IPoIB-ip>:8082,...` in IP order, empty with `SERVICES=0`; a `PRESET` adds its
+`TINKER_SAMPLE_TIMEOUT_SECONDS`), logs it to `$JOBDIR/client.log` (exit code in `client.status`), and ends the job
+when the client finishes, with the client's exit status (the nodes are released about ten seconds later;
+`KEEP_GATEWAY=1` keeps serving).
+
+`CLIENT_CMD` needs no script file. The job writes it verbatim to `$JOBDIR/client-cmd.sh` and runs that file exactly
+as it runs a `CLIENT_SCRIPT`, in `CLIENT_DIR`: by default `PBS_O_WORKDIR`, the directory you ran `qsub` in. (A
+`CLIENT_SCRIPT` runs in `MILES_SRC` unless `CLIENT_DIR` is set.) The command line runs as bash reads it, so its
+quotes group words and its `$VARIABLES` expand on the head node, the exports above included. Before any node
+starts, the job fails if both `CLIENT_SCRIPT` and `CLIENT_CMD` are set, if `CLIENT_DIR` is not a directory, or if
+`bash -n` rejects the command line.
+
+```bash
+qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD="$PWD/.venv/bin/platoon train $PWD/train.yaml" $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+`qsub -v` rewrites a value written after `=`: a comma ends the value unless the value is in quotes
+(`-v "CLIENT_CMD='echo a,b'"`), and the quotes are removed, because they are `qsub`'s own syntax. A command line
+without quotes, commas or backslashes passes as is. To keep quotes and commas, put the command line in `qsub`'s
+environment and name it in `-v` without a value; `qsub` then copies it unchanged:
+
+```bash
+CLIENT_CMD='platoon train train.yaml "stats.notes=lr 1e-6, group 8"' \
+  qsub -l select=2:mpiprocs=8 -v RTYPE=rt_HF,PRESET=qwen3.8-27b-128k,MILES_SRC=$MILES,CLIENT_CMD $MILES/deploy/abci/tinker_gateway.pbs
+```
+
+Backslashes survive neither way (PBS doubles them), so a command line that needs one belongs in a `CLIENT_SCRIPT`.
+Ready-made scripts:
 
 ```bash
 # SDK smoke + sampler/trainer probe + short MFU benchmark (LoRA or full, two nodes)
@@ -207,7 +306,7 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 | Artifact | Path |
 |---|---|
 | Gateway checkpoints (`tinker://<model_id>/weights/<name>`, `.../sampler_weights/<name>`, `tinker_meta.json` sidecars) | `$PROJECT_ROOT/checkpoints/<RUN_NAME>/<model_id>/...` (`--checkpoint-root`); pruned by `clients/prune_tinker_checkpoints.py` on the Toolathlon jobs |
-| Launcher / head / worker / service / client logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head}.log`, `worker-<host>.log`, `ray-worker-<host>.log`, `services-<host>.log`, `client.log` + `client.status`, `teardown-<host>.log`, `roles.tsv`, `nodes.tsv`, `container_args.txt`, `worker.sh`, `node-init.sh`, `kill-leftovers.sh` |
+| Launcher / head / worker / service / client logs | `$PROJECT_ROOT/jobs/<RUN_NAME>/{launcher,head}.log`, `worker-<host>.log`, `ray-worker-<host>.log`, `services-<host>.log`, `client.log` + `client.status` (+ `client-cmd.sh` with `CLIENT_CMD`), `teardown-<host>.log`, `roles.tsv`, `nodes.tsv`, `container_args.txt`, `worker.sh`, `node-init.sh`, `kill-leftovers.sh` |
 | PBS stdout/err | `/home/aci18912it/miles-tinker/logs/<jobname>.o<jobid>` |
 | Ray session logs (node-local, gone with the job) | `/local/<jobid>/miles/tmp/ray/session_latest/logs` |
 | Toolathlon node-local state (gone with the job) | `/local/<jobid>/toolathlon/{images,state,rootfs-overlay.img,singularity-cache,singularity-tmp}` |
@@ -215,6 +314,31 @@ acceptable because it finishes in about a minute; anything that samples rollouts
 | Client logs | the `log_path` you pass: cookbook `metrics.jsonl`, `checkpoints.jsonl`; platoon `$PROJECT_ROOT/runs/<RUN_NAME>/logs/<experiment>/<trial>/` |
 
 ## 7. Memory guard and node telemetry
+
+### SWE-rebench V2 services
+
+Set `SERVICES=1,SERVICE_ENVIRONMENT=swe_rebench` to run one SWE server on each
+inference node. The launcher probes port 8084 and forwards the same IPoIB URL
+pool as `OPENREWARD_SESSION_URLS_SWE_REBENCH` to Platoon. Toolathlon remains the
+default service environment. Set `OPENREWARD_REWARD_MODE=binary` for strict
+test-pass rewards.
+
+`swe_rebench_service.sh` supervises the existing Platoon
+`pbs-scripts/openreward-swe-singularity-server.sh` and the node memory guard.
+The pinned SWE backend extracts a private writable directory for each episode
+and retains exact UUID session cleanup. Directory containers avoid the nodes'
+ten-loop-device limit and make root-owned task build caches writable by the
+service UID. They use more node-local scratch space than sparse overlays.
+`swe_rebench.env` contains only dataset, image-cache, source,
+and job-local directory settings; `SWE_ENV` can select another credential-free
+file. The environment server runs on the host so it can start Singularity task
+instances.
+
+The existing `clients/platoon_toolathlon.sh` also runs SWE configs; its filename
+is retained for existing submissions. `CONFIG` accepts an absolute path or a
+path relative to the OpenReward plugin. The config's environment must be
+`nebius/SWE-rebench-V2`, with session URL port 8084 and
+`session_urls_env_var: OPENREWARD_SESSION_URLS_SWE_REBENCH`.
 
 Each service node runs `deploy/abci/openreward-node-memory-guard.py` (verbatim release copy) with exactly
 `--node-limit-bytes 2061584302080 --trigger-percent 85 --fallback-available-bytes 274877906944 --poll-seconds 2
@@ -237,6 +361,21 @@ stays flat.
   `kill-leftovers.sh` locally and via `pbsdsh` on every other node - the Toolathlon container has no PID namespace,
   so nginx/postgres/uvicorn/MCP processes are swept by name (`teardown-<host>.log`). PBS releases the nodes about
   ten seconds after the client exits.
+- "monitor: the gateway's trainer is dead; ending the job": a weight push or a training command failed
+  and took the trainer actors down (`ft op=execute phase=fail` in `head.log`). The gateway cannot rebuild
+  them, so every later command would fail: `/api/v1/healthz` answers 503 with the reason, and after
+  `GATEWAY_DEAD_PROBES` (4) such answers 30 s apart the monitor ends the job instead of leaving it idle.
+  A trainer that dies before the gateway was ever healthy (a failed warmup push) ends the job the same way,
+  with "the gateway's trainer died before the gateway was healthy; ending the job" and the end of `head.log`.
+  Resubmit with the same `RUN_NAME`; the client resumes from its last checkpoint (next bullet).
+- Engine connections: SGLang closes a keep-alive connection that stays idle for
+  `SGLANG_TIMEOUT_KEEP_ALIVE` seconds (5 by default, the same as httpx's own idle limit), and a request
+  written on a connection the engine is closing at that moment gets a TCP reset (`httpx.ReadError`). That
+  failed a full-weight sync whose buckets went out 5 s apart. miles therefore launches every engine with
+  `SGLANG_TIMEOUT_KEEP_ALIVE=600` (a value in the driver's environment wins), and the trainer's engine
+  client drops a connection after 2 s idle. The pause, continue and weight-version calls are sent once more
+  after a reset; the weight buckets and the update session's begin and end never are, because the engine may
+  already have acted on them.
 - Clients survive a gateway restart only through checkpoints: cookbook resumes
   from `checkpoints.jsonl` with `behavior_if_log_dir_exists=resume`, platoon
   through its restart wrapper; both call `/weights_info` + `load_state` on the

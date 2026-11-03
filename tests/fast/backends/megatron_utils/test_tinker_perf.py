@@ -107,6 +107,56 @@ def test_peak_memory_metrics_are_absent_without_cuda_and_reset_the_peak(monkeypa
     assert tp._peak_memory_metrics() == {}
 
 
+def test_peak_memory_adds_the_maximum_over_all_ranks(monkeypatch):
+    """The gateway keeps rank 0's metrics; the all-rank maximum (one gloo all-reduce) is the headroom to plan with
+    when ranks differ (R3 load imbalance, uneven CP shards)."""
+    import torch
+
+    import miles.backends.megatron_utils.tinker_perf as tp
+
+    class _Cuda:
+        def is_available(self):
+            return True
+
+        def max_memory_allocated(self):
+            return 40 * 1024**3
+
+        def max_memory_reserved(self):
+            return 44 * 1024**3
+
+        def reset_peak_memory_stats(self):
+            pass
+
+    reduced = {}
+
+    def all_reduce(tensor, op, group):
+        reduced.update(op=op, group=group)
+        tensor.copy_(torch.maximum(tensor, torch.tensor([61.5, 66.0], dtype=tensor.dtype)))  # another rank's peaks
+
+    dist = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_world_size=lambda: 8,
+        all_reduce=all_reduce,
+        ReduceOp=SimpleNamespace(MAX="max"),
+    )
+    monkeypatch.setattr(tp.torch, "cuda", _Cuda())
+    monkeypatch.setattr(tp, "dist", dist)
+    monkeypatch.setattr(tp, "get_gloo_group", lambda: "gloo")
+    assert tp._peak_memory_metrics() == {
+        "actor_peak_mem_alloc_gib": 40.0,
+        "actor_peak_mem_reserved_gib": 44.0,
+        "actor_peak_mem_alloc_gib_all_ranks": 61.5,
+        "actor_peak_mem_reserved_gib_all_ranks": 66.0,
+    }
+    assert reduced == {"op": "max", "group": "gloo"}
+
+    def no_gloo():
+        raise RuntimeError("Gloo group has not been initialized")
+
+    monkeypatch.setattr(tp, "get_gloo_group", no_gloo)
+    assert "actor_peak_mem_alloc_gib_all_ranks" not in tp._peak_memory_metrics(), "no group yet: local peaks only"
+
+
 # --------------------------------------------------------------------------------------
 # MFU diagnostics: rank imbalance, sequence shape, wall-clock stages, micro-batch shape
 # --------------------------------------------------------------------------------------

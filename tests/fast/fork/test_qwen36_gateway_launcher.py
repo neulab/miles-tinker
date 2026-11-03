@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 import miles.utils.external_utils.command_utils as U
+from miles.tinker.core.types import UserInputError
+from miles.tinker.runtime import _clamp_max_new_tokens
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = REPO_ROOT / "examples" / "tinker" / "run_qwen3_6_35b_a3b_gateway.py"
@@ -90,7 +92,7 @@ _EXPECTED_DEFAULT_ARGV = (
     "--moe-token-dispatcher-type alltoall "
     "--mtp-num-layers 0 "
     "--rollout-num-gpus-per-engine 8 --sglang-ep-size 8 --sglang-mem-fraction-static 0.75 "
-    "--sglang-context-length 65537 --rollout-max-context-len 65536 --sglang-chunked-prefill-size 16384 "
+    "--sglang-context-length 65542 --rollout-max-context-len 65536 --sglang-chunked-prefill-size 16384 "
     "--sglang-max-running-requests 128 --sglang-enable-fp32-lm-head "
     "--pause-generation-mode retract --update-weight-buffer-size 2147483648 "
     "--num-gpus-per-node 8 --actor-num-nodes 4 --actor-num-gpus-per-node 8 --rollout-num-gpus 88 "
@@ -235,11 +237,98 @@ def test_mtp_training_rejects_empty_or_invalid_loss(launcher, overrides):
         launcher.ScriptArgs(enable_mtp_training=True, **overrides)
 
 
+def test_mtp_training_requires_cp1_but_frozen_draft_can_use_cp(launcher):
+    with pytest.raises(AssertionError, match="requires --cp 1"):
+        launcher.ScriptArgs(model_variant="27b", enable_mtp_training=True, cp=2)
+    launcher.ScriptArgs(model_variant="27b", mtp_speculative_decoding=True, cp=2)
+
+
+@pytest.mark.parametrize("option", ["enable_mtp_training", "mtp_speculative_decoding"])
+def test_glimmer_recipe_rejects_qwen_mtp(launcher, option):
+    with pytest.raises(AssertionError, match="does not support Qwen MTP"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", **{option: True})
+
+
 def test_context_length_drives_both_sides(launcher, monkeypatch):
     argv = _serve_argv(launcher, monkeypatch, context_len=32768, max_tokens_per_gpu=32769, max_tokens_per_datum=32769)
-    assert _flag(argv, "--sglang-context-length") == "32769"
+    assert _flag(argv, "--sglang-context-length") == "32774"
     assert _flag(argv, "--rollout-max-context-len") == "32768"
     assert _flag(argv, "--max-tokens-per-gpu") == "32769"
+
+
+@pytest.mark.parametrize("decode_mtp", [False, True])
+def test_mtp_decoding_preserves_gateway_context_after_draft_reservation(launcher, monkeypatch, decode_mtp):
+    argv = _serve_argv(
+        launcher, monkeypatch, model_variant="27b", context_len=32768, mtp_speculative_decoding=decode_mtp
+    )
+    engine_context = int(_flag(argv, "--sglang-context-length"))
+    draft_reserve = 3 if decode_mtp else 0
+    assert engine_context == 32768 + 6 + draft_reserve
+    assert _flag(argv, "--rollout-max-context-len") == "32768"
+    # Even servers subtracting the draft reserve before their prompt checks
+    # must accept the longest prompt allowed by the gateway.
+    assert _sglang_max_new_tokens(engine_context - draft_reserve, prompt_len=32767, max_new_tokens=1) == 1
+
+
+def _sglang_max_new_tokens(context_length: int, prompt_len: int, max_new_tokens: int) -> int:
+    """SGLang's length checks on one /generate request in the serving image (no speculative decoding, a KV pool
+    of at least one context): the max_new_tokens the engine keeps, or ValueError with the message of its 400.
+
+    - tokenizer_manager._validate_one_request: prompt < context_length, prompt + max_new_tokens <= context_length;
+    - tp_worker.get_worker_info (max_req_len = context_length - 1, max_req_input_len = max_req_len - 5) and
+      managers/utils.validate_input_length: prompt < max_req_input_len;
+    - scheduler.init_req_max_new_tokens: max_new_tokens <= max_req_len - 1 - prompt (a silent cap).
+    """
+    if prompt_len >= context_length or prompt_len + max_new_tokens > context_length:
+        raise ValueError(f"Requested token count exceeds the model's maximum context length of {context_length}")
+    max_req_len = context_length - 1
+    max_req_input_len = max_req_len - 5
+    if prompt_len >= max_req_input_len:
+        raise ValueError(
+            f"Input length ({prompt_len} tokens) exceeds the maximum allowed length ({max_req_input_len} tokens)."
+        )
+    return min(max_new_tokens, max_req_len - 1 - prompt_len)
+
+
+def test_the_sglang_model_reproduces_the_refusal_seen_on_gpu():
+    """A platoon eval on 2026-10-17, with the engines at the old context_len + 1: SGLang's 400 for a prompt that
+    the gateway had admitted at --rollout-max-context-len 32768, and one completion token cut when it fit."""
+    with pytest.raises(ValueError, match=r"Input length \(32763 tokens\) exceeds the maximum allowed length \(32763"):
+        _sglang_max_new_tokens(32769, prompt_len=32763, max_new_tokens=5)
+    assert _sglang_max_new_tokens(32769, prompt_len=32762, max_new_tokens=6) == 5
+
+
+@pytest.mark.parametrize("context_len", [8192, 32768, 65536, 131072])
+def test_the_engines_take_every_request_the_gateway_admits(launcher, monkeypatch, context_len):
+    """Every prompt the gateway admits under --rollout-max-context-len reaches the engines with the whole
+    completion budget the gateway clamped it to, and one token less of engine context would refuse the longest."""
+    argv = _serve_argv(launcher, monkeypatch, context_len=context_len, max_tokens_per_datum=context_len + 1)
+    gateway_context = int(_flag(argv, "--rollout-max-context-len"))
+    engine_context = int(_flag(argv, "--sglang-context-length"))
+    assert gateway_context == context_len
+    for prompt_len in (1, gateway_context // 2, *range(gateway_context - 16, gateway_context)):
+        max_new_tokens = _clamp_max_new_tokens(1 << 30, prompt_len=prompt_len, context_len=gateway_context)
+        assert _sglang_max_new_tokens(engine_context, prompt_len, max_new_tokens) == max_new_tokens
+    with pytest.raises(UserInputError, match="no room"):  # the gateway's own bound: prompts under its context
+        _clamp_max_new_tokens(1, prompt_len=gateway_context, context_len=gateway_context)
+    with pytest.raises(ValueError, match="exceeds the maximum allowed length"):
+        _sglang_max_new_tokens(engine_context - 1, prompt_len=gateway_context - 1, max_new_tokens=1)
+
+
+@pytest.mark.parametrize("nchannels", [8, 16])
+def test_deterministic_inference_matches_weight_transfer_peers(launcher, monkeypatch, nchannels):
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(sglang_deterministic_inference=True, deterministic_nccl_nchannels=nchannels)
+    assert "--sglang-enable-deterministic-inference" in shlex.split(captured["train_args"])
+    env = captured["extra_env_vars"]
+    assert env["NCCL_ALGO"] == "allreduce:tree"
+    assert env["NCCL_MIN_NCHANNELS"] == str(nchannels)
+    assert env["NCCL_MAX_NCHANNELS"] == str(nchannels)
+    assert env["SGLANG_DETERMINISTIC_NCCL_NCHANNELS"] == str(nchannels)
+    assert launcher.ScriptArgs().deterministic_env_vars == {}
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(deterministic_nccl_nchannels=0)
 
 
 def test_topology_flags_follow_the_split(launcher, monkeypatch):
@@ -341,3 +430,254 @@ def test_serve_side_flags_are_rejected_by_the_typer_cli(launcher, monkeypatch):
     result, captured = _invoke_serve(launcher, monkeypatch, ["--check-weight-update-equal", "--tinker-r3-check"])
     assert result.exit_code == 2 and "No such option: --tinker-r3-check" in result.output
     assert not captured, "execute_train must not run"
+
+
+# --- context parallelism (--cp) and the Qwen3.5-4B recipe ----------------------------------------
+
+
+def test_cp_sizes_the_per_rank_budget(launcher, monkeypatch):
+    argv = _serve_argv(launcher, monkeypatch, cp=2)
+    assert _flag(argv, "--context-parallel-size") == "2"
+    # one 65537-token row: 2 * ceil(65537 / 4) = 32770 tokens per rank, padded to 128
+    assert _flag(argv, "--max-tokens-per-gpu") == "32896"
+    # headwise GatedDeltaNet CP unless chunkwise is requested
+    assert _flag(argv, "--linear-cp-mode") == "headwise"
+    argv = _serve_argv(launcher, monkeypatch, cp=8, context_len=131072, max_tokens_per_datum=131073)
+    assert _flag(argv, "--max-tokens-per-gpu") == "16512" and _flag(argv, "--linear-cp-mode") == "headwise"
+    assert _flag(argv, "--tinker-max-tokens-per-datum") == "131073"
+
+
+def test_linear_cp_mode_is_headwise_by_default_and_chunkwise_on_request(launcher, monkeypatch):
+    assert "--linear-cp-mode" not in _serve_argv(launcher, monkeypatch), "no CP: the GDN layers run unsplit"
+    assert "--linear-cp-mode" not in _serve_argv(launcher, monkeypatch, linear_cp_mode="chunkwise")
+    argv = _serve_argv(launcher, monkeypatch, cp=4, linear_cp_mode="chunkwise")
+    assert _flag(argv, "--linear-cp-mode") == "chunkwise"
+
+
+@pytest.mark.parametrize("variant, tp, cp", [("27b", 4, 2), ("27b", 4, 4), ("35b-a3b", 1, 8), ("4b", 1, 4)])
+def test_headwise_fits_the_recommended_layouts(launcher, variant, tp, cp):
+    """Headwise splits the 16 GatedDeltaNet key heads (48/32 value heads) over TP*CP ranks."""
+    assert launcher.ScriptArgs(model_variant=variant, tp=tp, cp=cp, context_len=131072).linear_cp_mode == "headwise"
+
+
+def test_headwise_rejects_a_layout_its_heads_cannot_split(launcher):
+    with pytest.raises(AssertionError, match="over TP\\*CP=32 ranks; .* --linear-cp-mode chunkwise"):
+        launcher.ScriptArgs(model_variant="27b", tp=4, cp=8, context_len=131072)
+    chunkwise = launcher.ScriptArgs(model_variant="27b", tp=4, cp=8, context_len=131072, linear_cp_mode="chunkwise")
+    assert chunkwise.max_tokens_per_gpu == 16896
+
+
+def test_cp_budget_follows_a_pad_multiplier_set_through_extra_args(launcher, monkeypatch):
+    """get_batch pads each rank's share to TP * --data-pad-size-multiplier: the default budget must use the
+    multiplier serve_tinker.py will parse, not a hard-coded 128."""
+    assert launcher.ScriptArgs(cp=2, extra_args="--data-pad-size-multiplier 256").max_tokens_per_gpu == 33024
+    assert launcher.ScriptArgs(cp=2, extra_args="--lr 1e-6 --data-pad-size-multiplier=64").max_tokens_per_gpu == 32832
+    assert launcher.ScriptArgs(cp=2).max_tokens_per_gpu == 32896
+    with pytest.raises(AssertionError, match="needs 33024"):
+        launcher.ScriptArgs(cp=2, max_tokens_per_gpu=32896, extra_args="--data-pad-size-multiplier 256")
+
+
+@pytest.mark.parametrize(
+    "variant, tp, cp, expected", [("27b", 4, 2, 66048), ("27b", 4, 4, 33280), ("35b-a3b", 1, 8, 16512)]
+)
+def test_cp_budgets_for_128k_rows(launcher, variant, tp, cp, expected):
+    """docs/fork/full-finetuning.md: the per-rank budgets of the H100 layouts for 131073-token rows."""
+    args = launcher.ScriptArgs(model_variant=variant, tp=tp, cp=cp, context_len=131072)
+    assert args.max_tokens_per_gpu == expected
+
+
+def test_cp_rejects_a_budget_that_cannot_hold_one_row(launcher):
+    with pytest.raises(AssertionError, match="cannot hold the --cp 2 shard of one 65537-token row"):
+        launcher.ScriptArgs(cp=2, max_tokens_per_gpu=32768)
+    launcher.ScriptArgs(cp=2, max_tokens_per_gpu=32896)
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(cp=0)
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(linear_cp_mode="ringwise")
+
+
+def test_qwen35_4b_recipe(launcher, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(
+        hf_checkpoint="/x/hf",
+        checkpoint_root="/x/ckpt",
+        model_variant="4b",
+        cp=2,
+        context_len=8192,
+        max_tokens_per_datum=8193,
+        actor_num_nodes=1,
+        rollout_num_gpus=8,
+    )
+    assert captured["megatron_model_type"] == "qwen3.5-4B"
+    argv = shlex.split(captured["train_args"])
+    assert _flag(argv, "--tinker-base-model") == "Qwen/Qwen3.5-4B"
+    # tied embeddings: the standard head scores, and the engines keep their default head to match it
+    assert "--fused-lm-head-logprobs" not in argv and _flag(argv, "--log-probs-chunk-size") == "2048"
+    assert "--sglang-enable-fp32-lm-head" not in argv and "--use-rollout-routing-replay" not in argv
+    assert _flag(argv, "--rollout-num-gpus-per-engine") == "1" and _flag(argv, "--sglang-ep-size") == "1"
+    assert _flag(argv, "--tensor-model-parallel-size") == "1" and _flag(argv, "--context-parallel-size") == "2"
+    assert _flag(argv, "--max-tokens-per-gpu") == "4224"  # 2 * ceil(8193 / 4) = 4098, padded to 128
+    assert _flag(argv, "--mtp-num-layers") == "0" and "--freeze-vision-model" in argv
+    fields = _server_args_fields()
+    assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+    with pytest.raises(AssertionError, match="no expert routes"):
+        launcher.ScriptArgs(model_variant="4b", routing_replay=True)
+
+
+# --- gateway presets (deploy/abci/presets/*.env): head-inner.sh passes their LAUNCHER_ARGS and EXTRA_ARGS -------
+
+_PRESETS = sorted((REPO_ROOT / "deploy" / "abci" / "presets").glob("*.env"))
+
+
+def _read_preset(path: Path) -> dict[str, str]:
+    """KEY=value lines (test_deploy_dry_run.py checks that the job reads them as bash sources them)."""
+    values = {}
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            words = shlex.split(value)
+            assert len(words) <= 1, line
+            values[key] = words[0] if words else ""
+    return values
+
+
+@pytest.mark.parametrize("preset", _PRESETS, ids=lambda path: path.stem)
+def test_preset_options_are_accepted_by_its_launcher(launcher, monkeypatch, preset):
+    values = _read_preset(preset)
+    if values["GATEWAY_LAUNCHER"] != LAUNCHER.relative_to(REPO_ROOT).as_posix():
+        pytest.skip(f"{preset.name} serves {values['GATEWAY_LAUNCHER']}")
+    argv = [
+        "--mode",
+        values["MODE"],
+        *shlex.split(values["LAUNCHER_ARGS"]),
+        "--extra-args",
+        values.get("EXTRA_ARGS", ""),
+    ]
+    result, captured = _invoke_serve(launcher, monkeypatch, argv)
+    assert result.exit_code == 0, result.output
+    serve_argv = shlex.split(captured["train_args"])
+    fields = _server_args_fields()
+    assert not {flag for flag in serve_argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+
+
+def test_qwen38_128k_preset_serves_the_fcs_q38_argv_but_for_the_advertised_name(launcher, monkeypatch):
+    """fcs-q38 passed the snapshot path as --model-name where the preset passes the HF id; on fcs-q38's split (5 train
+    nodes, 40 rollout GPUs) nothing else in the serve_tinker.py argv may differ."""
+    values = _read_preset(REPO_ROOT / "deploy" / "abci" / "presets" / "qwen3.8-27b-128k.env")
+    model = values["HF_MODEL"]
+    snapshot = f"/x/hub/models--{model.replace('/', '--')}/snapshots/{values['HF_REVISION']}"
+
+    def serve(launcher_args: str):
+        argv = [
+            "--mode",
+            values["MODE"],
+            "--actor-num-nodes",
+            "5",
+            "--rollout-num-gpus",
+            "40",
+            "--tinker-port",
+            "18110",
+            *shlex.split(launcher_args),
+            "--extra-args",
+            values["EXTRA_ARGS"],
+        ]
+        result, captured = _invoke_serve(launcher, monkeypatch, argv)
+        assert result.exit_code == 0, result.output
+        return shlex.split(captured["train_args"]), captured
+
+    argv, captured = serve(values["LAUNCHER_ARGS"])
+    fcs_argv, fcs_captured = serve(
+        values["LAUNCHER_ARGS"].replace(f"--model-name {model} ", f"--model-name {snapshot} ")
+    )
+    assert len(argv) == len(fcs_argv)
+    differing = [i for i, (ours, fcs) in enumerate(zip(argv, fcs_argv, strict=True)) if ours != fcs]
+    assert differing == [argv.index("--tinker-base-model") + 1]
+    assert _flag(argv, "--tinker-base-model") == model and _flag(fcs_argv, "--tinker-base-model") == snapshot
+    assert captured["megatron_model_type"] == fcs_captured["megatron_model_type"] == "qwen3.6-27B"
+    assert U.resolve_extra_env_vars({}, captured["config"]) == {"NCCL_DEBUG": "INFO"}
+    # the recipe: dense TP4 training on 128K rows, no routing replay, the gateway's 128K limits, TP8 engines
+    for flag, value in (
+        ("--tensor-model-parallel-size", "4"),
+        ("--expert-model-parallel-size", "1"),
+        ("--max-tokens-per-gpu", "131073"),
+        ("--tinker-max-tokens-per-datum", "131073"),
+        ("--tinker-unit-token-budget", "1310730"),
+        ("--rollout-max-context-len", "131072"),
+        ("--sglang-context-length", str(captured["config"].sglang_context_length)),
+        ("--rollout-num-gpus-per-engine", "8"),
+        ("--sglang-ep-size", "1"),
+        ("--actor-num-nodes", "5"),
+        ("--rollout-num-gpus", "40"),
+    ):
+        assert _flag(argv, flag) == value, flag
+    assert "--use-rollout-routing-replay" not in argv
+    # EXTRA_ARGS come last, so their --lr 1e-6 wins over the launcher's initial --lr 3e-6
+    assert argv[-len(shlex.split(values["EXTRA_ARGS"])) :] == shlex.split(values["EXTRA_ARGS"])
+
+
+# --- Muse-Glimmer-30B (--model-variant glimmer-30b) ------------------------------------------------------------------
+
+
+def test_muse_glimmer_recipe(launcher, monkeypatch):
+    """Dense TP4 training without routing replay or CP, TP2 engines, the fused fp32 head on both sides, and a 128K
+    gateway whose engines get exactly Glimmer's 131072 positions."""
+    captured = {}
+    monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    launcher.serve(
+        hf_checkpoint="/x/hf",
+        checkpoint_root="/x/ckpt",
+        model_variant="glimmer-30b",
+        context_len=131066,
+        max_tokens_per_datum=131067,
+        actor_num_nodes=3,
+        rollout_num_gpus=16,
+    )
+    assert captured["megatron_model_type"] == "muse-glimmer-30B"
+    argv = shlex.split(captured["train_args"])
+    assert _flag(argv, "--tinker-base-model") == "meta-models/Muse-Glimmer-30B"
+    assert _flag(argv, "--megatron-to-hf-mode") == "bridge" and "--freeze-vision-model" in argv
+    assert "--fused-lm-head-logprobs" in argv and "--sglang-enable-fp32-lm-head" in argv
+    assert "--use-rollout-routing-replay" not in argv and _flag(argv, "--expert-model-parallel-size") == "1"
+    assert _flag(argv, "--tensor-model-parallel-size") == "4" and _flag(argv, "--context-parallel-size") == "1"
+    assert "--linear-cp-mode" not in argv
+    assert _flag(argv, "--rollout-num-gpus-per-engine") == "2" and _flag(argv, "--sglang-ep-size") == "1"
+    assert _flag(argv, "--sglang-context-length") == "131072"  # max_position_embeddings of the checkpoint
+    assert _flag(argv, "--max-tokens-per-gpu") == "131067" and _flag(argv, "--rollout-max-context-len") == "131066"
+    fields = _server_args_fields()
+    assert not {flag for flag in argv if flag.startswith("--sglang-") and _sglang_field(flag) not in fields}
+
+
+def test_muse_glimmer_layouts(launcher):
+    for tp in (1, 2, 4, 8):  # 32 query heads; Megatron replicates the 2 KV heads past TP2
+        assert launcher.ScriptArgs(model_variant="glimmer-30b", tp=tp).tp == tp
+    with pytest.raises(AssertionError, match=r"attention heads split over TP \(1, 2, 4, 8\)"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", tp=16)
+    with pytest.raises(AssertionError, match="slices its own input for context parallelism"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", cp=2)
+    with pytest.raises(AssertionError, match="no expert routes"):
+        launcher.ScriptArgs(model_variant="glimmer-30b", routing_replay=True)
+    # the Qwen dense recipes keep their TP sizes
+    with pytest.raises(AssertionError, match=r"attention heads split over TP \(1, 2, 4\)"):
+        launcher.ScriptArgs(model_variant="27b", tp=8)
+
+
+def test_muse_glimmer_model_definition_matches_the_checkpoint_shape():
+    from miles.utils.external_utils.model_args_utils import load_model_args
+
+    tokens = load_model_args("muse-glimmer-30B").split()
+    flags = dict(zip(tokens, tokens[1:], strict=False))  # each flag to the token after it
+    expected = {
+        "--num-layers": "52",
+        "--hidden-size": "6656",
+        "--ffn-hidden-size": "19968",
+        "--num-attention-heads": "32",
+        "--num-query-groups": "2",
+        "--kv-channels": "128",
+        "--norm-epsilon": "1e-5",
+        "--rotary-base": "500000",
+        "--vocab-size": "202048",
+        "--make-vocab-size-divisible-by": "1",
+    }
+    assert {flag: flags[flag] for flag in expected} == expected
+    assert "--untie-embeddings-and-output-weights" in tokens and "--attention-output-gate" in tokens

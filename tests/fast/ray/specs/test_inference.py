@@ -24,6 +24,7 @@ from miles.ray.specs.inference import (
 )
 from miles.rollout.session.config import SessionServerConfig
 from miles.router.config import MilesRouterConfig
+from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.workers.argv_utils import parse_config_argv
 from miles.utils.workers.worker_spec import HostAndPort, LaunchCommandContext, WorkerMetaContext
 
@@ -365,6 +366,20 @@ class TestInferenceEngineEnvVars:
 
         assert envs["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
         assert envs["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "true"
+
+    def test_the_engines_keep_idle_connections_far_longer_than_any_client(self, monkeypatch):
+        """At SGLang's 5 s default an idle connection could be closed under a request the trainer had just sent
+        (httpx's own default expiry is the same 5 s), and a weight sync died of the TCP reset."""
+        monkeypatch.delenv("SGLANG_TIMEOUT_KEEP_ALIVE", raising=False)
+
+        keep_alive = float(compute_inference_engine_env_vars(make_args())["SGLANG_TIMEOUT_KEEP_ALIVE"])
+
+        assert keep_alive >= 60 * GeneralHttpClientProvider._KEEPALIVE_EXPIRY
+
+    def test_an_operator_can_still_set_the_engines_keep_alive(self, monkeypatch):
+        monkeypatch.setenv("SGLANG_TIMEOUT_KEEP_ALIVE", "30")
+
+        assert compute_inference_engine_env_vars(make_args())["SGLANG_TIMEOUT_KEEP_ALIVE"] == "30"
 
     def test_custom_all_reduce_v2_is_disabled_only_for_colocated_multi_gpu_engines(self, monkeypatch):
         """Only a colocated engine spanning several gpus hits the v2 all-reduce conflict; disabling it elsewhere

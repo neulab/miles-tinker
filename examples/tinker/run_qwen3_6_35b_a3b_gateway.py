@@ -1,9 +1,37 @@
 """Tinker gateway launcher for Qwen3.6 hybrid GDN/attention models.
 
-``--model-variant 35b-a3b`` retains the MoE recipe. ``--model-variant 27b``
-selects the dense model with TP4/EP1 training, TP8/EP1 inference, and no
-routing replay. Custom preserve-thinking snapshots can be supplied through
-``--model-name`` and ``--hf-checkpoint``.
+The default ``--model-variant 35b-a3b`` retains the existing MoE recipe.
+``--model-variant 27b`` selects the dense model definition, TP4/EP1 training,
+TP8/EP1 inference, and disables routing replay. ``--model-variant 4b`` is the
+small dense Qwen3.5-4B (same hybrid GDN/attention VL family, built through the
+bridge): TP1 training, one TP1 engine per GPU, no routing replay, and the
+standard lm head (its embeddings are tied, which the fused head rejects). A
+custom preserve-thinking HF snapshot can be passed through ``--hf-checkpoint``
+and ``--model-name``. The launcher filename is retained for compatibility with
+existing deployments.
+
+``--model-variant glimmer-30b`` is meta-models/Muse-Glimmer-30B, a dense model
+with three sliding-window (2048) layers to one global layer, 32 query and 2 KV
+heads, and a vision tower that stays frozen: TP4 training (TP up to 8, the KV
+heads replicated past 2), TP2 engines (four per node), no routing replay, no
+context parallelism (megatron-bridge's Glimmer model slices its own input for
+CP, which miles pre-shards). It needs a megatron-bridge with the builder-backed
+Glimmer bridge, the Megatron-LM APIs it uses, and transformers 5.15 (the
+overlay of ``deploy/abci/overlays/muse-glimmer``); the fused head applies its
+logit multiplier and softcap. Glimmer's position limit is 131072, so a 128K
+gateway takes ``--context-len 131066`` (the engines get 6 tokens more).
+
+Context parallelism (``--cp N``, full fine-tuning only): each datum is split
+into 2N zigzag chunks, two per CP rank, and DP shrinks to GPUs / (TP*CP).
+``--max-tokens-per-gpu`` is then the per-rank budget; by default it is sized
+for one ``context_len + 1`` row (``ceil((context_len + 1) / 2N) * 2`` rounded up
+to a multiple of TP * ``--data-pad-size-multiplier``, 128 unless ``--extra-args``
+sets it). The GatedDeltaNet layers default to ``--linear-cp-mode headwise``
+(full sequences on 1/CP of the linear heads, which TP*CP must divide): its
+numerics do not depend on the packing and stay closest to CP=1. The chunkwise
+mode (sequence-sharded fla CP kernels, Megatron's default) passes the same
+checks and covers layouts whose TP*CP does not divide the heads. See
+docs/fork/full-finetuning.md.
 
 Serves ``serve_tinker.py`` disaggregated: ``actor_num_nodes`` x 8 GPUs train
 (Megatron, TP1 / EP8 / ETP1, distributed optimizer, full uniform recompute) and
@@ -45,7 +73,9 @@ Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
-  --model-variant: ``35b-a3b`` (default) or ``27b``; selects model and parallelism defaults.
+  --model-variant: ``35b-a3b`` (default), ``27b``, ``4b`` or ``glimmer-30b``; sets
+    architecture, model-name, parallelism and routing defaults. Explicit
+    overrides still win.
   --mode: ``full`` (full fine-tuning, emits ``--tinker-train-mode full``); ``lora``
     is not supported by this recipe yet.
   --model-name: HuggingFace id the gateway advertises.
@@ -54,13 +84,20 @@ Args:
   --checkpoint-root: where ``tinker://`` checkpoints are written.
   --actor-num-nodes / --actor-num-gpus-per-node / --rollout-num-gpus /
     --rollout-num-gpus-per-engine: the train / sample split.
-  --tp / --ep / --etp: tensor, expert and expert-tensor parallel sizes (PP=CP=1).
+  --tp / --ep / --etp: tensor, expert and expert-tensor parallel sizes (PP=1).
     ``--tp 2`` is the memory fallback (``--sequence-parallel`` becomes effective,
     expert DP halves); a resumed run must keep the TP/EP/DP of its save.
-  --max-tokens-per-gpu: packed tokens per training microbatch (one 64k row).
+  --cp: context-parallel size (default 1); ``--linear-cp-mode`` picks the
+    GatedDeltaNet layers' CP mode at ``--cp`` > 1 (``headwise`` default, or
+    ``chunkwise``).
+  --max-tokens-per-gpu: packed tokens per training microbatch and rank (default:
+    one ``context_len + 1`` row, or its zigzag shard at ``--cp`` > 1).
   --context-len: model_input tokens per datum; datums are ``context_len + 1``
-    tokens, the engines get ``context_len + 1`` as context length and
-    ``--rollout-max-context-len context_len``.
+    tokens. The gateway gets ``--rollout-max-context-len context_len`` (prompts
+    up to ``context_len - 1`` tokens, generation clamped to ``context_len``) and
+    the engines ``context_len + 6`` as context length: SGLang refuses a prompt
+    of ``context_length - 6`` tokens or more (``engine_context_length``). MTP
+    decoding reserves another three draft tokens on top of that margin.
   --max-tokens-per-datum / --unit-token-budget / --coalesce-wait-s /
     --coalesce-max-wait-s / --max-concurrent-samples / --lease-timeout-s: the
     gateway limits (``--tinker-*`` flags).
@@ -69,7 +106,7 @@ Args:
   --fused-lm-head / --fused-lm-head-chunk-size: the fused fp32 head; with
     ``--no-fused-lm-head`` the trainer falls back to ``--log-probs-chunk-size``.
   --enable-mtp-training / --mtp-num-layers / --mtp-loss-scaling-factor:
-    opt-in MTP training (one layer, loss factor 0.2); the default keeps it disabled.
+    opt-in Qwen MTP training at CP1 (one layer, loss factor 0.2); disabled by default.
   --mtp-speculative-decoding: opt-in EAGLE decoding with two draft steps,
     top-k 1, and three verification tokens; independent of MTP training.
   --balance-data: Karmarkar-Karp token balancing across DP ranks per unit.
@@ -79,8 +116,11 @@ Args:
   --update-weight-buffer-size: bytes per weight-update batch (2 GiB).
   --sglang-ep-size / --sglang-mem-fraction-static / --sglang-chunked-prefill-size /
     --sglang-max-running-requests / --sglang-max-total-tokens /
-    --sglang-fp32-lm-head: engine knobs (``--sglang-max-total-tokens`` bounds
+  --sglang-fp32-lm-head: engine knobs (``--sglang-max-total-tokens`` bounds
     the KV pool and the pinned routed-experts host cache when set).
+  --sglang-deterministic-inference / --deterministic-nccl-nchannels: enable
+    deterministic inference and match the NCCL algorithm/channel settings on
+    the trainer and engines, which share a weight-broadcast communicator.
   --check-weight-update-equal: compare the first weight push against the
     engines (smoke runs only).
   --extra-args: appended verbatim to the ``serve_tinker.py`` argv.
@@ -95,6 +135,7 @@ Example:
       --actor-num-nodes 2 --rollout-num-gpus 48 --enable-mtp-training --mtp-speculative-decoding
 """
 
+import shlex
 from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
@@ -102,6 +143,7 @@ from typing import Literal
 import typer
 
 import miles.utils.external_utils.command_utils as U
+from miles.utils.tinker_args import cp_shard_tokens, engine_context_length, max_datum_tokens
 
 app = typer.Typer()
 
@@ -114,12 +156,57 @@ class _Recipe:
     ep: int
     sglang_ep_size: int
     routing_replay: bool
+    fused_lm_head: bool = True
+    rollout_num_gpus_per_engine: int = 8
+    # GatedDeltaNet (linear attention) key and value heads: headwise CP needs TP*CP to divide both
+    linear_heads: tuple[int, int] = (16, 32)
+    # A dense model has no experts (EP 1, no routing replay); tp_sizes are the TP sizes its attention heads allow.
+    dense: bool = False
+    tp_sizes: tuple[int, ...] = (1, 2, 4)
+    # Whether the bridge's model takes miles' pre-sharded context-parallel rows (Glimmer's slices them again)
+    context_parallel: bool = True
+    mtp: bool = True
 
 
 _RECIPES = {
     "35b-a3b": _Recipe("apurvaga/Qwen3.6-35B-A3B-preserve-thinking", "qwen3.6-35B-A3B", 1, 8, 8, True),
-    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False),
+    # four KV heads
+    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False, linear_heads=(16, 48), dense=True),
+    # tied embeddings: the fused head takes the output layer's own weight, so the standard head scores
+    "4b": _Recipe(
+        "Qwen/Qwen3.5-4B", "qwen3.5-4B", 1, 1, 1, False, fused_lm_head=False, rollout_num_gpus_per_engine=1, dense=True
+    ),
+    # 32 query and 2 KV heads (Megatron replicates KV heads past TP2); two GPUs per engine, one KV head each
+    "glimmer-30b": _Recipe(
+        "meta-models/Muse-Glimmer-30B",
+        "muse-glimmer-30B",
+        4,
+        1,
+        1,
+        False,
+        rollout_num_gpus_per_engine=2,
+        dense=True,
+        tp_sizes=(1, 2, 4, 8),
+        context_parallel=False,
+        mtp=False,
+    ),
 }
+
+
+# get_batch pads every packed microbatch to a multiple of TP * --data-pad-size-multiplier (miles' default)
+_DEFAULT_PAD_MULTIPLIER = 128
+
+
+def _pad_multiplier(extra_args: str) -> int:
+    """--data-pad-size-multiplier as serve_tinker.py will parse it: the last one in --extra-args, else 128."""
+    value = _DEFAULT_PAD_MULTIPLIER
+    tokens = shlex.split(extra_args)
+    for i, token in enumerate(tokens):
+        if token == "--data-pad-size-multiplier" and i + 1 < len(tokens):
+            value = int(tokens[i + 1])
+        elif token.startswith("--data-pad-size-multiplier="):
+            value = int(token.split("=", 1)[1])
+    return value
 
 
 @dataclass
@@ -127,7 +214,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     mode: str = "full"
-    model_variant: Literal["35b-a3b", "27b"] = "35b-a3b"
+    model_variant: Literal["35b-a3b", "27b", "4b", "glimmer-30b"] = "35b-a3b"
     model_name: str | None = None
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"
@@ -139,15 +226,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
     actor_num_nodes: int = 4
     actor_num_gpus_per_node: int = 8
     rollout_num_gpus: int = 88
-    rollout_num_gpus_per_engine: int = 8
+    rollout_num_gpus_per_engine: int | None = None
 
     # Megatron parallelism: TP1 (num_query_groups=2 caps TP at 2), experts spread over 8 ranks.
     tp: int | None = None
     ep: int | None = None
     etp: int = 1
+    # Context parallelism (full fine-tuning): DP = GPUs / (TP * CP). --linear-cp-mode for the GDN layers
+    # (None: headwise at cp > 1, packing-independent and closest to CP=1; chunkwise on request).
+    cp: int = 1
+    linear_cp_mode: str | None = None
 
     # Training performance knobs: one 64k row (65536 model_input + 1 target token) per DP rank per microbatch.
-    max_tokens_per_gpu: int = 65537
+    # None: one context_len + 1 row per rank (its zigzag shard at cp > 1).
+    max_tokens_per_gpu: int | None = None
     context_len: int = 65536
     balance_data: bool = True
     recompute_args: str = "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"
@@ -169,11 +261,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     routing_prefix_stride: int = 256
     r3_check: bool = False
 
-    # fp32 lm head: fused chunked head in the trainer, fp32 logits on the engines.
-    fused_lm_head: bool = True
+    # fp32 lm head: fused chunked head in the trainer, fp32 logits on the engines (None: the recipe's head).
+    fused_lm_head: bool | None = None
     fused_lm_head_chunk_size: int = 1024
     log_probs_chunk_size: int = 2048  # only without the fused head
-    sglang_fp32_lm_head: bool = True
+    sglang_fp32_lm_head: bool | None = None  # None: follows the trainer head
 
     # Training the draft and using it for inference are independent opt-ins.
     enable_mtp_training: bool = False
@@ -215,26 +307,52 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_chunked_prefill_size: int = 16384
     sglang_max_running_requests: int = 128
     sglang_max_total_tokens: int | None = None
+    sglang_deterministic_inference: bool = False
+    deterministic_nccl_nchannels: int = 8
 
     tinker_port: int = 10613
     extra_args: str = ""
 
     def __post_init__(self):
         recipe = _RECIPES[self.model_variant]
-        for name in ("model_name", "tp", "ep", "sglang_ep_size", "routing_replay"):
+        for name in (
+            "model_name",
+            "tp",
+            "ep",
+            "sglang_ep_size",
+            "routing_replay",
+            "fused_lm_head",
+            "rollout_num_gpus_per_engine",
+        ):
             if getattr(self, name) is None:
                 setattr(self, name, getattr(recipe, name))
-        if self.model_variant == "27b":
-            assert not self.routing_replay, "The dense model has no expert routes to replay"
-            assert self.ep == self.sglang_ep_size == 1, "The dense model requires EP1 on training and inference"
-            assert self.tp in (1, 2, 4), "Qwen3.6-27B training TP must divide its four KV heads"
+        if self.sglang_fp32_lm_head is None:
+            self.sglang_fp32_lm_head = self.fused_lm_head
+        if recipe.dense:
+            assert not self.routing_replay, f"The dense {self.model_variant} model has no expert routes to replay"
+            assert self.ep == self.etp == self.sglang_ep_size == 1, "The dense model requires expert parallelism 1"
+            assert (
+                self.tp in recipe.tp_sizes
+            ), f"--tp {self.tp}: the {self.model_variant} model's attention heads split over TP {recipe.tp_sizes}"
+        assert self.cp >= 1, f"--cp must be positive, got {self.cp}"
+        assert self.cp == 1 or recipe.context_parallel, (
+            f"--cp {self.cp}: the {self.model_variant} model slices its own input for context parallelism, which "
+            "miles pre-shards; train it at --cp 1"
+        )
+        if self.enable_mtp_training or self.mtp_speculative_decoding:
+            assert recipe.mtp, f"The {self.model_variant} recipe does not support Qwen MTP"
         if self.enable_mtp_training:
+            assert self.cp == 1, "Tinker MTP training currently requires --cp 1"
             assert self.mtp_num_layers > 0, "--enable-mtp-training requires --mtp-num-layers > 0"
             assert (
                 isfinite(self.mtp_loss_scaling_factor) and self.mtp_loss_scaling_factor > 0
             ), "--mtp-loss-scaling-factor must be finite and positive"
         if self.mtp_speculative_decoding:
             assert not self.routing_replay, "MTP speculative decoding requires --no-routing-replay"
+        self._resolve_linear_cp_mode(recipe)
+        if self.max_tokens_per_gpu is None:
+            row = self.context_len + 1
+            self.max_tokens_per_gpu = row if self.cp == 1 else cp_shard_tokens(row, self.cp, self.pad_size)
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name.rsplit('/', 1)[-1]}"
         if self.checkpoint_root is None:
@@ -245,18 +363,61 @@ class ScriptArgs(U.ExecuteTrainConfig):
         )
         assert self.pause_generation_mode in ("abort", "retract", "in_place"), self.pause_generation_mode
         assert self.routing_policy in ("strict", "natural"), self.routing_policy
+        assert self.deterministic_nccl_nchannels > 0, self.deterministic_nccl_nchannels
         assert self.rollout_num_gpus % self.rollout_num_gpus_per_engine == 0, (
             f"--rollout-num-gpus {self.rollout_num_gpus} is not a multiple of "
             f"--rollout-num-gpus-per-engine {self.rollout_num_gpus_per_engine}"
         )
-        assert (
-            self.max_tokens_per_gpu >= self.context_len + 1
-        ), f"--max-tokens-per-gpu {self.max_tokens_per_gpu} cannot hold one {self.context_len + 1}-token row"
+        if self.cp == 1:
+            assert (
+                self.max_tokens_per_gpu >= self.context_len + 1
+            ), f"--max-tokens-per-gpu {self.max_tokens_per_gpu} cannot hold one {self.context_len + 1}-token row"
+        else:
+            pad = self.pad_size
+            assert max_datum_tokens(self.max_tokens_per_gpu, self.cp, pad) >= self.context_len + 1, (
+                f"--max-tokens-per-gpu {self.max_tokens_per_gpu} cannot hold the --cp {self.cp} shard of one "
+                f"{self.context_len + 1}-token row (needs {cp_shard_tokens(self.context_len + 1, self.cp, pad)})"
+            )
+
+    def _resolve_linear_cp_mode(self, recipe: _Recipe) -> None:
+        assert self.linear_cp_mode in (None, "chunkwise", "headwise"), self.linear_cp_mode
+        if self.cp == 1:
+            self.linear_cp_mode = None  # no CP: the GDN layers run unsplit
+            return
+        if self.linear_cp_mode is None:
+            self.linear_cp_mode = "headwise"
+        if self.linear_cp_mode == "headwise":
+            split = self.tp * self.cp
+            assert all(heads % split == 0 for heads in recipe.linear_heads), (
+                f"--linear-cp-mode headwise splits the {recipe.linear_heads} GatedDeltaNet key/value heads over "
+                f"TP*CP={split} ranks; pick a layout that divides them or pass --linear-cp-mode chunkwise"
+            )
+
+    @property
+    def pad_size(self) -> int:
+        """get_batch's padding unit per packed microbatch: TP * --data-pad-size-multiplier."""
+        return self.tp * _pad_multiplier(self.extra_args)
 
     @property
     def sglang_context_length(self) -> int:
-        """One token of slack over the datum length: the gateway clamps generation to ``context_len``."""
-        return self.context_len + 1
+        """The engines' context: the gateway admits prompts up to ``context_len - 1`` tokens and clamps
+        generation to ``context_len``, and SGLang refuses the last 6 tokens of its context to prompts.
+        EAGLE additionally reserves the three draft tokens configured below."""
+        return engine_context_length(self.context_len) + (3 if self.mtp_speculative_decoding else 0)
+
+    @property
+    def deterministic_env_vars(self) -> dict[str, str]:
+        if not self.sglang_deterministic_inference:
+            return {}
+        # SGLang otherwise pins channels only on the receivers. NCCL bootstrap
+        # then fails during the initial weight broadcast (1024 vs 512 bytes).
+        nchannels = str(self.deterministic_nccl_nchannels)
+        return {
+            "NCCL_ALGO": "allreduce:tree",
+            "NCCL_MIN_NCHANNELS": nchannels,
+            "NCCL_MAX_NCHANNELS": nchannels,
+            "SGLANG_DETERMINISTIC_NCCL_NCHANNELS": nchannels,
+        }
 
 
 @app.command()
@@ -273,7 +434,7 @@ def serve(args: ScriptArgs):
     """Serve the Tinker gateway (idles until clients connect)."""
     print(
         f"[run] tinker gateway mode={args.mode} {args.model_name}: "
-        f"{args.actor_num_nodes}x{args.actor_num_gpus_per_node} train (TP{args.tp}/EP{args.ep}/ETP{args.etp}) + "
+        f"{args.actor_num_nodes}x{args.actor_num_gpus_per_node} train (TP{args.tp}/CP{args.cp}/EP{args.ep}/ETP{args.etp}) + "
         f"{args.rollout_num_gpus} rollout GPUs ({args.rollout_num_gpus_per_engine} per engine), "
         f"port {args.tinker_port}, checkpoints {args.checkpoint_root}, "
         f"r3={'on' if args.routing_replay else 'off'}/{args.routing_policy}, "
@@ -318,7 +479,8 @@ def serve(args: ScriptArgs):
 
     perf_args = (
         f"--tensor-model-parallel-size {args.tp} "
-        "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
+        f"--pipeline-model-parallel-size 1 --context-parallel-size {args.cp} "
+        f"{f'--linear-cp-mode {args.linear_cp_mode} ' if args.linear_cp_mode else ''}"
         f"--expert-model-parallel-size {args.ep} --expert-tensor-parallel-size {args.etp} "
         "--sequence-parallel "  # a no-op at TP1 (Megatron disables it); effective under --tp 2
         f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
@@ -345,6 +507,7 @@ def serve(args: ScriptArgs):
         f"--sglang-chunked-prefill-size {args.sglang_chunked_prefill_size} "
         f"--sglang-max-running-requests {args.sglang_max_running_requests} "
         f"{'--sglang-enable-fp32-lm-head ' if args.sglang_fp32_lm_head else ''}"
+        f"{'--sglang-enable-deterministic-inference ' if args.sglang_deterministic_inference else ''}"
     )
     if args.sglang_max_total_tokens is not None:
         sglang_args += f"--sglang-max-total-tokens {args.sglang_max_total_tokens} "
@@ -395,6 +558,7 @@ def serve(args: ScriptArgs):
         megatron_model_type=_RECIPES[args.model_variant].megatron_model_type,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
+        extra_env_vars=args.deterministic_env_vars,
     )
 
 

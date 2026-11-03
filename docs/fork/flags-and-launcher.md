@@ -1,8 +1,17 @@
 # Gateway flags and the Qwen3.6 launcher
 
+The existing `examples/tinker/run_qwen3_6_35b_a3b_gateway.py` also accepts
+`serve --model-variant 27b` for Qwen3.6-27B. This selects the dense architecture,
+TP4/EP1 training, TP8/EP1 inference, and no routing replay. Pass a custom
+preserve-thinking checkpoint with `--hf-checkpoint`, and advertise its tokenizer
+path or model identifier with `--model-name`. The default `35b-a3b` variant keeps
+the existing MoE recipe. Node counts remain explicit launcher arguments.
+`--model-variant glimmer-30b` serves meta-models/Muse-Glimmer-30B (below).
+
 The `--tinker-*` flags of `serve_tinker.py`, the two fused-head flags, the
-serve-time validation they trigger, and the launcher that emits them for the
-35B MoE and 27B dense deployments (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`).
+serve-time validation they trigger, the launcher that emits them for Qwen and
+Glimmer (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`), and the gateway
+presets that pin its options per model.
 `FORK.md` lists the files; `full-finetuning.md` covers the training semantics.
 
 ## Flags (`miles/utils/arguments.py`, tinker group)
@@ -46,6 +55,14 @@ In addition to the existing full-mode / LoRA-mode checks:
   `--use-rollout-entropy` (the head yields target log-probs only), and untied
   embeddings. MTP training uses its own chunked auxiliary loss; see
   [the fused-head documentation](fused-lm-head.md#mtp-training).
+- `--enable-mtp-training` requires full fine-tuning, PP1, CP1, a positive
+  MTP layer count, and a finite, nonnegative loss scaling factor.
+- With both `--rollout-max-context-len` and `--sglang-context-length` set, the
+  engine context must be at least the gateway's plus 6
+  (`engine_context_length`). SGLang refuses a prompt of `context_length - 6`
+  tokens or more (`max_req_input_len = context_length - 1 - 5`), while the
+  gateway admits prompts up to `--rollout-max-context-len - 1` tokens; a
+  prompt the engines refuse fails its sample as a server error.
 
 ## The 35B launcher
 
@@ -69,9 +86,9 @@ decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
   `--tinker-max-tokens-per-datum 65537 --tinker-unit-token-budget 2097184
   --tinker-coalesce-wait-s 5.0 --tinker-coalesce-max-wait-s 120.0
   --tinker-max-concurrent-samples 1024 --tinker-lease-timeout-s 600`.
-- `--context-len 65536` drives `--sglang-context-length 65537`,
-  `--rollout-max-context-len 65536` and the `--max-tokens-per-gpu 65537`
-  lower bound.
+- `--context-len 65536` drives `--rollout-max-context-len 65536`,
+  `--sglang-context-length 65542` (the 6 tokens SGLang holds back from
+  prompts, above) and the `--max-tokens-per-gpu 65537` lower bound.
 - No `--sglang-mamba-*` flag: the image resolves
   `mamba_radix_cache_strategy=auto` to `extra_buffer` for
   `Qwen3_5MoeForConditionalGeneration`; `--sglang-max-total-tokens` is emitted
@@ -80,7 +97,7 @@ decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
   a resumed run must keep the TP/EP/DP of its save.
 - `--check-weight-update-equal` is opt-in (smoke runs).
 
-## Dense 27B and MTP options
+## Qwen MTP options
 
 `--model-variant 27b` selects `scripts/models/qwen3.6-27B.py`, TP4/EP1
 training, EP1 inference, and no routing replay. The default model is
@@ -95,8 +112,15 @@ KV heads. Other allocation and context flags work as in the MoE recipe.
 | `--mtp-loss-scaling-factor` | 0.2 | Weight on the draft's token-mean auxiliary loss. |
 | `--mtp-speculative-decoding` | off | Enable EAGLE with two draft steps, top-k 1, three verification tokens, and `extra_buffer` hybrid-state caching. |
 
+These MTP options apply to Qwen checkpoints with pretrained MTP weights;
+they do not enable Glimmer MTP. Training requires PP1/CP1 even though ordinary
+full fine-tuning also supports CP>1.
+
 The training and decoding switches are independent. A frozen-draft benchmark
 uses only `--mtp-speculative-decoding`; a run that updates the draft uses both.
+With speculative decoding enabled, the launcher reserves three additional
+engine context tokens above the standard six-token margin for its three-token
+draft/verification window (two draft steps, top-k 1).
 Speculative decoding rejects routing replay, so the 35B recipe must also pass
 `--no-routing-replay`. The installed SGLang 0.5.19.dev56 uses its speculative
 V2 worker without a separate environment switch. Older serving images may
@@ -112,8 +136,53 @@ MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \
 ```
 
 The default 35B arguments remain covered by the original exact-argument test.
-Recordings for both models and frozen/trained MTP drafts live under
+Recordings for the model variants and frozen/trained Qwen MTP drafts live under
 `tests/snapshots/launch_scripts/py/examples/tinker/run_qwen3_6_35b_a3b_gateway.py/`.
+
+## Gateway presets (`deploy/abci/presets/*.env`)
+
+`deploy/abci/tinker_gateway.pbs` takes `PRESET=<name>` and reads the launcher, `LAUNCHER_ARGS`,
+`EXTRA_ARGS`, the snapshot (`HF_MODEL` at `HF_REVISION` under `$HF_HOME`) and the client's
+`TINKER_SAMPLE_TIMEOUT_SECONDS` from `deploy/abci/presets/<name>.env`; a non-empty job variable
+replaces a preset value (runbook: `deploy/abci/README.md`, section 4).
+
+`qwen3.8-27b-128k` is the fcs-q38 gateway, as rasp's `launch/abci/submit.sh frontiercs-*` submits it,
+with one change: `--model-name` is the HF id `apurvaga/Qwen3.8-27B-preserve-thinking` where fcs-q38
+passed the snapshot path, so the gateway advertises the id and a trainer's `model_name` names the id.
+Through `run_qwen3_6_35b_a3b_gateway.py serve` its options give:
+
+| Preset option | `serve_tinker.py` argv |
+|---|---|
+| `--model-variant 27b` | Megatron model `qwen3.6-27B`, EP1 training, TP8/EP1 engines (`--rollout-num-gpus-per-engine 8 --sglang-ep-size 1`) |
+| `--model-name apurvaga/Qwen3.8-27B-preserve-thinking` | `--tinker-base-model apurvaga/Qwen3.8-27B-preserve-thinking`, the one word that differs from fcs-q38's argv |
+| `--no-routing-replay` | no `--use-rollout-routing-replay` (the dense model has no expert routes) |
+| `--tp 4` | `--tensor-model-parallel-size 4`: DP = 2 x `TRAIN_NODES`, DP10 at fcs-q38's `TRAIN_NODES=5` |
+| `--context-len 131072` | `--rollout-max-context-len 131072`, and the engines' `--sglang-context-length`, which the launcher derives from it |
+| `--max-tokens-per-gpu 131073` | `--max-tokens-per-gpu 131073`: one 128K row per microbatch |
+| `--max-tokens-per-datum 131073 --unit-token-budget 1310730` | `--tinker-max-tokens-per-datum 131073 --tinker-unit-token-budget 1310730`: ten rows per unit |
+| `--extra-env-vars NCCL_DEBUG=INFO` | `NCCL_DEBUG=INFO` in the Ray job's environment |
+| `EXTRA_ARGS` | appended last, so they win: `--sglang-attention-backend fa3`, `--lr 1e-6` (the optimizer's initial lr; every `optim_step` sends its own Adam parameters), `--router-policy cache_aware --router-balance-abs-threshold 16 --router-balance-rel-threshold 1.5` |
+
+`muse-glimmer-30b-128k` (5 nodes, `TRAIN_NODES=3`) and `muse-glimmer-30b-64k` (2 nodes) serve
+meta-models/Muse-Glimmer-30B at `a4e59da5`. They need the overlay of `deploy/abci/overlays/muse-glimmer`
+(`ROOTFS`, `EXTRA_SITE` and an `HF_HOME` with the snapshot, as job variables):
+
+| Preset option | `serve_tinker.py` argv |
+|---|---|
+| `--model-variant glimmer-30b` | Megatron model `muse-glimmer-30B` (shape only: megatron-bridge's ModelBuilder builds the model), TP4/EP1 training without routing replay or CP, the fused fp32 head with Glimmer's multiplier and softcap on both sides (`--fused-lm-head-logprobs`, `--sglang-enable-fp32-lm-head`), TP2 engines (`--rollout-num-gpus-per-engine 2`, four per node), the vision tower frozen |
+| `--context-len 131066` | `--rollout-max-context-len 131066` and `--sglang-context-length 131072`, Glimmer's `max_position_embeddings` (131072 would ask SGLang for 131078 positions, which it refuses) |
+| `--max-tokens-per-gpu 131067 --max-tokens-per-datum 131067 --unit-token-budget 1310670` | one 128K row per microbatch, ten per unit |
+| `EXTRA_ARGS` | as the Qwen3.8 preset's, plus `--sglang-language-model-only` (the engines skip the vision tower and the pushed vision weights; HF exports keep it) |
+
+The 64k preset is the two-node layout, a smoke of the 5-node gateway: it checks the first weight push against the
+engines (`--check-weight-update-equal`). There two DP ranks hold half of the optimizer state each; a training GPU
+peaks at 101 GiB on a 64K row and at 120.5 GiB on a 131K row.
+
+`tests/fast/fork/test_qwen36_gateway_launcher.py` builds both argvs through the launcher's CLI and
+requires that only `--tinker-base-model` differs, and requires every preset's options to parse with
+its launcher (its `--sglang-*` flags included, against the allowlist below);
+`tests/fast/fork/test_deploy_dry_run.py` pins the preset to fcs-q38's strings and checks that the job
+renders a preset exactly as it renders the same job variables.
 
 ## The `--sglang-*` allowlist
 

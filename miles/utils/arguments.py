@@ -419,6 +419,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "every step. Ignored for text-only providers."
                 ),
             )
+            reset_arg(
+                parser,
+                "--linear-cp-mode",
+                choices=["chunkwise", "headwise"],
+                # unset: no attribute, so core_transformer_config_from_args and the bridge providers keep
+                # TransformerConfig's own default (chunkwise)
+                default=argparse.SUPPRESS,
+                help=(
+                    "Context-parallel mode of linear-attention (GatedDeltaNet) layers at --context-parallel-size > 1 "
+                    "(Megatron's TransformerConfig.linear_cp_mode; unset keeps the model config's own, chunkwise): "
+                    "'chunkwise' keeps every head and shards the sequence (fla CP kernels); 'headwise' all-to-alls "
+                    "to full sequences on a 1/CP slice of the heads (needs the linear heads divisible by TP*CP). "
+                    "Attention layers follow --cp-comm-type."
+                ),
+            )
             parser.add_argument(
                 "--dsa-attention-backend",
                 choices=["megatron", "tilelang"],
@@ -1958,6 +1973,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "With --use-rollout-routing-replay: a datum without cached routing fails the request "
                     "('strict') or trains through the live router with a logged metric ('natural', default)"
+                ),
+            )
+            parser.add_argument(
+                "--tinker-routing-capture-mode",
+                choices=["auto", "full", "incremental"],
+                default="auto",
+                help=(
+                    "R3 capture: auto returns full routing for retract-mode engines and incremental routing otherwise. "
+                    "Full capture shares stored prefixes only after comparing the captured expert IDs."
                 ),
             )
             parser.add_argument(

@@ -71,6 +71,28 @@ is handled by the wrapper: it all-gathers the SP hidden states with
 `gather_from_sequence_parallel_region` (backward reduce-scatters), otherwise
 `copy_to_tensor_model_parallel_region` (backward all-reduces dHidden).
 
+## Output transforms (Muse Glimmer)
+
+The fused path replaces the head's `forward`, so whatever that forward does after the projection would be skipped
+without an error. `install` therefore asks which class defines the `forward` the head runs
+(`fused_lm_head.output_transform`):
+
+- Megatron's `ColumnParallelLinear`, and GPTModel's `LinearCrossEntropyModule` (every GPT and Qwen head: its
+  `forward` is `ColumnParallelLinear`'s unless asked for fused cross-entropy loss, which the wrapper
+  implements with chunked CE for MTP): nothing after the projection.
+- megatron-bridge's `MuseGlimmerOutputLayerMixin` (Muse Glimmer, put on the head with `extend_instance`):
+  `logits * config.output_multiplier` (0.19611613513818404, 1/sqrt(26)), then
+  `final_logit_softcapping * tanh(logits / final_logit_softcapping)` (cap 20).
+- Any other class (a Gemma softcap mixin, a subclass that overrides `forward`): `install` refuses
+  (`RuntimeError`), so a run either reproduces the head exactly or trains with `--no-fused-lm-head`.
+
+Each chunk applies the transform to its fp32 projection in SGLang's order (`logit_scale`, then the softcap, both in
+fp32 under `--sglang-enable-fp32-lm-head`) before the temperature and the log-softmax. The backward multiplies the
+logit gradient by the transform's derivative, `multiplier * (1 - tanh^2)` (one extra fp32 `[chunk, V/TP]` tensor per
+chunk), before it is cast for the two gradient GEMMs. Without the fix the fused head scored Glimmer's raw projection,
+logits about 5 times too large and uncapped; megatron-bridge's own mixin runs the transform in bf16 (max error 0.12 in
+a capped logit), the fused head in fp32 (2e-6 against SGLang's fp32 head).
+
 ## Flags and requirements
 
 - `--fused-lm-head-logprobs` (store_true) turns the head on; the modules read
@@ -79,7 +101,9 @@ is handled by the wrapper: it all-gathers the SP hidden states with
   `--log-probs-chunk-size` is not used while the fused head is active.
 - Requirements checked at install time (`RuntimeError`): exactly one lm head
   per pipeline rank (VPP=1), no lm-head bias, `gather_output=False`, no
-  `disable_grad_reduce`, no `defer_embedding_wgrad_compute`, and no MuP.
+  `disable_grad_reduce`, no `defer_embedding_wgrad_compute`, no MuP, and a
+  head class whose output transform it knows (above). An MTP block must use
+  detached heads (`mtp_detach_heads=True`).
 - Unsupported while active (`AssertionError`/`RuntimeError`): entropy
   (`use_rollout_entropy`), `--true-on-policy-mode`, sampling masks,
   `runtime_gather_output`. MTP's `output_cross_entropy_loss` uses chunked CE.
@@ -118,8 +142,9 @@ MTP parameters with `grad_norm_group='mtp'` and clip them separately. Older
 versions with a shared clipping norm can couple the policy's update magnitude
 to the draft gradient despite the detached loss.
 
-The initial integration supports full fine-tuning with pipeline and context
-parallelism both set to 1. It requires a Megatron runtime whose MTP loss path
+The initial MTP integration supports full fine-tuning with pipeline and context
+parallelism both set to 1; the ordinary policy path still supports context
+parallelism greater than 1. It requires a Megatron runtime whose MTP loss path
 accepts a linear-cross-entropy implementation hook; older runtimes fail the
 capability check instead of falling back to a full-vocabulary allocation.
 
@@ -148,7 +173,11 @@ bf16 tolerance; both weight-gradient paths (`main_grad` present / absent); a
 fake 2-shard TP (two threads, barrier-based all-reduce) with and without
 sequence parallelism; install guards; wrapper passthrough and errors;
 `maybe_activate` on/off; dispatch through `calculate_log_probs_and_entropy`
-and `get_log_probs_and_entropy` with `[1, T, H]` hidden states.
+and `get_log_probs_and_entropy` with `[1, T, H]` hidden states; the output
+transform (Glimmer's 0.196 multiplier and cap 20 on inputs that reach the cap,
+a cap that bites on most logits, a multiplier alone) against an fp32 autograd
+reference in forward and backward, with a temperature and on the fake 2-shard
+TP; the head classes it knows and the one it refuses.
 
 Integration on the 5-node smoke (design 4.7 b/c, run after the launcher lands):
 

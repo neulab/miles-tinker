@@ -164,13 +164,27 @@ def reduce_marked_lora_grads(model: Sequence[torch.nn.Module]) -> None:
                 g.copy_(red)
 
 
+# The modules that hold LoRA adapters: a Megatron-Bridge adapter wrapper's ``adapter`` (linear_in, linear_out) and a
+# multi-LoRA layer's ``adapters.<slot>``. Other LoRA parameters are named ``lora_*`` (lora_A, lora_B, Inkling's
+# lora_adapter). A model's own module whose name only contains "adapter", such as Muse Glimmer's vision_adapter,
+# holds none.
+_LORA_ADAPTER_MODULES = frozenset({"adapter", "adapters"})
+
+
+def _names_lora_parameter(name: str) -> bool:
+    return "lora_" in name or not _LORA_ADAPTER_MODULES.isdisjoint(name.split("."))
+
+
 def is_lora_model(model: Sequence[torch.nn.Module]) -> bool:
-    """Check if model has LoRA layers applied."""
+    """Check if model has LoRA layers applied: a PEFT config, or a parameter of a LoRA adapter.
+
+    A model with none saves (``save``) and exports (``hf_export``) all its weights: matching any name that contains
+    "adapter" took Muse Glimmer's vision_adapter for LoRA, so its full fine-tuning checkpoints held no weights."""
     for model_chunk in model:
         if hasattr(model_chunk.module, "peft_config"):
             return True
         for name, _ in model_chunk.named_parameters():
-            if "lora_" in name or "adapter" in name:
+            if _names_lora_parameter(name):
                 return True
     return False
 

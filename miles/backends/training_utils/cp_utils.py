@@ -437,6 +437,73 @@ def slice_log_prob_with_cp(
         return torch.cat([chunk_1, chunk_2], dim=0)
 
 
+def gather_cp_response_values(
+    values: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    *,
+    scalars: list[torch.Tensor] | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Full-response vectors from this rank's zigzag CP shards, with one CP all-reduce.
+
+    ``values[i]`` is sample i's local response slice in the layout of
+    :func:`slice_log_prob_with_cp` (empty when this rank holds no response token
+    of the sample). Every response position belongs to exactly one CP rank, so
+    summing zero-filled full-length vectors over the CP group rebuilds each
+    vector exactly. ``scalars`` (e.g. each sample's partial loss on this rank)
+    ride the same collective and come back summed over the group.
+
+    Every rank of the CP group must call this with the same samples. Returns
+    ``(vectors, summed_scalars)``: detached CPU tensors (one device-to-host copy
+    for the whole batch) in each input's dtype. At cp_size 1 no collective runs.
+    """
+    parallel_state = get_parallel_state()
+    values = [value.detach() for value in values]
+    scalars = [scalar.detach().reshape(()) for scalar in scalars or []]
+    if not values and not scalars:
+        return [], []
+
+    if parallel_state.cp.size > 1:
+        max_seq_lens = max_seq_lens or [None] * len(values)
+        full_values = [
+            _zero_filled_response(value, total_length, response_length, qkv_format, max_seq_len)
+            for value, total_length, response_length, max_seq_len in zip(
+                values, total_lengths, response_lengths, max_seq_lens, strict=True
+            )
+        ]
+    else:
+        full_values = [value.float() for value in values]
+
+    parts = list(full_values)
+    if scalars:
+        parts.insert(0, torch.stack(scalars).float().to((values or scalars)[0].device))
+    flat = torch.cat(parts)
+    if parallel_state.cp.size > 1:
+        dist.all_reduce(flat, group=parallel_state.cp.group)
+    flat = flat.cpu()
+
+    summed = [total.clone().to(scalar.dtype) for total, scalar in zip(flat[: len(scalars)], scalars, strict=True)]
+    vectors = flat[len(scalars) :].split([full.numel() for full in full_values])
+    return [full.clone().to(value.dtype) for full, value in zip(vectors, values, strict=True)], summed
+
+
+def _zero_filled_response(
+    value: torch.Tensor, total_length: int, response_length: int, qkv_format: str, max_seq_len: int | None
+) -> torch.Tensor:
+    """fp32 ``[response_length]`` zeros holding this rank's local response values at their positions."""
+    positions = slice_log_prob_with_cp(
+        torch.arange(response_length, device=value.device), total_length, response_length, qkv_format, max_seq_len
+    )
+    assert positions.numel() == value.numel(), (
+        f"{value.numel()} local values for {positions.numel()} local response positions "
+        f"(total_length={total_length}, response_length={response_length})"
+    )
+    full = torch.zeros(response_length, dtype=torch.float32, device=value.device)
+    return full.index_copy_(0, positions, value.float())
+
+
 def assemble_log_prob_from_cp(
     chunks: dict[int, torch.Tensor],
     total_length: int,

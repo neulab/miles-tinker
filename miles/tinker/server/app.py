@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, Response
 
 from miles.tinker.core.promise import FAILED, PENDING
 from miles.tinker.core.service import TinkerService
-from miles.tinker.core.types import OwnershipError, UserInputError
+from miles.tinker.core.types import ConflictError, NotFoundError, OwnershipError, PermissionDeniedError, UserInputError
 from miles.tinker.server.encoding import decode_command, decode_forward_request, decode_sample_request, render_result
 from miles.tinker.server.proto_codec import (
     PROTO_CONTENT_TYPE,
@@ -26,6 +26,8 @@ from miles.tinker.server.proto_codec import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DELETE_STATUS = {UserInputError: 400, PermissionDeniedError: 403, NotFoundError: 404, ConflictError: 409}
 
 COMMAND_ROUTES = {
     "/api/v1/optim_step": "optim_step",
@@ -78,6 +80,9 @@ def build_app(service: TinkerService) -> FastAPI:
     @app.get("/api/v1/healthz")
     @app.get("/health")
     async def healthz():
+        problem = service.health_problem()
+        if problem is not None:
+            return JSONResponse(status_code=503, content={"status": "unavailable", "error": problem})
         return {"status": "ok"}
 
     @app.post("/api/v1/client/config")
@@ -189,15 +194,19 @@ def build_app(service: TinkerService) -> FastAPI:
                 return JSONResponse(
                     status_code=408, content={"type": "try_again", "request_id": request_id, "queue_state": "active"}
                 )
-        service.promises.delivered(promise)
         if promise.state == FAILED:
-            return JSONResponse({"error": promise.error, "category": promise.error_category})
-        encoder = PROTO_ENCODERS.get(promise.result["kind"])
-        if encoder is not None and PROTO_CONTENT_TYPE in request.headers.get("accept", ""):
-            return Response(content=encoder(promise.result), media_type=PROTO_CONTENT_TYPE)
-        # an explicit JSONResponse: returning the dict would first send every token and
-        # logprob through FastAPI's jsonable_encoder
-        return JSONResponse(render_result(promise.result))
+            response = JSONResponse({"error": promise.error, "category": promise.error_category})
+        else:
+            encoder = PROTO_ENCODERS.get(promise.result["kind"])
+            if encoder is not None and PROTO_CONTENT_TYPE in request.headers.get("accept", ""):
+                response = Response(content=encoder(promise.result), media_type=PROTO_CONTENT_TYPE)
+            else:
+                # Avoid FastAPI's recursive jsonable_encoder on every token.
+                response = JSONResponse(render_result(promise.result))
+        # A serialization failure has not delivered the result. Do not shorten
+        # its TTL and replace the real error with a misleading promise-expired.
+        service.promises.delivered(promise)
+        return response
 
     @app.post("/api/v1/cancel_future")
     async def cancel_future(request: Request):
@@ -241,7 +250,18 @@ def build_app(service: TinkerService) -> FastAPI:
 
     @app.delete("/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_id:path}")
     async def delete_checkpoint(request: Request, model_id: str, checkpoint_id: str):
-        service.delete_checkpoint(_tenant(request), model_id, checkpoint_id)
+        # The official service's checkpoint routes answer FastAPI HTTPExceptions, {"detail": ...}: 400 for an
+        # invalid id, 404 for a checkpoint that is missing or not the caller's, 409 for a state conflict.
+        try:
+            service.delete_checkpoint(_tenant(request), model_id, checkpoint_id)
+        except (UserInputError, PermissionDeniedError, NotFoundError, ConflictError) as error:
+            status_code = _DELETE_STATUS[type(error)]
+            logger.info(f"checkpoint delete of {model_id}/{checkpoint_id} refused ({status_code}): {error}")
+            return JSONResponse(status_code=status_code, content={"detail": str(error)})
+        except OSError as error:
+            logger.exception(f"checkpoint delete of {model_id}/{checkpoint_id} failed")
+            detail = f"checkpoint delete failed: {error.strerror or error}"
+            return JSONResponse(status_code=500, content={"detail": detail})
         return Response(status_code=204)
 
     return app

@@ -51,6 +51,7 @@ from megatron.core.optimizer import MegatronOptimizer
 from miles.backends.megatron_utils import tinker_mtp, tinker_perf
 from miles.backends.megatron_utils.adam_params import apply_adam_params, set_clip_grad, should_veto_step
 from miles.backends.megatron_utils.checkpoint import load_checkpoint
+from miles.backends.megatron_utils.cp_model_config import check_per_token_loss_flag
 from miles.backends.megatron_utils.lora.optimizer import reset_grad_metadata_keep_grads
 from miles.backends.megatron_utils.model import (
     _has_loadable_ckpt,
@@ -66,6 +67,7 @@ from miles.backends.training_utils.loss_hub import fused_lm_head
 from miles.backends.training_utils.loss_hub.tinker_losses import drain_per_datum_outputs, start_per_datum_outputs
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.replay_data import rollout_replay_stage
+from miles.backends.training_utils.tinker_numerics import finite_per_datum_reports
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -78,7 +80,7 @@ logger = logging.getLogger(__name__)
 SAVE_ITERATION = 1
 
 # Single tenant: one accumulation window per process.
-_state = {"pending_finalize": False, "dirty": False, "num_updates": 0}
+_state = {"pending_finalize": False, "dirty": False, "nonfinite_output": False, "num_updates": 0}
 _mtp_window = tinker_mtp.MTPWindow()
 
 
@@ -111,6 +113,9 @@ def forward_backward(
     for model_chunk in model:
         model_chunk.train()
     config = setup_train_iteration_config(args, model, optimizer, disable_optimizer=False)
+    # the schedule reads the flag from the config on every call; a reset that did not hold (or a later
+    # rebuild that turned it back on) would scale this unit's gradients by num_microbatches * |DP*CP|
+    check_per_token_loss_flag(config, args)
     config.finalize_model_grads_func = _deferred_finalize
     reset_grad_metadata_keep_grads(model)
 
@@ -139,6 +144,7 @@ def forward_backward(
         raise
     finally:
         per_datum_outputs = drain_per_datum_outputs()
+    per_datum_outputs = _check_per_datum_outputs(unit_id, per_datum_outputs, rollout_data)
     dumper_phase_util.finalize(model)
     tinker_perf.note_unit(Timer().seq_lens, tinker_perf.unit_shape(args, rollout_data, data_iterator))
 
@@ -148,6 +154,7 @@ def forward_backward(
 
 
 def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, adam_params: dict) -> dict:
+    nonfinite_output = _state["nonfinite_output"]
     mtp_metrics = {}
     if getattr(args, "enable_mtp_training", False) and _state["pending_finalize"] and not _state["dirty"]:
         mtp_metrics = _mtp_window.normalize_gradients(model, dp_group=get_parallel_state().intra_dp.group)
@@ -161,13 +168,39 @@ def optim_step(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimiz
         "lr": adam_params["learning_rate"],
         "num_updates": _state["num_updates"],
     }
+    if nonfinite_output:
+        metrics["nonfinite_output"] = 1
     return {**metrics, **mtp_metrics, **tinker_perf.pop_optim_window_metrics(args)}
+
+
+def _check_per_datum_outputs(unit_id: int, outputs: list[dict], rollout_data: RolloutBatch) -> list[dict]:
+    reports, diagnostics = finite_per_datum_reports(outputs)
+    invalid = torch.tensor(bool(diagnostics), dtype=torch.int32)
+    # Every rank must take the same branch at optim_step, including ranks with
+    # no bad local rows. Otherwise some would enter finalize's collectives alone.
+    if dist.is_initialized():
+        dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=get_gloo_group())
+    if invalid.item():
+        _state["dirty"] = True
+        _state["nonfinite_output"] = True
+    if diagnostics:
+        indices = {int(index): i for i, index in enumerate(rollout_data.get("sample_indices", []))}
+        for diagnostic in diagnostics:
+            local_index = indices.get(int(diagnostic["sample_index"]))
+            if local_index is not None:
+                diagnostic["tokens"] = rollout_data["total_lengths"][local_index]
+                for field in ("rollout_log_probs", "advantages"):
+                    if field in rollout_data:
+                        values = torch.as_tensor(rollout_data[field][local_index])
+                        diagnostic[f"nonfinite_{field}"] = int((~torch.isfinite(values)).sum().item())
+        logger.error("tinker nonfinite output: unit=%s; optimizer window vetoed; datums=%s", unit_id, diagnostics)
+    return reports
 
 
 def _step_accumulated_grads(model, optimizer, adam_params: dict) -> tuple[float, int]:
     """Finalize once, apply this step's AdamParams, veto non-finite grads, step. Returns (grad_norm, skipped)."""
     if _state["dirty"]:
-        logger.warning("optim_step: discarding a window with a failed forward_backward")
+        logger.warning("optim_step: discarding a window with a failed or non-finite forward_backward")
         discard_grads(model, optimizer)
         return float("nan"), 1
     if _state["pending_finalize"]:
@@ -195,12 +228,14 @@ def discard_grads(model: Sequence[DDP], optimizer: MegatronOptimizer) -> None:
     """Drop the accumulated window: zero DDP grad buffers and optimizer grads."""
     _zero_grads(model, optimizer, False)
     _state["pending_finalize"] = False
+    _state["nonfinite_output"] = False
     _state["dirty"] = False
     _mtp_window.reset()
 
 
 def save_state(args: Namespace, model: Sequence[DDP], optimizer: MegatronOptimizer, path: str) -> None:
     """Megatron torch_dist checkpoint (model + optimizer) under ``path``; complete on return."""
+    _initialize_optimizer_state(optimizer)
     with inplace_modify_args(args, {"save": path, "async_save": False}):
         save(SAVE_ITERATION, model, optimizer, None)
     _barrier()
@@ -227,6 +262,8 @@ def load_state(
     if not load_optimizer:
         optimizer.reload_model_params()
         reset_optimizer_state(optimizer)
+    else:
+        _reset_unstepped_optimizer_state(optimizer)
     discard_grads(model, optimizer)
     _barrier()
 
@@ -246,8 +283,11 @@ def reset_to_base(args: Namespace, model: Sequence[DDP], optimizer: MegatronOpti
 
 def reset_optimizer_state(optimizer: MegatronOptimizer) -> None:
     """Zero Adam moments and step clocks in place (group-level FusedAdam or per-param torch Adam)."""
+    _initialize_optimizer_state(optimizer)
     for child in getattr(optimizer, "chained_optimizers", [optimizer]):
         inner = child.optimizer
+        if inner is None:
+            continue
         for group in inner.param_groups:
             if "step" in group:
                 group["step"] = _zeroed_step(group["step"])
@@ -257,6 +297,29 @@ def reset_optimizer_state(optimizer: MegatronOptimizer) -> None:
                     state[key].zero_()
             if "step" in state:
                 state["step"] = _zeroed_step(state["step"])
+
+
+def _initialize_optimizer_state(optimizer: MegatronOptimizer) -> None:
+    # FusedAdam allocates moments lazily. A checkpoint saved before its first
+    # step must contain real zero moments, not leave load-time empty buffers.
+    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
+        initialize = getattr(child, "init_state_fn", None)
+        if child.optimizer is not None and initialize is not None:
+            initialize(child.optimizer, child.config)
+
+
+def _reset_unstepped_optimizer_state(optimizer: MegatronOptimizer) -> None:
+    # Older pre-step checkpoints can restore uninitialized Adam moments. No
+    # step means there is no history to preserve. Trained optimizers retain it.
+    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
+        inner = child.optimizer
+        if inner is None:
+            continue
+        clocks = [group.get("step", 0) for group in inner.param_groups]
+        clocks.extend(state.get("step", 0) for state in inner.state.values())
+        if all(float(step) == 0 for step in clocks):
+            logger.info("Resetting unstepped Adam state after checkpoint load")
+            reset_optimizer_state(child)
 
 
 def _zeroed_step(step):

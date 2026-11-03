@@ -41,6 +41,7 @@ import torch
 import torch.distributed as dist
 
 from miles.utils.device_flops import local_peak_bf16_tflops
+from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.flops_utils import calculate_fwd_flops, ensure_hf_layer_pattern, fwd_tflops_per_gpu
 from miles.utils.timer import Timer
 
@@ -424,19 +425,37 @@ def _stage_metrics(stages: dict[str, float], actor_train_time: float) -> dict[st
 
 
 def _peak_memory_metrics() -> dict[str, float]:
-    """This rank's peak CUDA memory over the window, then reset the peak.
+    """This rank's peak CUDA memory over the window and the maximum over all trainer
+    ranks (``*_all_ranks``), then reset the peak.
 
     The headroom decides whether a bigger ``--max-tokens-per-gpu`` (or one more
     row per DP rank) fits, and an OOM 20 h into a run is otherwise the first
-    time anyone learns how close it was. Reset per window so the number tracks
-    the current shape rather than a startup transient.
+    time anyone learns how close it was. The gateway keeps rank 0's metrics, and
+    ranks differ (MoE load imbalance under R3, uneven zigzag CP shards), so the
+    all-rank maximum is the number to plan with. Reset per window so the numbers
+    track the current shape rather than a startup transient.
     """
     if not torch.cuda.is_available():
         return {}
     gib = 1024**3
-    peak = {
-        "actor_peak_mem_alloc_gib": torch.cuda.max_memory_allocated() / gib,
-        "actor_peak_mem_reserved_gib": torch.cuda.max_memory_reserved() / gib,
-    }
+    local = [torch.cuda.max_memory_allocated() / gib, torch.cuda.max_memory_reserved() / gib]
     torch.cuda.reset_peak_memory_stats()
+    peak = {"actor_peak_mem_alloc_gib": local[0], "actor_peak_mem_reserved_gib": local[1]}
+    maxima = _max_over_ranks(local)
+    if maxima is not None:
+        peak.update(actor_peak_mem_alloc_gib_all_ranks=maxima[0], actor_peak_mem_reserved_gib_all_ranks=maxima[1])
     return peak
+
+
+def _max_over_ranks(values: list[float]) -> list[float] | None:
+    """Elementwise maximum over every trainer rank (one gloo all-reduce, which every rank's
+    optim_step reaches); None in a single process or before the gloo group exists."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return None
+    try:
+        group = get_gloo_group()
+    except RuntimeError:
+        return None
+    maxima = torch.tensor(values, dtype=torch.float64)
+    dist.all_reduce(maxima, op=dist.ReduceOp.MAX, group=group)
+    return maxima.tolist()

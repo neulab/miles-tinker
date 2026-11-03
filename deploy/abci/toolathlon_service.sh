@@ -57,7 +57,8 @@ GUARD_ARGV=(/usr/bin/python3 -I "$MEMORY_GUARD"
 
 # ---------------------------------------------------------------- preconditions
 [[ $ENVIRONMENT_SET == toolathlon_only ]] || die "OPENREWARD_ENVIRONMENT_SET must be toolathlon_only, got $ENVIRONMENT_SET"
-[[ $REWARD_MODE == partial ]] || die "OPENREWARD_REWARD_MODE must be partial, got $REWARD_MODE"
+[[ $REWARD_MODE == partial || $REWARD_MODE == binary ]] || die "OPENREWARD_REWARD_MODE must be partial or binary, got $REWARD_MODE"
+log "reward_mode=$REWARD_MODE"
 [[ $RUNTIME == /* && -x $RUNTIME ]] || die "container runtime missing or not absolute: $RUNTIME"
 [[ -x $MKFS_EXT3 ]] || die "mkfs.ext3 is missing: $MKFS_EXT3"
 [[ -r $MEMORY_GUARD ]] || die "memory guard is missing: $MEMORY_GUARD"
@@ -84,7 +85,7 @@ STAGE_ARGV=("$RUNTIME" exec --fakeroot --cleanenv --no-home
   --bind "$STATE:/mnt/state,$STAGER:/app/openreward-toolathlon-stage-pgdata.sh:ro"
   "$LOCAL_SIF" /app/openreward-toolathlon-stage-pgdata.sh "$PGDATA_CONTAINER")
 MKFS_ARGV=("$MKFS_EXT3" -q -F -d "$LOCAL_ROOT/overlay-layout" "$OVERLAY")
-CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --overlay "$OVERLAY"
+CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --pid --overlay "$OVERLAY"
   --bind "$STATE:/mnt/state,$ENTRYPOINT:/app/openreward-toolathlon-resilient-entrypoint.sh:ro"
   "$LOCAL_SIF"
   env HOME=/mnt/state/home UV_CACHE_DIR=/mnt/state/cache/uv "${PORTABLE_ENV[@]}"
@@ -94,7 +95,7 @@ CONTAINER_ARGV=("$RUNTIME" exec --cleanenv --no-home --overlay "$OVERLAY"
       OPENREWARD_STATE_DIR=/mnt/state "OPENREWARD_PGDATA=$PGDATA_CONTAINER"
       "OPENREWARD_PG_PORT=$PG_PORT" "OPENREWARD_PG_MAX_CONNECTIONS=$PG_MAX_CONNECTIONS"
       "OPENREWARD_PORT=$PORT" "OPENREWARD_WORKER_BASE_PORT=$WORKER_BASE_PORT" "OPENREWARD_WORKERS=$WORKERS"
-      OPENREWARD_WORKER_PID_ISOLATION=0
+      OPENREWARD_WORKER_PID_ISOLATION=1
       /app/openreward-toolathlon-resilient-entrypoint.sh)
 if dry; then
   echo "DRY_RUN resolved_sif: $OPENREWARD_TOOLATHLON_SIF"
@@ -127,7 +128,9 @@ rmdir "$LOCAL_ROOT/overlay-layout/upper" "$LOCAL_ROOT/overlay-layout/work" "$LOC
 
 # ---------------------------------------------------------------- supervision (child or guard dies -> TERM the other, exit 1)
 container_pid=; guard_pid=; cleanup_started=0
-port_closed() { ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$PORT\$"; }
+# The readers below read to the end. Under pipefail, one that quits early (grep -q, head) can leave its writer to die of
+# SIGPIPE: that fails the pipeline (a listening port reads as closed) and, through errexit, the helper.
+port_closed() { ! ss -ltn 2>/dev/null | awk -v port="$PORT" '$4 ~ ("(^|:)" port "$") {open = 1} END {exit !open}'; }
 cleanup() {
   local st=${1:-$?} t
   ((cleanup_started)) && return; cleanup_started=1; trap - EXIT INT TERM
@@ -157,7 +160,7 @@ log "starting Toolathlon host=$(hostname -s) port=$PORT workers=$WORKER_BASE_POR
 next_ps=$((SECONDS + 300))
 while kill -0 "$container_pid" 2>/dev/null && kill -0 "$guard_pid" 2>/dev/null; do
   if (( SECONDS >= next_ps )); then
-    log "top rss (kB, comm):"; ps -eo rss,comm --sort=-rss | head -8; next_ps=$((SECONDS + 300))
+    log "top rss (kB, comm):"; ps -eo rss,comm --sort=-rss | sed -n 1,8p; next_ps=$((SECONDS + 300))
   fi
   sleep 2
 done

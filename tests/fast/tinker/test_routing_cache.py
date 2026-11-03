@@ -87,11 +87,12 @@ def test_a_retokenized_tail_gets_an_lcp_parent():
     np.testing.assert_array_equal(rows[start:], delta)
 
 
-def test_a_handle_with_other_tokens_falls_back_to_the_token_hash():
+def test_a_handle_with_other_tokens_does_not_bind_to_another_capture():
     cache, _ = _cache()
     id_a, d_a, _ = _record(cache, [1, 2, 3, 4, 5], [6], seed=1)
     id_b, d_b, _ = _record(cache, [7, 8, 9], [10, 11], seed=2)
-    rows = cache.materialize("t", id_a, [7, 8, 9, 10, 11])  # wrong handle, tokens of b
+    assert cache.materialize("t", id_a, [7, 8, 9, 10, 11]) is None
+    rows = cache.materialize("t", id_b, [7, 8, 9, 10, 11])
     np.testing.assert_array_equal(rows, d_b)
     rows = cache.materialize("t", None, [1, 2, 3, 4, 5, 6])  # no handle at all
     np.testing.assert_array_equal(rows, d_a)
@@ -100,7 +101,8 @@ def test_a_handle_with_other_tokens_falls_back_to_the_token_hash():
 def test_unknown_handles_and_tokens_materialize_to_none():
     cache, _ = _cache()
     _record(cache, [1, 2, 3], [4], seed=1)
-    assert cache.materialize("t", 12345, [1, 2, 3, 4]) is not None, "a foreign handle: the hash lookup still hits"
+    assert cache.materialize("t", 12345, [1, 2, 3, 4]) is None
+    assert cache.materialize("t", None, [1, 2, 3, 4]) is not None, "plain clients retain token lookup"
     assert cache.materialize("t", 12345, [9, 9, 9]) is None
     assert cache.materialize("t", None, [1, 2, 3, 5]) is None
 
@@ -178,6 +180,10 @@ def test_a_consumed_leaf_is_released_and_a_consumed_parent_follows_its_last_chil
         "pinned": 0,
         "capture_rejected": 0,
         "prefix_hits": 1,
+        "full_captures": 0,
+        "full_capture_rows": 0,
+        "verified_prefix_rows": 0,
+        "full_prefix_mismatches": 0,
     }
 
 

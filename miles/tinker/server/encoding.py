@@ -164,11 +164,16 @@ def decode_sample_request(payload: dict) -> dict:
 
 def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
     """Request-level metrics in the SDK's ``name:reduction`` form."""
-    return {
+    metrics = {
         "loss:sum": float(sum(output["loss"] for output in outputs)),
         "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
         "num_datums:sum": float(len(outputs)),
     }
+    for key in ("nonfinite_loss", "nonfinite_logprobs"):
+        count = sum(output.get(key, 0) for output in outputs)
+        if count:
+            metrics[f"{key}:sum"] = float(count)
+    return metrics
 
 
 def render_result(result: dict) -> dict:

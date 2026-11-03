@@ -78,3 +78,100 @@ def test_reassemble_bails_on_indivisible_segment():
     cu = [0, 6]  # 6 not divisible by 2*cp=4
     gathered = [torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long)]
     assert _reassemble_full_row(gathered, cu, cp_size=2) is None
+
+
+# ---------------------------------------------------------------------------
+# The patched forward on a pre-sharded CP row: positions must be built and used
+# ---------------------------------------------------------------------------
+
+_BRIDGE_MODEL = "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model"
+
+
+class _Psp:
+    qkv_format = "thd"
+
+    def __init__(self, cu):
+        self.cu_seqlens_q = torch.tensor(cu, dtype=torch.int32)
+
+
+@pytest.fixture
+def patched_bridge(monkeypatch):
+    """A fake bridge model module, patched by miles: Qwen3VLModel.forward asks get_rope_index for positions
+    (as megatron-bridge 0.5.0 does) unless the model skips it, and returns what it got."""
+    import sys
+    import types
+
+    import miles_plugins.models.qwen3_vl as plugin
+
+    module = types.ModuleType(_BRIDGE_MODEL)
+    module.get_rope_index = lambda *args, **kwargs: ("dense", None)
+
+    class Qwen3VLModel:
+        _cp_local_vision_embed_indices = None
+        config = types.SimpleNamespace(spatial_merge_size=2)
+        image_token_id, video_token_id, vision_start_token_id = -1, -2, -3
+
+        def __init__(self, asks_for_positions=True):
+            self.asks_for_positions = asks_for_positions
+
+        def forward(self, input_ids=None, packed_seq_params=None, **kwargs):
+            if not self.asks_for_positions:
+                return "no positions"
+            positions, _ = module.get_rope_index(2, -1, -2, -3, input_ids)
+            return positions
+
+    module.Qwen3VLModel = Qwen3VLModel
+    monkeypatch.setitem(sys.modules, _BRIDGE_MODEL, module)
+    plugin._patch_model_forward_and_rope_index()
+    return plugin, Qwen3VLModel
+
+
+def _cp_rows(cp_size):
+    """Rank 0's row of two packed samples, sliced like get_batch, and the full cu_seqlens."""
+    samples, per_rank, cu = _build_like_get_batch([10, 7], cp_size)
+    return per_rank, cu
+
+
+def test_a_pre_sharded_row_gets_rank_local_positions(patched_bridge, monkeypatch):
+    plugin, model_cls = patched_bridge
+    per_rank, cu = _cp_rows(2)
+    monkeypatch.setattr(plugin, "_cp_size_rank", lambda: (2, 0))
+    monkeypatch.setattr(plugin, "_cp_allgather_unzigzag", lambda flat, cu, cp: _reassemble_full_row(per_rank, cu, cp))
+    positions = model_cls().forward(input_ids=per_rank[0].unsqueeze(0), packed_seq_params=_Psp(cu))
+    assert positions.shape == (3, 1, per_rank[0].numel())
+    # each segment numbered from 0, then zigzag-sliced like the tokens
+    expected = torch.cat(
+        [_natural_to_zigzag_slice(torch.arange(e - s), 2, 0, dim=0) for s, e in zip(cu[:-1], cu[1:], strict=True)]
+    )
+    assert torch.equal(positions[0, 0], expected)
+
+
+def test_a_pre_sharded_row_without_positions_fails(patched_bridge, monkeypatch):
+    plugin, model_cls = patched_bridge
+    per_rank, cu = _cp_rows(2)
+    monkeypatch.setattr(plugin, "_cp_size_rank", lambda: (2, 0))
+    monkeypatch.setattr(plugin, "_cp_allgather_unzigzag", lambda flat, cu, cp: None)
+    with pytest.raises(RuntimeError, match="got no rank-local MRoPE positions"):
+        model_cls().forward(input_ids=per_rank[0].unsqueeze(0), packed_seq_params=_Psp(cu))
+
+
+def test_positions_the_bridge_never_asked_for_fail(patched_bridge, monkeypatch):
+    """A bridge build that stops calling the module-level get_rope_index would silently use its own positions."""
+    plugin, model_cls = patched_bridge
+    per_rank, cu = _cp_rows(2)
+    monkeypatch.setattr(plugin, "_cp_size_rank", lambda: (2, 0))
+    monkeypatch.setattr(plugin, "_cp_allgather_unzigzag", lambda flat, cu, cp: _reassemble_full_row(per_rank, cu, cp))
+    with pytest.raises(RuntimeError, match="never asked get_rope_index"):
+        model_cls(asks_for_positions=False).forward(input_ids=per_rank[0].unsqueeze(0), packed_seq_params=_Psp(cu))
+
+
+def test_full_rows_keep_the_unchanged_paths(patched_bridge, monkeypatch):
+    plugin, model_cls = patched_bridge
+    full = torch.arange(1, 17)
+    monkeypatch.setattr(plugin, "_cp_size_rank", lambda: (2, 0))
+    # the full packed row at CP2 (the bridge splits it itself): no check, whatever the model does
+    model = model_cls(asks_for_positions=False)
+    assert model.forward(input_ids=full.unsqueeze(0), packed_seq_params=_Psp([0, 16])) == "no positions"
+    monkeypatch.setattr(plugin, "_cp_size_rank", lambda: (1, 0))
+    positions = model_cls().forward(input_ids=full.unsqueeze(0), packed_seq_params=_Psp([0, 10, 16]))
+    assert torch.equal(positions[0, 0], torch.cat([torch.arange(10), torch.arange(6)]))

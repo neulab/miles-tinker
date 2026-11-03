@@ -354,7 +354,13 @@ def _tiny_training_window(partition, enable_mtp):
     return gradients, metrics
 
 
-def test_fused_policy_plus_mtp_matches_work_unit_partitions_and_isolates_policy_gradients():
+def test_fused_policy_plus_mtp_matches_work_unit_partitions_and_isolates_policy_gradients(monkeypatch):
+    # This CPU stand-in is a plain linear head with no output transform.
+    monkeypatch.setattr(
+        fused_lm_head,
+        "_PLAIN_HEAD_FORWARDS",
+        (*fused_lm_head._PLAIN_HEAD_FORWARDS, f"{_Head.__module__}.{_Head.__qualname__}"),
+    )
     baseline, _ = _tiny_training_window([[0], [1]], enable_mtp=False)
     split, metrics = _tiny_training_window([[0], [1]], enable_mtp=True)
     packed, packed_metrics = _tiny_training_window([[0, 1]], enable_mtp=True)

@@ -265,6 +265,12 @@ def compute_inference_engine_env_vars(args) -> dict[str, str]:
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            # Seconds the engine's HTTP server keeps an idle keep-alive connection (SGLang's default is 5). A client
+            # must drop an idle connection before the engine does: a request written on a connection the engine is
+            # closing at that moment gets a TCP reset (httpx.ReadError). At 5 s that is httpx's own default expiry,
+            # and a full-weight sync whose buckets went out 5 s apart lost that race and took the trainer down.
+            # 600 s is far above any client's idle expiry (GeneralHttpClientProvider, the trainer's, keeps 2 s).
+            "SGLANG_TIMEOUT_KEEP_ALIVE": "600",
         }.items()
     }
     env_vars.update(dumper_utils.get_sglang_env(args))

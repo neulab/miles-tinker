@@ -12,18 +12,28 @@
 # N-node Tinker gateway on ABCI (singularity + PBS + Ray), N = unique hosts in PBS_NODEFILE (>= 2).
 #   PBS node 0 (this batch shell): ray head + miles driver (serve_tinker.py) + gateway HTTP (one container)
 #   every other node:              ray worker (one container each, held by pbsdsh)
-#   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs (miles/ray/placement_group.py sorts bundles by IP)
-#   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one Toolathlon
-#                                  service per engine node (deploy/abci/toolathlon_service.sh), started before Ray
-# Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for presets):
+#   trainer nodes:                 the TRAIN_NODES lowest IPoIB IPs other than the head's (miles/ray/placement_group.py
+#                                  sorts bundles by IP with the Ray head node last), so the head is always an engine node
+#   engine nodes:                  the rest, one SGLang engine per node; with SERVICES=1 also one OpenReward
+#                                  service per engine node, started before Ray
+# Knobs via `qsub -l select=N:mpiprocs=8 -l walltime=... -v K=V,...` (see deploy/abci/submit_toolathlon.sh for the
+# Toolathlon jobs):
+#   PRESET (a gateway preset: deploy/abci/presets/<PRESET>.env, or a path; it sets GATEWAY_LAUNCHER MODE HF_MODEL
+#   HF_REVISION LAUNCHER_ARGS EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS, and a non-empty job variable wins over it)
 #   MODE=lora|full  RUN_NAME  TRAIN_NODES (4, or 1 on two nodes)  SERVICES=0|1  GATEWAY_LAUNCHER (alias LAUNCHER;
 #   repo-relative launcher, default the Qwen3-4B one)  HF_SNAPSHOT (its --hf-checkpoint)  LAUNCHER_ARGS  EXTRA_ARGS
-#   CLIENT_SCRIPT  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)  PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT
-#   MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
-# Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT, not on a login node.
+#   (context parallelism: LAUNCHER_ARGS="--cp N [--max-tokens-per-gpu <per-rank>]" with run_qwen3_6_35b_a3b_gateway.py)
+#   CLIENT_SCRIPT (a bash script) or CLIENT_CMD (a command line)  CLIENT_DIR (the client's working directory: default
+#   PBS_O_WORKDIR for CLIENT_CMD, MILES_SRC for CLIENT_SCRIPT)  KEEP_GATEWAY=1  WORKERS (client rollout workers, 3)
+#   PLATOON_ROOT  TOOLATHLON_ENV  TINKER_PORT  MILES_SRC (checkout to serve)  MILES_SIF  WANDB_MODE
+#   SERVICE_ENVIRONMENT=toolathlon|swe_rebench|frontier_cs  SWE_ENV  FRONTIER_ENV
+# Clients (tinker-cookbook, platoon, probes) run on the head compute node through CLIENT_SCRIPT or CLIENT_CMD, not on
+# a login node.
 # DRY_RUN=1 (login node, fake PBS_NODEFILE/PBS_JOBID/PBS_LOCALDIR, optional DRY_RUN_IPS=ip,ip,...) prints roles.tsv
 # and every pbsdsh / singularity command line without executing anything.
 set -euo pipefail
+# Under pipefail, a reader that stops early (head, grep -q or -m, awk's exit) can fail its pipeline: the writer dies of
+# SIGPIPE (status 141) if it writes again, and errexit then ends the job. So every reader under pipefail reads to the end.
 umask 077
 DRY_RUN=${DRY_RUN:-0}
 # Credentials never enter this batch shell: the client subshell sources abci.env/secrets.env itself and every
@@ -42,15 +52,102 @@ ROOTFS=${ROOTFS:-$PROJECT_ROOT/rootfs}                 # mounted as /root: Megat
 MILES_SRC=${MILES_SRC:-/home/aci18912it/source/miles}  # the fork checkout, mounted at /root/miles
 EXTRA_SITE=${EXTRA_SITE:-$PROJECT_ROOT/extra-site}     # pip --target dir with the tinker SDK
 HF_HOME=${HF_HOME:-$GROUPS_ROOT/rasp/cache/huggingface}
-HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | head -1)}
+# ---------------------------------------------------------------- gateway preset (PRESET=<name> or a path)
+# A preset pins one model's gateway: deploy/abci/presets/<name>.env holds KEY=value lines (a value with spaces in one
+# pair of quotes) for the keys below. The file is read, never sourced, so nothing in it is expanded or run. A non-empty
+# job variable (qsub -v) replaces the preset's value. HF_MODEL + HF_REVISION select the snapshot under $HF_HOME
+# unless HF_SNAPSHOT is given; TINKER_SAMPLE_TIMEOUT_SECONDS is exported to the client.
+PRESET_KEYS=(GATEWAY_LAUNCHER MODE HF_MODEL HF_REVISION LAUNCHER_ARGS EXTRA_ARGS TINKER_SAMPLE_TIMEOUT_SECONDS)
+PRESET_LOG=()
+load_preset() {  # load_preset <file>: set every preset key the job left empty; PRESET_LOG records what came from where
+  local file=$1 line key raw value lineno=0; local -A seen=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || { echo "$file:$lineno: expected KEY=value: $line" >&2; exit 2; }
+    key=${BASH_REMATCH[1]}; raw=${BASH_REMATCH[2]}
+    [[ " ${PRESET_KEYS[*]} " == *" $key "* ]] || { echo "$file:$lineno: $key is not a preset key (${PRESET_KEYS[*]})" >&2; exit 2; }
+    [[ -z ${seen[$key]:-} ]] || { echo "$file:$lineno: $key is set twice" >&2; exit 2; }
+    seen[$key]=1
+    case $raw in
+      \"*\" | \'*\') value=${raw:1:${#raw}-2} ;;
+      *) value=$raw
+         [[ $value =~ ^[A-Za-z0-9_./:@%+,=-]*$ ]] || { echo "$file:$lineno: quote a value with spaces or symbols: $line" >&2; exit 2; } ;;
+    esac
+    [[ $value != *[\"\'\$\`\\]* ]] || { echo "$file:$lineno: a value holds no quote, \$, backquote or backslash (nothing is expanded): $line" >&2; exit 2; }
+    if [[ $key == GATEWAY_LAUNCHER && -z ${GATEWAY_LAUNCHER:-} && -n ${LAUNCHER:-} ]]; then
+      PRESET_LOG+=("$key=\"$LAUNCHER\" (the job's LAUNCHER; the preset's value is not used)")
+    elif [[ -n ${!key:-} ]]; then
+      PRESET_LOG+=("$key=\"${!key}\" (the job's value; the preset's is not used)")
+    else
+      printf -v "$key" '%s' "$value"; PRESET_LOG+=("$key=\"$value\"")
+    fi
+  done < "$file"
+}
+PRESET_NOTE=
+if [[ -n ${PRESET:-} ]]; then
+  if [[ $PRESET == */* ]]; then PRESET_FILE=$PRESET
+  elif [[ $PRESET =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then PRESET_FILE=$MILES_SRC/deploy/abci/presets/$PRESET.env
+  else echo "PRESET=$PRESET is neither a preset name nor a path" >&2; exit 2; fi
+  [[ -f $PRESET_FILE && -r $PRESET_FILE ]] || {
+    echo "PRESET=$PRESET: $PRESET_FILE is not a readable file; presets in $MILES_SRC/deploy/abci/presets:" \
+         "$(find "$MILES_SRC/deploy/abci/presets" -maxdepth 1 -name '*.env' -printf '%f ' 2>/dev/null | sed 's/\.env / /g')" >&2
+    exit 2
+  }
+  load_preset "$PRESET_FILE"
+  if [[ -z ${HF_SNAPSHOT:-} && -n ${HF_MODEL:-} ]]; then
+    [[ $HF_MODEL =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && ${HF_REVISION:-} =~ ^[0-9a-f]{40}$ ]] || {
+      echo "PRESET=$PRESET: HF_MODEL must be an <org>/<name> id and HF_REVISION a 40-hex commit (got '$HF_MODEL' '${HF_REVISION:-}')" >&2; exit 2; }
+    HF_SNAPSHOT=$HF_HOME/hub/models--${HF_MODEL//\//--}/snapshots/$HF_REVISION
+    [[ -d $HF_SNAPSHOT ]] || {
+      echo "PRESET=$PRESET: no snapshot $HF_SNAPSHOT (fetch it: HF_HOME=$HF_HOME hf download $HF_MODEL --revision $HF_REVISION)" >&2; exit 2; }
+    # The gateway loads $HF_SNAPSHOT by path; a client that names the model by id resolves it through refs/main.
+    if [[ $(cat "$HF_HOME/hub/models--${HF_MODEL//\//--}/refs/main" 2>/dev/null || true) != "$HF_REVISION" ]]; then
+      PRESET_NOTE="note: $HF_HOME/hub/models--${HF_MODEL//\//--}/refs/main does not name $HF_REVISION, so a client that loads $HF_MODEL by id with HF_HUB_OFFLINE=1 (its tokenizer) will not find this snapshot"
+    fi
+  fi
+fi
+HF_SNAPSHOT=${HF_SNAPSHOT:-$(ls -d $HF_HOME/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/* | sed -n 1p)}
 MODE=${MODE:-lora}
 GATEWAY_LAUNCHER=${GATEWAY_LAUNCHER:-${LAUNCHER:-examples/tinker/run_qwen3_4b_gateway.py}}  # run from /root/miles inside the container
 PLATOON_ROOT=${PLATOON_ROOT:-/home/aci18912it/source/platoon-tinker}
 TOOLATHLON_ENV=${TOOLATHLON_ENV:-$MILES_SRC/deploy/abci/toolathlon.env}
 SERVICES=${SERVICES:-0}
+SERVICE_ENVIRONMENT=${SERVICE_ENVIRONMENT:-toolathlon}
+case "$SERVICE_ENVIRONMENT" in
+  toolathlon)
+    SERVICE_PORT=8082; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_TOOLATHLON
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/toolathlon_service.sh
+    SERVICE_ENV_FILE=$TOOLATHLON_ENV
+    SERVICE_EXTRA_ENV=("TOOLATHLON_ENV=$TOOLATHLON_ENV" OPENREWARD_ENVIRONMENT_SET=toolathlon_only)
+    ;;
+  swe_rebench)
+    SERVICE_PORT=8084; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_SWE_REBENCH
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/swe_rebench_service.sh
+    SERVICE_ENV_FILE=${SWE_ENV:-$MILES_SRC/deploy/abci/swe_rebench.env}
+    SERVICE_EXTRA_ENV=("SWE_ENV=$SERVICE_ENV_FILE")
+    ;;
+  frontier_cs)
+    SERVICE_PORT=8085; SERVICE_URLS_VARIABLE=OPENREWARD_SESSION_URLS_FRONTIER_CS
+    SERVICE_HELPER=$MILES_SRC/deploy/abci/frontier_cs_service.sh
+    SERVICE_ENV_FILE=${FRONTIER_ENV:-$MILES_SRC/deploy/abci/frontier_cs.env}
+    SERVICE_EXTRA_ENV=("FRONTIER_ENV=$SERVICE_ENV_FILE")
+    ;;
+  *) echo "Unsupported SERVICE_ENVIRONMENT=$SERVICE_ENVIRONMENT" >&2; exit 2 ;;
+esac
 WORKERS=${WORKERS:-3}
 LAUNCHER_ARGS=${LAUNCHER_ARGS:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
+# The client's command line and directory fail here, before any node starts, not after an hour of gateway startup.
+if [[ -n ${CLIENT_CMD:-} ]]; then
+  [[ -z ${CLIENT_SCRIPT:-} ]] || { echo "set CLIENT_SCRIPT or CLIENT_CMD, not both" >&2; exit 2; }
+  CLIENT_DIR=${CLIENT_DIR:-${PBS_O_WORKDIR:-$PWD}}
+  bash -n -c "$CLIENT_CMD" || {
+    echo "CLIENT_CMD is not a bash command line (qsub -v removes quotes; see deploy/abci/README.md section 5): $CLIENT_CMD" >&2; exit 2; }
+fi
+if [[ -n ${CLIENT_SCRIPT:-}${CLIENT_CMD:-} && -n ${CLIENT_DIR:-} && ! -d ${CLIENT_DIR:-} ]]; then
+  echo "CLIENT_DIR is not a directory on $(hostname -s): $CLIENT_DIR" >&2; exit 2
+fi
 JOB=${PBS_JOBID%%.*}
 RUN_NAME=${RUN_NAME:-gw-$MODE-$JOB}
 # Per-attempt log dir. A resume reuses RUN_NAME (the checkpoint path depends on it), so a flat
@@ -64,7 +161,7 @@ ENDPOINT_FILE=$PROJECT_ROOT/name-resolve/$RUN_NAME.endpoint
 mkdir -p "$JOBDIR" "$PROJECT_ROOT/checkpoints" "$PROJECT_ROOT/name-resolve"
 # Gateway port: outside miles' dynamic 20000+ range and Toolathlon's 8082 / 28100-28107; bumped while bound.
 TINKER_PORT=${TINKER_PORT:-$((30000 + 10#$JOB % 9000))}
-while ss -ltn 2>/dev/null | grep -q ":$TINKER_PORT "; do echo "port $TINKER_PORT is bound, trying the next"; TINKER_PORT=$((TINKER_PORT + 1)); done
+while [[ $(ss -ltn 2>/dev/null) == *":$TINKER_PORT "* ]]; do echo "port $TINKER_PORT is bound, trying the next"; TINKER_PORT=$((TINKER_PORT + 1)); done
 
 # ---------------------------------------------------------------- helpers (DRY_RUN prints instead of executing)
 dry() { [[ $DRY_RUN == 1 ]]; }
@@ -91,19 +188,25 @@ NODES=${#HOSTS[@]}
 (( NODES >= 2 )) || { echo "expected >= 2 nodes, got ${HOSTS[*]}" >&2; exit 2; }
 TRAIN_NODES=${TRAIN_NODES:-$(( NODES == 2 ? 1 : 4 ))}
 (( TRAIN_NODES >= 1 && TRAIN_NODES < NODES )) || { echo "TRAIN_NODES=$TRAIN_NODES must be in [1, $NODES)" >&2; exit 2; }
+[[ ${GATEWAY_DEAD_PROBES:-4} =~ ^(0|[1-9][0-9]*)$ ]] || { echo "GATEWAY_DEAD_PROBES=$GATEWAY_DEAD_PROBES must be a count (0 = off)" >&2; exit 2; }
 ROLLOUT_GPUS=$(( 8 * (NODES - TRAIN_NODES) ))
 NUM_GPUS=$(( 8 * NODES ))
 dry || [[ ${HOSTS[0]} == $(hostname -s) ]] || { echo "batch shell not on first node" >&2; exit 2; }
 # The node's own hostname resolves to an IPv6 link-local address on the node itself, so pick the
-# IPoIB hostname network (10.0.x.y) from the interface list instead of getent.
-node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {split($4, a, "/"); print a[1]; exit}'; }
-node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ {print $2; exit}'; }
+# IPoIB hostname network (10.0.x.y) from the interface list instead of getent. awk prints the first match and reads on:
+# one that exited there could leave `ip` writing to a closed pipe, and its SIGPIPE (141) ended the script at start-up.
+node_ipv4() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ && !found++ {split($4, a, "/"); print a[1]}'; }
+node_ifname() { ip -o -4 addr show | awk '$4 ~ /^10\.0\./ && !found++ {print $2}'; }
 HEAD_HOST=${HOSTS[0]}; HEAD_IP=$(node_ipv4); IFNAME=$(node_ifname)
 if dry; then IFS=, read -r -a DRY_IPS <<< "${DRY_RUN_IPS:-}"; HEAD_IP=${DRY_IPS[0]:-10.0.0.1}; IFNAME=${IFNAME:-ib0}; fi
 [[ -n $HEAD_IP && -n $IFNAME ]] || { echo "could not determine the head IPoIB address" >&2; ip -o -4 addr show >&2; exit 2; }
 exec > >(tee -a "$JOBDIR/launcher.log") 2>&1
 echo "job=$JOB run=$RUN_NAME mode=$MODE nodes=$NODES train_nodes=$TRAIN_NODES rollout_gpus=$ROLLOUT_GPUS services=$SERVICES launcher=$GATEWAY_LAUNCHER snapshot=$HF_SNAPSHOT head=$HEAD_HOST ip=$HEAD_IP if=$IFNAME port=$TINKER_PORT sif=$SIF dry_run=$DRY_RUN $(date)"
 echo "fork: $(git -C "$MILES_SRC" rev-parse --short HEAD 2>/dev/null) $(git -C "$MILES_SRC" branch --show-current 2>/dev/null)"
+if [[ -n ${PRESET:-} ]]; then
+  echo "preset $PRESET ($PRESET_FILE):"; (( ${#PRESET_LOG[@]} == 0 )) || printf '  %s\n' "${PRESET_LOG[@]}"
+  [[ -z $PRESET_NOTE ]] || echo "$PRESET_NOTE"
+fi
 install -m 755 "$MILES_SRC/deploy/abci/kill-leftovers.sh" "$JOBDIR/kill-leftovers.sh"
 
 # ---------------------------------------------------------------- node-local init on every node (also reports host -> IPoIB ip)
@@ -148,7 +251,10 @@ for i in "${!HOSTS[@]}"; do
 done
 [[ ${HOST_IP[$HEAD_HOST]} == "$HEAD_IP" ]] || { echo "head ip mismatch: $HEAD_IP vs ${HOST_IP[$HEAD_HOST]}" >&2; exit 2; }
 
-# ---------------------------------------------------------------- roles: trainers = TRAIN_NODES lowest IPs (numeric per octet, as placement_group.sort_key)
+# ---------------------------------------------------------------- roles: trainers = TRAIN_NODES lowest IPs, the head's last
+# Numeric per octet with the head node last, as miles/ray/placement_group.py orders the actor slots (sort_bundles_head_last):
+# the head runs the Ray head, the driver, the gateway and the client, so trainer rank 0, which converts and sends every
+# weight-sync bucket, must not compete with them for CPU. TRAIN_NODES < NODES, so the head is always an engine node.
 TRAIN_HOSTS=(); ENGINE_HOSTS=(); ENGINE_IPS=(); ENGINE_VIDX=()
 : > "$JOBDIR/roles.tsv"
 n=0
@@ -157,13 +263,17 @@ while IFS=$'\t' read -r ip host vidx; do
   else role=engine; ENGINE_HOSTS+=("$host"); ENGINE_IPS+=("$ip"); ENGINE_VIDX+=("$vidx"); fi
   printf '%s\t%s\t%s\t%s\n' "$host" "$vidx" "$ip" "$role" >> "$JOBDIR/roles.tsv"
   n=$((n + 1))
-done < <(for i in "${!HOSTS[@]}"; do printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i]}]}" "${HOSTS[$i]}" "${VIDX[$i]}"; done \
-         | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+done < <({ for i in "${!HOSTS[@]}"; do (( i == 0 )) && continue
+             printf '%s\t%s\t%s\n' "${HOST_IP[${HOSTS[$i]}]}" "${HOSTS[$i]}" "${VIDX[$i]}"; done \
+           | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
+         printf '%s\t%s\t%s\n' "$HEAD_IP" "$HEAD_HOST" "${VIDX[0]}"; })
 echo "roles (host vidx ip role):"; cat "$JOBDIR/roles.tsv"
+echo "node roles: head $HEAD_HOST ($HEAD_IP) = ray head + driver + gateway + client + engine;" \
+     "trainers (rank 0 first): ${TRAIN_HOSTS[*]}; engines: ${ENGINE_HOSTS[*]}"
 SERVICE_NODES=; SERVICE_URLS=; ENGINE_IP_LIST=
-if [[ $SERVICES == 1 ]]; then  # one Toolathlon service per engine node; URLs by IPoIB ip in IP order (C10)
+if [[ $SERVICES == 1 ]]; then  # one service per engine node; URLs in roles.tsv order: IPoIB ip order, the head last (C10)
   SERVICE_NODES=$(IFS=,; echo "${ENGINE_HOSTS[*]}")
-  SERVICE_URLS=$(printf 'http://%s:8082,' "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
+  SERVICE_URLS=$(printf "http://%s:$SERVICE_PORT," "${ENGINE_IPS[@]}"); SERVICE_URLS=${SERVICE_URLS%,}
   ENGINE_IP_LIST=$(IFS=,; echo "${ENGINE_IPS[*]}")
 fi
 
@@ -212,8 +322,10 @@ cat > "$JOBDIR/head-inner.sh" <<'EOF'
 set -euo pipefail
 ray start --head --node-ip-address="$HEAD_IP" --port="$RAY_PORT" --dashboard-host=127.0.0.1 --dashboard-port="$DASH_PORT" \
           --num-gpus 8 --temp-dir /tmp/ray --disable-usage-stats
-for t in $(seq 1 180); do ray status 2>/dev/null | grep -q "/${NUM_GPUS}.0 GPU" && break; echo "waiting for $NUM_GPUS GPUs ($t/180)"; sleep 10; done
-ray status | grep -q "/${NUM_GPUS}.0 GPU" || { echo "workers never joined ($NUM_GPUS GPUs expected)" >&2; ray status; exit 1; }
+# ray status is read in full, then grepped: behind a pipe, grep -q can quit while ray still writes, and under pipefail
+# ray's broken pipe fails the check
+for t in $(seq 1 180); do out=$(ray status 2>/dev/null) && grep -q "/${NUM_GPUS}.0 GPU" <<< "$out" && break; echo "waiting for $NUM_GPUS GPUs ($t/180)"; sleep 10; done
+out=$(ray status) && grep -q "/${NUM_GPUS}.0 GPU" <<< "$out" || { echo "workers never joined ($NUM_GPUS GPUs expected)" >&2; ray status; exit 1; }
 printf "http://%s:%s\n" "$(hostname -s)" "$TINKER_PORT" > "$ENDPOINT_FILE.tmp" && mv "$ENDPOINT_FILE.tmp" "$ENDPOINT_FILE"
 echo "endpoint $(cat "$ENDPOINT_FILE") (ray cluster ready $(date))"
 # shellcheck disable=SC2086
@@ -282,15 +394,15 @@ cleanup() { local st=$?; trap - EXIT TERM INT; echo "cleanup status=$st $(date)"
   echo "teardown done $(date)"; exit "$st"; }
 trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT
 
-# ---------------------------------------------------------------- Toolathlon services (before Ray: miles' dynamic ports start at 20000 and skip bound ones)
+# ---------------------------------------------------------------- environment services (before Ray: dynamic ports start at 20000)
 if [[ $SERVICES == 1 ]]; then
-  [[ -r $TOOLATHLON_ENV ]] || { echo "TOOLATHLON_ENV not readable: $TOOLATHLON_ENV" >&2; exit 2; }
+  [[ -r $SERVICE_ENV_FILE ]] || { echo "Service environment not readable: $SERVICE_ENV_FILE" >&2; exit 2; }
   for i in "${!ENGINE_HOSTS[@]}"; do
     launch_bg "$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
       pbsdsh -n "${ENGINE_VIDX[$i]}" -- "${PBSDSH_ENV[@]}" "PBS_JOBID=$PBS_JOBID" "PBS_LOCALDIR=$PBS_LOCALDIR" "SERVICE_LOG=$JOBDIR/services-${ENGINE_HOSTS[$i]}.log" \
-        "PLATOON_ROOT=$PLATOON_ROOT" "TOOLATHLON_ENV=$TOOLATHLON_ENV" "MILES_SRC=$MILES_SRC" \
-        OPENREWARD_REWARD_MODE=partial OPENREWARD_ENVIRONMENT_SET=toolathlon_only \
-        /bin/bash "$MILES_SRC/deploy/abci/toolathlon_service.sh"
+        "PLATOON_ROOT=$PLATOON_ROOT" "MILES_SRC=$MILES_SRC" "${SERVICE_EXTRA_ENV[@]}" \
+        "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}" \
+        /bin/bash "$SERVICE_HELPER"
     SERVICE_PIDS+=("$LAST_PID")
   done
   echo "services: ${#ENGINE_HOSTS[@]} helper(s) started on $SERVICE_NODES ($(date))"
@@ -316,12 +428,16 @@ HEAD_PID=$LAST_PID
 dry && show "serve (inside the head container)" python "$GATEWAY_LAUNCHER" serve --mode "$MODE" --hf-checkpoint "$HF_SNAPSHOT" \
   --tinker-port "$TINKER_PORT" --checkpoint-root "$CHECKPOINT_ROOT" --actor-num-nodes "$TRAIN_NODES" --rollout-num-gpus "$ROLLOUT_GPUS" $LAUNCHER_ARGS --extra-args "$EXTRA_ARGS"
 
-# ---------------------------------------------------------------- service health (release quorum: >= 1/4 on :8082 with X-Session-ID, >= 5/8 workers)
+# ---------------------------------------------------------------- service health (Toolathlon quorum or a single OpenReward server)
 probe() { [[ $(curl --silent --output /dev/null --connect-timeout 3 --max-time 15 --noproxy '*' --write-out '%{http_code}' "$@" 2>/dev/null) == 200 ]]; }
 SWEEP_REPORT=
 sweep_services() {  # 0 when every service host meets the quorum and its helper is alive; SWEEP_REPORT lists the rest
   local pids=() kinds=() hosts=() i w host ip; local -A pub=() wrk=()
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}; ip=${ENGINE_IPS[$i]}
+    if [[ $SERVICE_ENVIRONMENT != toolathlon ]]; then
+      probe "http://$ip:$SERVICE_PORT/health" & pids+=($!); kinds+=(pub); hosts+=("$host")
+      continue
+    fi
     for w in 0 1 2 3; do probe -H "X-Session-ID: gw-health-$JOB-$host-$w" "http://$ip:8082/health" & pids+=($!); kinds+=(pub); hosts+=("$host"); done
     for w in 0 1 2 3 4 5 6 7; do probe "http://$ip:$((28100 + w))/health" & pids+=($!); kinds+=(wrk); hosts+=("$host"); done
   done
@@ -333,7 +449,11 @@ sweep_services() {  # 0 when every service host meets the quorum and its helper 
   SWEEP_REPORT=
   for i in "${!ENGINE_HOSTS[@]}"; do host=${ENGINE_HOSTS[$i]}
     kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null || SWEEP_REPORT+=" $host(helper dead)"
-    (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
+    if [[ $SERVICE_ENVIRONMENT != toolathlon ]]; then
+      (( ${pub[$host]:-0} >= 1 )) || SWEEP_REPORT+=" $host($SERVICE_ENVIRONMENT unhealthy)"
+    else
+      (( ${pub[$host]:-0} >= 1 && ${wrk[$host]:-0} >= 5 )) || SWEEP_REPORT+=" $host(nginx=${pub[$host]:-0}/4 workers=${wrk[$host]:-0}/8)"
+    fi
   done
   [[ -z $SWEEP_REPORT ]]
 }
@@ -348,22 +468,44 @@ if [[ $SERVICES == 1 ]] && ! dry; then
 fi
 
 # ---------------------------------------------------------------- gateway health
+# The gateway's healthz answers 503 once its trainer is dead (a failed weight push or training command kills the
+# trainer actors, and nothing rebuilds them in place): every later command fails, so after GATEWAY_DEAD_PROBES
+# consecutive 503s the job ends instead of holding its nodes, both while it waits for the gateway here (a failed
+# warmup push, 10 s apart) and from the monitor below (30 s apart). Any other answer, no answer included, resets the
+# count: a gateway still starting answers nothing, and a busy gateway is not a dead one. GATEWAY_DEAD_PROBES=0 keeps
+# a dead gateway's job running (to inspect it).
+GATEWAY_DEAD_PROBES=${GATEWAY_DEAD_PROBES:-4}
+GATEWAY_DEAD=0
+gateway_dead() {  # one healthz probe; true once GATEWAY_DEAD_PROBES probes in a row answered 503
+  (( GATEWAY_DEAD_PROBES > 0 )) || return 1
+  local out code
+  out=$(curl -s --noproxy '*' --connect-timeout 3 --max-time 15 --write-out '\n%{http_code}' \
+        "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" 2>/dev/null) || true
+  code=${out##*$'\n'}
+  if [[ $code != 503 ]]; then GATEWAY_DEAD=0; return 1; fi
+  GATEWAY_DEAD=$((GATEWAY_DEAD + 1))
+  echo "gateway unavailable ($GATEWAY_DEAD/$GATEWAY_DEAD_PROBES): ${out%$'\n'*} ($(date))" >&2
+  (( GATEWAY_DEAD >= GATEWAY_DEAD_PROBES ))
+}
 if ! dry; then
   for t in $(seq 1 360); do
     if curl -sf --noproxy '*' --connect-timeout 3 --max-time 10 "http://$HEAD_HOST:$TINKER_PORT/api/v1/healthz" >/dev/null; then
       echo "gateway healthy at http://$HEAD_HOST:$TINKER_PORT ($(date))"; break
     fi
     kill -0 "$HEAD_PID" 2>/dev/null || { echo "head container exited early" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
+    gateway_dead && { echo "the gateway's trainer died before the gateway was healthy; ending the job" >&2; tail -60 "$JOBDIR/head.log" >&2; exit 1; }
     (( t == 360 )) && { echo "gateway not healthy after 3600 s" >&2; exit 1; }
     sleep 10
   done
 fi
 
-# ---------------------------------------------------------------- monitor: head container alive, services quorum (10 consecutive failures = fatal)
+# ---------------------------------------------------------------- monitor: head container alive, trainer alive, services quorum
+# The trainer: gateway_dead above. Services: 10 consecutive failed sweeps are fatal.
 monitor_loop() {
   local fails=0
   while sleep 30; do
     kill -0 "$HEAD_PID" 2>/dev/null || { echo "monitor: head container died ($(date)); ending the job" >&2; kill -TERM $$; return; }
+    gateway_dead && { echo "monitor: the gateway's trainer is dead; ending the job" >&2; kill -TERM $$; return; }
     [[ $SERVICES == 1 ]] || continue
     if sweep_services; then fails=0; continue; fi
     fails=$((fails + 1)); echo "monitor: unhealthy services ($fails/10):$SWEEP_REPORT ($(date))" >&2
@@ -386,23 +528,38 @@ if [[ ${HEAD_MEMORY_GUARD:-1} == 1 && -r $MILES_SRC/deploy/abci/openreward-node-
 fi
 
 # ---------------------------------------------------------------- client on the head node (never on a login node)
-# CLIENT_SCRIPT=<bash script> runs here on the head compute node once the gateway (and the services) are healthy,
-# in its own process group with the C10 exports below; its output goes to $JOBDIR/client.log and its exit code to
-# $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1.
+# CLIENT_SCRIPT=<bash script> or CLIENT_CMD=<command line> runs here on the head compute node once the gateway (and the
+# services) are healthy, in its own process group with the C10 exports below; its output goes to $JOBDIR/client.log and
+# its exit code to $JOBDIR/client.status. The job ends when the client does unless KEEP_GATEWAY=1. CLIENT_CMD is written
+# verbatim to $JOBDIR/client-cmd.sh, which then runs exactly as a CLIENT_SCRIPT does, in CLIENT_DIR.
 CLIENT_ENV=(
   "TINKER_BASE_URL=http://$HEAD_HOST:$TINKER_PORT" "TINKER_API_KEY=${TINKER_API_KEY:-tml-local}" "ENDPOINT_FILE=$ENDPOINT_FILE"
   "JOBDIR=$JOBDIR" "RUN_NAME=$RUN_NAME" "HF_HOME=$HF_HOME"
   "no_proxy=$HEAD_HOST,$HEAD_IP${SERVICE_NODES:+,$SERVICE_NODES,$ENGINE_IP_LIST}${no_proxy:+,$no_proxy}"
   "MILES_SRC=$MILES_SRC" "PLATOON_ROOT=$PLATOON_ROOT" "SERVICE_NODES=$SERVICE_NODES"
-  "OPENREWARD_SESSION_URLS_TOOLATHLON=$SERVICE_URLS" "OPENREWARD_SESSION_URLS=$SERVICE_URLS"
+  "$SERVICE_URLS_VARIABLE=$SERVICE_URLS" "OPENREWARD_SESSION_URLS=$SERVICE_URLS" "SERVICE_ENVIRONMENT=$SERVICE_ENVIRONMENT"
+  "OPENREWARD_REWARD_MODE=${OPENREWARD_REWARD_MODE:-partial}"
   "PBS_LOCALDIR=$PBS_LOCALDIR" "WORKERS=$WORKERS"
 )
-if [[ -n ${CLIENT_SCRIPT:-} ]]; then
-  [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
-  echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"; printf '  export %s\n' "${CLIENT_ENV[@]}"
-  if dry; then show "client" env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT"; CLIENT_STATUS=0
+# A preset's sampling timeout is a client setting (how long one sample request may take), so it goes to the client.
+if [[ -n ${PRESET:-} && -n ${TINKER_SAMPLE_TIMEOUT_SECONDS:-} ]]; then
+  CLIENT_ENV+=("TINKER_SAMPLE_TIMEOUT_SECONDS=$TINKER_SAMPLE_TIMEOUT_SECONDS")
+fi
+if [[ -n ${CLIENT_SCRIPT:-} || -n ${CLIENT_CMD:-} ]]; then
+  if [[ -n ${CLIENT_SCRIPT:-} ]]; then
+    [[ -r $CLIENT_SCRIPT ]] || { echo "CLIENT_SCRIPT not readable: $CLIENT_SCRIPT" >&2; exit 2; }
+    CLIENT_FILE=$CLIENT_SCRIPT; CLIENT_DIR=${CLIENT_DIR:-$MILES_SRC}
+    echo "client: $CLIENT_SCRIPT on $(hostname -s) ($(date))"
   else
-    ( cd "$MILES_SRC" && exec setsid env "${CLIENT_ENV[@]}" bash "$CLIENT_SCRIPT" ) > "$JOBDIR/client.log" 2>&1 &
+    CLIENT_FILE=$JOBDIR/client-cmd.sh
+    printf '#!/bin/bash\n# CLIENT_CMD, verbatim: tinker_gateway.pbs runs this file in CLIENT_DIR with the client exports\n%s\n' \
+      "$CLIENT_CMD" > "$CLIENT_FILE"
+    echo "client: CLIENT_CMD in $CLIENT_DIR on $(hostname -s) ($(date)): $CLIENT_CMD"
+  fi
+  printf '  export %s\n' "${CLIENT_ENV[@]}"
+  if dry; then show "client" env "${CLIENT_ENV[@]}" bash "$CLIENT_FILE"; CLIENT_STATUS=0
+  else
+    ( cd "$CLIENT_DIR" && exec setsid env "${CLIENT_ENV[@]}" bash "$CLIENT_FILE" ) > "$JOBDIR/client.log" 2>&1 &
     CLIENT_PID=$!
     CLIENT_STATUS=0; wait "$CLIENT_PID" || CLIENT_STATUS=$?
     CLIENT_PID=

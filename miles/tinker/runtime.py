@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import math
+import secrets
 import time
 import uuid
 from argparse import Namespace
@@ -25,6 +26,7 @@ import pybase64
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.service import ExecutorBackend
 from miles.tinker.core.types import UserInputError
+from miles.tinker.memory import process_memory_metrics
 from miles.tinker.routing_cache import (
     DEFAULT_MAX_BYTES,
     DEFAULT_PREFIX_STRIDE,
@@ -72,6 +74,7 @@ class MilesBackend(ExecutorBackend):
         self.router_url = router_url
         self.inference_controller = inference_controller
         self.train_mode = getattr(args, "tinker_train_mode", "lora")
+        self.deterministic_inference = bool(getattr(args, "sglang_enable_deterministic_inference", False))
         self.dp_size = _actor_dp_size(args)
         checkpoint_root = getattr(args, "tinker_checkpoint_root", None)
         self.perf_log_path = Path(checkpoint_root) / PERF_LOG_NAME if checkpoint_root else None
@@ -85,6 +88,14 @@ class MilesBackend(ExecutorBackend):
         self.routing: RoutingCache | None = _make_routing_cache(args)
         self.routing_replay = self.routing is not None
         self.routing_policy = getattr(args, "tinker_routing_replay_policy", ROUTING_POLICY_NATURAL)
+        capture_mode = getattr(args, "tinker_routing_capture_mode", "auto")
+        if capture_mode == "auto":
+            capture_mode = "full" if getattr(args, "pause_generation_mode", "in_place") == "retract" else "incremental"
+        if capture_mode not in ("full", "incremental"):
+            raise ValueError(f"unknown routing capture mode: {capture_mode}")
+        self.full_routing_capture = capture_mode == "full"
+        if self.routing is not None:
+            logger.info(f"tinker R3: capture_mode={capture_mode}, verified_prefix_storage={self.full_routing_capture}")
         self._prefix_hit_logs_left = PREFIX_HIT_LOG_LIMIT
         # JSON parse / base64 decode of /generate bodies, materialization and object_store.put run off the loop
         self._routing_executor = (
@@ -133,6 +144,9 @@ class MilesBackend(ExecutorBackend):
                 index = int(item["sample_index"])
                 if index not in by_index:
                     by_index[index] = {"loss": float(item["loss"]), "logprobs": item["logprobs"].tolist()}
+                    for key in ("nonfinite_loss", "nonfinite_logprobs"):
+                        if key in item:
+                            by_index[index][key] = item[key]
         # padded rows sit past len(slot_rows) and are dropped here
         return [by_index[index] for index in range(len(slot_rows))]
 
@@ -169,11 +183,23 @@ class MilesBackend(ExecutorBackend):
         self._window_counts.pop(slot, None)
         self._window_seq_lens.pop(slot, None)
 
+    def health_problem(self) -> str | None:
+        if not self.trainer.has_alive_cell():
+            # a failed slot command kills the cell's actors (cell.execute's kill_on_failure) and only the
+            # independent-DP train() path heals cells, so every later command fails with ActorDiedError
+            return "the trainer is dead: a failed command took down every trainer cell; restart the gateway"
+        return None
+
     def sweep(self) -> None:
         """Periodic housekeeping from the service's lease sweep: routing cache TTL / byte cap."""
         if self.routing is not None:
             stats = self.routing.sweep()
-            logger.debug(f"tinker R3 cache: {stats}")
+            memory = process_memory_metrics()
+            snapshot = {**memory, "cache_entries": stats["entries"], "cache_bytes": stats["bytes"]}
+            logger.info("tinker R3 memory: %s", json.dumps(snapshot))
+            map_limit = memory.get("gateway_memory_map_limit", 0)
+            if map_limit and memory.get("gateway_memory_maps", 0) >= 0.8 * map_limit:
+                logger.warning("tinker R3 memory maps above 80%% of vm.max_map_count: %s", memory)
 
     async def discard_grads(self, slot: int) -> None:
         self._forget_window(slot)
@@ -234,12 +260,18 @@ class MilesBackend(ExecutorBackend):
             return {}
         stats = self.routing.stats()
         return {
+            **process_memory_metrics(),
             "routing_capture_rejected": stats["capture_rejected"],
             "routing_cache_entries": stats["entries"],
             "routing_cache_bytes": stats["bytes"],
             "routing_cache_pinned": stats["pinned"],
             "routing_cache_evictions": stats["evictions"],
             "routing_prefix_hits": stats["prefix_hits"],
+            "routing_full_capture": int(self.full_routing_capture),
+            "routing_full_captures": stats["full_captures"],
+            "routing_full_capture_rows": stats["full_capture_rows"],
+            "routing_verified_prefix_rows": stats["verified_prefix_rows"],
+            "routing_full_prefix_mismatches": stats["full_prefix_mismatches"],
             "fused_lm_head": int(bool(getattr(self.args, "fused_lm_head_logprobs", False))),
         }
 
@@ -322,16 +354,16 @@ class MilesBackend(ExecutorBackend):
         return self._generate_client
 
     def _begin_capture(self, payload: dict, request: dict) -> "_RoutingCapture | None":
-        """R3: ask the engine for the routing and, when a cached sequence shares
-        a prefix with the prompt, only for the rows past it. The parent stays
-        pinned until every sample is recorded (or the request fails)."""
+        """Request full routing, or pin a prefix for explicit incremental capture."""
         if self.routing is None:
             return None
         tenant = payload.get("tenant", "")
         prompt_tokens = payload["prompt_tokens"]
         request["return_routed_experts"] = True
-        found = self.routing.find_prefix_parent(tenant, prompt_tokens)
         capture = _RoutingCapture(tenant=tenant, prompt_tokens=prompt_tokens)
+        if self.full_routing_capture:
+            return capture
+        found = self.routing.find_prefix_parent(tenant, prompt_tokens)
         if found is not None:
             capture.parent, capture.start_len = found
             capture.pins = 1
@@ -375,14 +407,24 @@ class MilesBackend(ExecutorBackend):
         for response, delta_rows in decoded:
             sequence = _to_sequence(response)  # abort -> RuntimeError before any record
             try:
-                sequence["routing_id"] = routing.record(
-                    capture.tenant,
-                    capture.prompt_tokens,
-                    sequence["tokens"],
-                    delta_rows,
-                    capture.parent,
-                    capture.start_len,
-                )
+                if self.full_routing_capture:
+                    sequence["routing_id"] = await loop.run_in_executor(
+                        self._routing_executor,
+                        routing.record_full,
+                        capture.tenant,
+                        capture.prompt_tokens,
+                        sequence["tokens"],
+                        delta_rows,
+                    )
+                else:
+                    sequence["routing_id"] = routing.record(
+                        capture.tenant,
+                        capture.prompt_tokens,
+                        sequence["tokens"],
+                        delta_rows,
+                        capture.parent,
+                        capture.start_len,
+                    )
             except RoutingCaptureError as error:
                 raise RuntimeError(f"routing capture rejected: {error}") from error
             if capture.parent is not None:
@@ -406,8 +448,13 @@ class MilesBackend(ExecutorBackend):
             "top_k": params.get("top_k", -1),
             "no_stop_trim": True,  # the matched stop token stays in the returned tokens (Tinker semantics)
         }
-        if params.get("seed") is not None:
-            sampling_params["sampling_seed"] = params["seed"]
+        seed = params.get("seed")
+        if seed is None and self.deterministic_inference:
+            # SGLang's deterministic sampler defaults every unseeded request
+            # to 42. Independent Tinker calls must still draw independent samples.
+            seed = secrets.randbits(31)
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
         stop = params.get("stop")
         if stop == []:
             sampling_params["ignore_eos"] = True  # Tinker: an empty stop list disables every stop, EOS included

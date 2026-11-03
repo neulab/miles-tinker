@@ -9,7 +9,7 @@ source /etc/profile.d/modules.sh 2>/dev/null || true; module load python/3.12/3.
 PY=${COOKBOOK_PYTHON:-/home/aci18912it/miles-tinker/cookbook-venv/bin/python}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-/groups/gai51740/aci18912it/miles-tinker/checkpoints/$RUN_NAME}
 MODE=${MODE:-$(sed -n '1s/.* mode=\([a-z]*\) .*/\1/p' "$JOBDIR/launcher.log")}
-MODEL_NAME=${MODEL_NAME:-$(grep -o -- '--tinker-base-model [^ ]*' "$JOBDIR/head.log" | head -1 | cut -d' ' -f2)}
+MODEL_NAME=${MODEL_NAME:-$(grep -o -- '--tinker-base-model [^ ]*' "$JOBDIR/head.log" | sed -n 1p | cut -d' ' -f2)}
 MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-4B-Instruct-2507}
 if [[ $MODE == full ]]; then
   # single-tenant gateway: free the first model before the resume check; FFT learning rate for the probe

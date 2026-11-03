@@ -19,7 +19,7 @@ def _format(recording, sandbox):
     return "\n".join(line.rstrip() for line in format_recording(recording, sandbox=sandbox).splitlines()) + "\n"
 
 
-@pytest.mark.parametrize("variant", ["35b-a3b", "27b"])
+@pytest.mark.parametrize("variant", ["35b-a3b", "27b", "4b"])
 @pytest.mark.parametrize("entrypoint", ["prepare", "serve"])
 def test_qwen36_gateway_recipe(monkeypatch, tmp_path: Path, variant: str, entrypoint: str):
     freeze_environment(monkeypatch)
@@ -44,3 +44,10 @@ def test_qwen36_gateway_mtp_recipe(monkeypatch, tmp_path: Path, train_mtp: bool)
     suffix = "trained-draft" if train_mtp else "frozen-draft"
     snapshot = REPO_ROOT / "tests/snapshots/launch_scripts/py" / _LAUNCHER / f"serve-27b-{suffix}.txt"
     assert_matches_snapshot(snapshot, _format(recording, tmp_path), f"27b::{suffix}")
+
+
+@pytest.mark.parametrize("overrides", [{"routing_replay": True}, {"ep": 8}, {"sglang_ep_size": 8}, {"tp": 8}])
+def test_dense_recipe_rejects_moe_settings(overrides):
+    module = import_launch_script(REPO_ROOT / _LAUNCHER)
+    with pytest.raises(AssertionError):
+        module.ScriptArgs(model_variant="27b", **overrides)

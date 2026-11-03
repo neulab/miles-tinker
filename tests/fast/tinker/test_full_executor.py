@@ -86,7 +86,7 @@ def _module(name: str, **attrs) -> types.ModuleType:
 def rig(monkeypatch):
     """Import the executor against stubs and expose the calls it makes."""
     log: list[str] = []
-    config = SimpleNamespace(finalize_model_grads_func=None)
+    config = SimpleNamespace(finalize_model_grads_func=None, calculate_per_token_loss=False)
 
     def run_forward_backward_pass(args, dumper, data_iterator, model, num_microbatches, num_rollouts):
         log.append("fwd_bwd")
@@ -133,7 +133,9 @@ def rig(monkeypatch):
         "miles.backends.training_utils.loss_hub.tinker_losses": _module(
             "miles.backends.training_utils.loss_hub.tinker_losses",
             start_per_datum_outputs=lambda: None,
-            drain_per_datum_outputs=lambda: [{"sample_index": 0}],
+            drain_per_datum_outputs=lambda: [
+                {"sample_index": 0, "loss": torch.tensor(1.0), "logprobs": torch.tensor([-1.0])}
+            ],
         ),
         "miles.backends.training_utils.parallel": _module(
             "miles.backends.training_utils.parallel",
@@ -158,18 +160,35 @@ def rig(monkeypatch):
     from miles.utils.timer import Timer
 
     Timer().seq_lens = [3, 3]
-    args = Namespace(overlap_grad_reduce=False, overlap_param_gather=False, load="/base", mfu_peak_tflops=None)
+    args = Namespace(
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        load="/base",
+        mfu_peak_tflops=None,
+        calculate_per_token_loss=False,
+    )
     rig = SimpleNamespace(executor=executor, log=log, config=config, args=args, model=[FakeModelChunk()])
     yield rig
     for name in (EXECUTOR, "miles.backends.megatron_utils.full"):
         sys.modules.pop(name, None)
 
 
+def test_a_unit_refuses_a_model_config_on_per_token_loss(rig):
+    """The schedule reads calculate_per_token_loss from the config on every call; a bridge VL config that
+    turned it back on (CP>1) would scale the unit's gradients by num_microbatches * |DP*CP|."""
+    rig.config.calculate_per_token_loss = True
+    with pytest.raises(AssertionError, match="disagrees with --calculate-per-token-loss"):
+        rig.executor.forward_backward(rig.args, 1, rig.model, FakeOptimizer(), {})
+    assert "fwd_bwd" not in rig.log
+
+
 def test_units_defer_finalize_and_optim_step_runs_it_once(rig):
     optimizer = FakeOptimizer()
     for unit_id in (1, 2):
         out = rig.executor.forward_backward(rig.args, unit_id, rig.model, optimizer, {})
-        assert out == {"metrics": {"loss": 1.0}, "per_datum": [{"sample_index": 0}]}
+        assert out["metrics"] == {"loss": 1.0}
+        assert out["per_datum"][0]["sample_index"] == 0
+        assert out["per_datum"][0]["loss"].item() == 1.0
     assert rig.log == ["reset_grad_metadata", "fwd_bwd", "reset_grad_metadata", "fwd_bwd"], "no collective per unit"
     assert rig.executor._state["pending_finalize"] is True
 
@@ -224,6 +243,42 @@ def test_failed_unit_poisons_the_window(rig):
     assert rig.executor._state["dirty"] is False
 
 
+def test_nonfinite_reporting_vetoes_the_whole_window_and_next_window_recovers(rig, monkeypatch):
+    optimizer = FakeOptimizer()
+    bad = [{"sample_index": 0, "loss": torch.tensor(float("nan")), "logprobs": torch.tensor([-1.0])}]
+    monkeypatch.setattr(rig.executor, "drain_per_datum_outputs", lambda: bad)
+    out = rig.executor.forward_backward(rig.args, 1, rig.model, optimizer, {})
+    assert out["per_datum"][0]["loss"].item() == 0.0
+    assert out["per_datum"][0]["nonfinite_loss"] == 1
+    metrics = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert metrics["skipped"] == 1 and metrics["nonfinite_output"] == 1
+    assert metrics["num_updates"] == 0 and optimizer.calls == []
+    assert "finalize" not in rig.log
+    assert not rig.executor._state["nonfinite_output"]
+    monkeypatch.setattr(rig.executor, "drain_per_datum_outputs", lambda: [])
+    rig.executor.forward_backward(rig.args, 2, rig.model, optimizer, {})
+    recovered = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert recovered["skipped"] == 0 and recovered["num_updates"] == 1
+    assert optimizer.calls.count("step") == 1
+
+
+def test_nonfinite_on_a_remote_rank_vetoes_local_optimizer_without_finalize(rig, monkeypatch):
+    def remote_failure(flag, op, group):
+        assert group == "all-trainer-ranks" and op == rig.executor.dist.ReduceOp.MAX
+        assert flag.item() == 0
+        flag.fill_(1)
+
+    with monkeypatch.context() as distributed:
+        distributed.setattr(rig.executor.dist, "is_initialized", lambda: True)
+        distributed.setattr(rig.executor, "get_gloo_group", lambda: "all-trainer-ranks")
+        distributed.setattr(rig.executor.dist, "all_reduce", remote_failure)
+        rig.executor._check_per_datum_outputs(1, [], {})
+    optimizer = FakeOptimizer()
+    metrics = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    assert metrics["skipped"] == 1 and metrics["nonfinite_output"] == 1
+    assert optimizer.calls == [] and "finalize" not in rig.log
+
+
 def test_discard_grads_clears_pending_finalize(rig):
     optimizer = FakeOptimizer()
     rig.executor.forward_backward(rig.args, 1, rig.model, optimizer, {})
@@ -239,6 +294,53 @@ def test_reset_optimizer_state_zeroes_moments_and_clocks(rig):
     state = optimizer.inner.state["p"]
     assert state["exp_avg"].sum() == 0 and state["exp_avg_sq"].sum() == 0 and state["step"].item() == 0
     assert optimizer.inner.param_groups[0]["step"] == 0
+
+
+def test_save_before_first_step_initializes_lazy_adam_moments(rig):
+    from collections import defaultdict
+
+    param = torch.ones(3)
+    optimizer = FakeOptimizer()
+    optimizer.inner.param_groups = [{"params": [param]}]
+    optimizer.inner.state = defaultdict(dict)
+    child = optimizer.chained_optimizers[0]
+
+    def initialize(inner, config):
+        for group in inner.param_groups:
+            for value in group["params"]:
+                if not inner.state[value]:
+                    inner.state[value] = {key: torch.zeros_like(value) for key in ("exp_avg", "exp_avg_sq")}
+
+    child.init_state_fn = initialize
+
+    def save(*args):
+        assert set(optimizer.inner.state[param]) == {"exp_avg", "exp_avg_sq"}
+        assert all(torch.count_nonzero(value) == 0 for value in optimizer.inner.state[param].values())
+        assert torch.equal(param, torch.ones(3))
+
+    rig.executor.save = save
+    rig.args.save, rig.args.async_save = "/native", True
+    rig.executor.save_state(rig.args, rig.model, optimizer, "/untrained")
+    assert optimizer.calls == [], "initialization must not run an optimizer step"
+
+
+@pytest.mark.parametrize("step", [None, 0, 7])
+def test_optimizer_restore_clears_only_unstepped_history(rig, step):
+    optimizer = FakeOptimizer()
+    if step is None:
+        optimizer.inner.param_groups[0].pop("step")
+        optimizer.inner.state["p"].pop("step")
+    else:
+        optimizer.inner.param_groups[0]["step"] = step
+        optimizer.inner.state["p"]["step"].fill_(step)
+    optimizer.inner.state["p"]["exp_avg_sq"].fill_(-1)
+    rig.args.finetune, rig.args.no_load_optim, rig.args.no_load_rng, rig.args.ckpt_step = False, False, True, None
+    rig.executor.load_state(rig.args, rig.model, optimizer, "/checkpoint", load_optimizer=True)
+    state = optimizer.inner.state["p"]
+    if step in (None, 0):
+        assert state["exp_avg"].sum() == 0 and state["exp_avg_sq"].sum() == 0
+    else:
+        assert state["exp_avg"].sum() == 2 and state["exp_avg_sq"].sum() == -2
 
 
 def test_save_state_uses_a_temporary_synchronous_save_dir(rig):
@@ -405,8 +507,8 @@ def test_the_optimizer_step_is_charged_inside_the_train_timer(rig, monkeypatch):
     assert stages == {tinker_perf.STAGE_OPTIM: pytest.approx(3.0)}
 
 
-@pytest.mark.parametrize("dirty", [False, True])
-def test_mtp_normalizes_once_before_dp_finalize_and_resets_on_discard(rig, monkeypatch, dirty):
+@pytest.mark.parametrize("failure", [None, "exception", "nonfinite_output"])
+def test_mtp_normalizes_once_before_dp_finalize_and_resets_on_discard(rig, monkeypatch, failure):
     from contextlib import nullcontext
 
     class Window:
@@ -430,12 +532,19 @@ def test_mtp_normalizes_once_before_dp_finalize_and_resets_on_discard(rig, monke
     for unit in (1, 2):
         rig.executor.forward_backward(rig.args, unit, rig.model, optimizer, {})
     assert "mtp_normalize" not in rig.log and "mtp_reset" not in rig.log
-    rig.executor._state["dirty"] = dirty
+    if failure == "nonfinite_output":
+        bad = [{"sample_index": 0, "loss": torch.tensor(float("nan")), "logprobs": torch.tensor([-1.0])}]
+        rig.executor._check_per_datum_outputs(3, bad, {})
+    else:
+        rig.executor._state["dirty"] = failure is not None
     result = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
-    if dirty:
+    if failure:
         assert "mtp_normalize" not in rig.log
         assert result["skipped"] == 1 and "mtp_loss" not in result
+        if failure == "nonfinite_output":
+            assert result["nonfinite_output"] == 1
     else:
         assert rig.log.index("mtp_normalize") < rig.log.index("finalize") < rig.log.index("mtp_reset")
         assert result["mtp_loss"] == 2.5 and result["mtp_tokens"] == 12
     assert rig.log.count("mtp_reset") == 1
+    assert rig.executor._state["nonfinite_output"] is False

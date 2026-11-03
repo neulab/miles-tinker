@@ -72,6 +72,19 @@ async def _create_model(client, tenant: str = "tml-tenant-a", **extra) -> str:
     return created["model_id"]
 
 
+async def test_response_is_not_marked_delivered_when_serialization_fails(client):
+    promise = client.service.promises.create("model", "tml-tenant-a")
+    result = {"kind": "forward_backward", "outputs": [{"loss": float("nan"), "logprobs": [-1.0]}]}
+    client.service.promises.resolve(promise.request_id, result)
+    with pytest.raises(ValueError, match="not JSON compliant"):
+        await client.post("/api/v1/retrieve_future", json={"request_id": promise.request_id}, headers=_headers())
+    assert promise.delivered_at is None
+    result["outputs"][0].update(loss=0.0, nonfinite_loss=1)
+    response = await _poll(client, promise.request_id)
+    assert response["metrics"]["nonfinite_loss:sum"] == 1
+    assert promise.delivered_at is not None
+
+
 async def test_the_training_conversation(client):
     session = await client.post("/api/v1/create_session", json={"sdk_version": "0.27.1"}, headers=_headers())
     session_id = session.json()["session_id"]
@@ -413,6 +426,44 @@ async def test_unknown_samplers_answer_400_and_404(client):
     assert (await client.get("/api/v1/samplers/sampling-nope", headers=_headers())).status_code == 404
 
 
+async def test_checkpoint_delete_answers_as_the_official_service_does(client, tmp_path):
+    """204 when deleted; {"detail": ...} bodies with 400 (invalid id), 404 (missing or another tenant's, alike),
+    409 (a save or load_state uses it; the SDK retries) and 403 (a symbolic link out of the checkpoint root)."""
+    model_id = await _create_model(client)
+    saved = await client.post(
+        "/api/v1/save_weights", json={"model_id": model_id, "seq_id": 1, "path": "ckpt"}, headers=_headers()
+    )
+    await _poll(client, saved.json()["request_id"])
+    url = f"/api/v1/training_runs/{model_id}/checkpoints/weights/ckpt"
+    not_found = {"detail": f"checkpoint tinker://{model_id}/weights/ckpt not found"}
+
+    foreign = await client.delete(url, headers=_headers("tml-tenant-b"))
+    assert (foreign.status_code, foreign.json()) == (404, not_found)
+
+    load_body = {"model_id": model_id, "seq_id": 2, "path": f"tinker://{model_id}/weights/ckpt", "optimizer": True}
+    async with client.service._backend_lock:  # the load stays queued
+        load = await client.post("/api/v1/load_weights", json=load_body, headers=_headers())
+        busy = await client.delete(url, headers=_headers())
+    assert busy.status_code == 409 and "a queued load_state will read it" in busy.json()["detail"]
+    await _poll(client, load.json()["request_id"])
+
+    deleted = await client.delete(url, headers=_headers())
+    assert (deleted.status_code, deleted.content) == (204, b"")
+    gone = await client.delete(url, headers=_headers())
+    assert (gone.status_code, gone.json()) == (404, not_found)
+
+    malformed = await client.delete(f"/api/v1/training_runs/{model_id}/checkpoints/bogus", headers=_headers())
+    assert malformed.status_code == 400 and "malformed checkpoint id" in malformed.json()["detail"]
+
+    outside = tmp_path / "outside" / "weights" / "x"
+    os.makedirs(outside)
+    (outside / "tinker_meta.json").write_text(json.dumps({"tenant": "tml-tenant-a"}))
+    os.symlink(tmp_path / "outside", f"{client.service.config.checkpoint_root}/model-elsewhere")
+    linked = await client.delete("/api/v1/training_runs/model-elsewhere/checkpoints/weights/x", headers=_headers())
+    assert linked.status_code == 403 and "symbolic link" in linked.json()["detail"]
+    assert (outside / "tinker_meta.json").is_file()
+
+
 async def test_a_failed_promise_reports_the_category(client):
     client.service.backend.fail_next = RuntimeError("boom")
     created = (
@@ -429,6 +480,46 @@ async def test_capabilities_health_and_telemetry_shapes(client):
     assert capabilities["supported_models"][0]["model_name"] == "base"
     assert (await client.post("/api/v1/telemetry", json={})).json() == {"status": "accepted"}
     assert (await client.get("/health")).json() == (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
+
+
+async def test_health_answers_503_once_the_backend_cannot_train(client, monkeypatch):
+    """A dead trainer fails every later command; healthz says so, so the job's monitor can end the job instead of
+    leaving it idle (the gateway kept answering ok for an hour after a failed weight push killed its trainer)."""
+    reason = "the trainer is dead: a failed command took down every trainer cell; restart the gateway"
+    monkeypatch.setattr(client.service.backend, "health_problem", lambda: reason)
+
+    for path in ("/api/v1/healthz", "/health"):
+        response = await client.get(path)
+        assert response.status_code == 503
+        assert response.json() == {"status": "unavailable", "error": reason}
+
+    monkeypatch.setattr(client.service.backend, "health_problem", lambda: None)
+    assert (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
+
+
+async def test_a_push_that_kills_the_trainer_turns_health_to_503(client):
+    """The incident's sequence: save_weights_for_sampler fails because the push killed the trainer cell."""
+    model_id = await _create_model(client)
+    backend = client.service.backend
+
+    async def _push_that_kills_the_trainer(slot, lora_name, rank, alpha):
+        backend.dead = True
+        raise RuntimeError("httpx.ReadError on 4 of 5 engines")
+
+    backend.dead = False
+    backend.push_slot = _push_that_kills_the_trainer
+    backend.health_problem = lambda: "the trainer is dead" if backend.dead else None
+    assert (await client.get("/api/v1/healthz")).status_code == 200
+
+    queued = await client.post(
+        "/api/v1/save_weights_for_sampler",
+        json={"model_id": model_id, "seq_id": 1, "path": "000001"},
+        headers=_headers(),
+    )
+    body = await _poll(client, queued.json()["request_id"])
+
+    assert body["category"] == "server" and "ReadError" in body["error"]
+    assert (await client.get("/api/v1/healthz")).status_code == 503
 
 
 async def test_a_session_end_event_frees_the_slots_at_once(client):

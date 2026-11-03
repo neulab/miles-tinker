@@ -1,11 +1,15 @@
 """The unmodified tinker SDK (0.27.1, the cookbook's) drives the gateway over a
 real uvicorn socket with the FakeBackend behind it: bootstrap, proto
 forward_backward, optim_step, named and unnamed sampler saves, sampling,
-save_state -> weights_info -> resume, training_runs, unload."""
+save_state -> weights_info -> resume, training_runs, checkpoint deletion, unload. platoon's SDK 0.16.1
+deletes checkpoints through the same gateway when TINKER016_SITE names its site-packages."""
 
 import asyncio
+import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -35,7 +39,8 @@ class _Gateway:
 
     def _serve(self) -> None:
         async def main():
-            self.service = make_service(base_model=BASE_MODEL, n_slots=2, retrieve_poll_timeout_s=1.0)
+            # three slots: the training loop holds two, platoon's SDK 0.16.1 check takes its own
+            self.service = make_service(base_model=BASE_MODEL, n_slots=3, retrieve_poll_timeout_s=1.0)
             run_task = asyncio.create_task(self.service.run())
             self._server = uvicorn.Server(
                 uvicorn.Config(build_app(self.service), host="127.0.0.1", port=self.port, log_level="warning")
@@ -140,6 +145,9 @@ def test_the_sdk_training_loop(gateway, sdk):
     run = rest.get_training_run_by_tinker_path(state.path).result()
     assert (run.is_lora, run.lora_rank, run.user_metadata) == (True, 8, {"renderer_name": "qwen3"})
     rest.delete_checkpoint_from_tinker_path(state.path).result()
+    with pytest.raises(tinker.NotFoundError):  # nothing left to delete: the official service's 404
+        rest.delete_checkpoint_from_tinker_path(state.path).result()
+    assert training.model_id in gateway.service.models, "a failed sync delete leaves the session alone"
 
     lora_names = [push["lora_name"] for push in gateway.service.backend.named("push_slot")]
     assert len(lora_names) == 2 and all("@" in name for name in lora_names)
@@ -158,3 +166,57 @@ def test_the_sdk_training_loop(gateway, sdk):
     assert polled.json() == {"type": "unload_model", "model_id": training.model_id}
     assert training.model_id not in gateway.service.models
     assert {u["lora_name"] for u in gateway.service.backend.named("unload_adapter")} == set(lora_names)
+
+
+_SDK016_DELETE = r"""
+import json, sys
+import tinker
+
+url, base_model = sys.argv[1], sys.argv[2]
+service = tinker.ServiceClient(base_url=url)
+training = service.create_lora_training_client(base_model=base_model, rank=8)
+path = training.save_state("recovery-000005").result().path
+rest = service.create_rest_client()
+rest.delete_checkpoint(training.model_id, "weights/recovery-000005").result()
+try:
+    rest.delete_checkpoint_from_tinker_path(path).result()
+    second = "deleted twice"
+except tinker.NotFoundError as error:
+    second = error.status_code
+after = training.save_state("after").result().path  # the training session outlived the 404
+print(json.dumps({"version": tinker.__version__, "model_id": training.model_id, "path": path, "second": second,
+                  "after": after}))
+"""
+
+
+def test_platoons_sdk_016_deletes_a_checkpoint_through_the_rest_client(gateway):
+    site = os.environ.get("TINKER016_SITE", "")
+    if not os.path.isdir(os.path.join(site, "tinker")):
+        pytest.skip("tinker 0.16.1 site-packages not available (TINKER016_SITE)")
+    tenant = "tml-sdk016"
+    env = {**os.environ, "PYTHONPATH": site, "PYTHONDONTWRITEBYTECODE": "1", "TINKER_API_KEY": tenant}
+    done = subprocess.run(
+        [sys.executable, "-c", _SDK016_DELETE, gateway.url, BASE_MODEL],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 0, done.stderr[-3000:]
+    result = json.loads(done.stdout.strip().splitlines()[-1])
+    assert (result["version"], result["second"]) == ("0.16.1", 404)
+    model_id = result["model_id"]
+    assert result["path"] == f"tinker://{model_id}/weights/recovery-000005"
+    root = gateway.service.config.checkpoint_root
+    assert not os.path.exists(f"{root}/{model_id}/weights/recovery-000005")
+    assert os.path.isdir(f"{root}/{model_id}/weights/after")
+
+    headers = {"X-API-Key": tenant}  # free the slot for whatever runs next
+    unload = httpx.post(f"{gateway.url}/api/v1/unload_model", json={"model_id": model_id}, headers=headers).json()
+    for _ in range(20):
+        polled = httpx.post(
+            f"{gateway.url}/api/v1/retrieve_future", json={"request_id": unload["request_id"]}, headers=headers
+        )
+        if polled.status_code != 408:
+            break
+    assert polled.json() == {"type": "unload_model", "model_id": model_id}

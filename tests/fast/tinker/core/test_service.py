@@ -18,7 +18,7 @@ from tests.fast.tinker.harness import (
 
 from miles.tinker.core.promise import DONE, FAILED
 from miles.tinker.core.service import SIDECAR_NAME, read_sidecar
-from miles.tinker.core.types import UserInputError
+from miles.tinker.core.types import NotFoundError, UserInputError
 
 
 def _optim_payload(model_id: str, seq_id: int) -> dict:
@@ -354,7 +354,7 @@ async def test_a_foreign_checkpoint_is_rejected_as_a_user_error(service):
     assert (promise.state, promise.error_category) == (FAILED, "user")
 
 
-async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
+async def test_delete_checkpoint_removes_the_dir_and_then_answers_not_found(service):
     model_id = await created_model(service)
     save = service.submit("tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt"})
     await await_settled(service, "tenant", save)
@@ -363,7 +363,8 @@ async def test_delete_checkpoint_removes_the_dir_and_tolerates_absence(service):
 
     service.delete_checkpoint("tenant", model_id, "weights/ckpt")
     assert not os.path.exists(path)
-    service.delete_checkpoint("tenant", model_id, "weights/ckpt")  # already gone: fine
+    with pytest.raises(NotFoundError):  # the official service's 404: nothing left to delete
+        service.delete_checkpoint("tenant", model_id, "weights/ckpt")
     with pytest.raises(UserInputError):
         service.delete_checkpoint("tenant", model_id, "bogus")
 
@@ -550,7 +551,7 @@ async def test_leases_are_per_session_not_per_tenant(service):
     assert live_model in service.models
 
 
-async def test_a_stale_sampling_session_cancels_its_samples(service):
+async def test_an_explicit_session_end_cancels_its_samples(service):
     session_id = service.create_session("tenant", {})
     sid = service.create_sampling_session("tenant", {"session_id": session_id, "base_model": "base"})
     gate = asyncio.Event()
@@ -561,8 +562,7 @@ async def test_a_stale_sampling_session_cancels_its_samples(service):
 
     service.backend.sample = slow_sample
     request_id, _ = service.submit_sample("tenant", _sample_payload(sampling_session_id=sid))
-    service.sessions[session_id]["last_heartbeat"] -= service.config.lease_timeout_s + 1
-    await service._sweep_once()
+    await service.end_session(session_id)
 
     promise = await await_settled(service, "tenant", request_id)
     assert (promise.state, promise.error) == (FAILED, "cancelled")

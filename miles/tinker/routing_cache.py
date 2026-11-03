@@ -13,11 +13,11 @@ Storage model
   when token i was the input (it produced token i+1), so a sequence has S-1
   rows. Rows are uint8 [rows, L, K] (num_experts <= 256).
 - Multi-turn requests extend an earlier sequence: the new prompt shares a
-  prefix with a cached entry (the parent). Rows [0, P) of the parent are
-  causally valid for the new request (row i depends only on tokens[:i+1]),
-  exactly like SGLang's own radix-cached prefix, so the engine is asked only
-  for rows [P, S-1) (``routed_experts_start_len``) and the entry stores that
-  delta with ``parent_id``/``parent_rows``. Materialization walks the chain.
+  prefix with a cached entry (the parent). Full capture compares the newly
+  captured expert rows with that parent before sharing storage. Incremental
+  capture asks only for rows [P, S-1) (``routed_experts_start_len``), which
+  requires the earlier inference state to remain valid. The entry stores
+  the suffix with ``parent_id``/``parent_rows``; materialization walks the chain.
 - Parents are found through a prefix-hash index: every entry records the
   blake2b digest of ``tokens[:c]`` at the cut ladder of ``_cut_lengths``
   (``MIN_CUT, 2*MIN_CUT, ...`` up to the stride, then ``stride, 2*stride, ...``,
@@ -112,12 +112,18 @@ class RoutingCache:
         self._releases = 0
         self._capture_rejected = 0
         self._prefix_hits = 0  # find_prefix_parent() lookups that reused a cached parent (P > 0)
+        self._full_captures = 0
+        self._full_capture_rows = 0
+        self._verified_prefix_rows = 0
+        self._full_prefix_mismatches = 0
         # unique per process and across restarts (a stale handle never resolves to a fresh entry)
         self._next_id = (secrets.randbits(ROUTING_ID_BITS - 9) << 8) + 1
 
     # -------- lookup --------
 
-    def find_prefix_parent(self, tenant: str, prompt_tokens) -> tuple[RoutingEntry, int] | None:
+    def find_prefix_parent(
+        self, tenant: str, prompt_tokens, *, count_hit: bool = True
+    ) -> tuple[RoutingEntry, int] | None:
         """The cached sequence sharing the longest prefix with ``prompt_tokens``
         and the number of its rows the new request may reuse (P). Pins the
         parent until record()/unpin()."""
@@ -140,7 +146,8 @@ class RoutingCache:
                 if reuse <= 0:
                     return None
                 self.pin(parent)
-                self._prefix_hits += 1
+                if count_hit:
+                    self._prefix_hits += 1
                 return parent, reuse
         return None
 
@@ -155,6 +162,52 @@ class RoutingCache:
             entry.pending_count = max(0, entry.pending_count - 1)
 
     # -------- record --------
+
+    def record_full(self, tenant: str, prompt_tokens, generated_tokens, full_rows: np.ndarray) -> int:
+        """Store a complete capture, sharing only expert rows verified equal.
+
+        Token equality selects a candidate; it never establishes routing equality.
+        The retained suffix owns its buffer so a view cannot keep the full matrix alive.
+        """
+        rows = self._validated_rows(
+            full_rows, expected_rows=len(prompt_tokens) + len(generated_tokens) - 1, parent=None
+        )
+        found = self.find_prefix_parent(tenant, prompt_tokens, count_hit=False)
+        parent, prefix_rows = found if found is not None else (None, 0)
+        recorded = False
+        mismatch = False
+        try:
+            if parent is not None and not self._prefix_rows_equal(parent, rows, prefix_rows):
+                mismatch = True
+                self.unpin(parent)
+                parent, prefix_rows = None, 0
+            stored_rows = np.array(rows[prefix_rows:], dtype=np.uint8, copy=True)
+            routing_id = self.record(tenant, prompt_tokens, generated_tokens, stored_rows, parent, prefix_rows)
+            recorded = True
+            with self._lock:
+                self._full_captures += 1
+                self._full_capture_rows += len(rows)
+                self._verified_prefix_rows += prefix_rows
+                self._full_prefix_mismatches += int(mismatch)
+            return routing_id
+        finally:
+            if parent is not None and not recorded:
+                self.unpin(parent)
+
+    def _prefix_rows_equal(self, parent: RoutingEntry, rows: np.ndarray, count: int) -> bool:
+        with self._lock:
+            chunks = self._chain_chunks(parent)
+        if chunks is None:
+            return False
+        offset = 0
+        for chunk in chunks:
+            size = min(len(chunk), count - offset)
+            if not np.array_equal(rows[offset : offset + size], chunk[:size]):
+                return False
+            offset += size
+            if offset == count:
+                return True
+        return offset == count
 
     def record(
         self,
@@ -203,8 +256,8 @@ class RoutingCache:
 
     def materialize(self, tenant: str, handle: int | None, tokens) -> np.ndarray | None:
         """int32 [S-1, L, K] for a datum, or None when nothing cached matches.
-        Lookup: the handle (with exact token equality), then the exact
-        full-token hash. The matched leaf is consumed and released."""
+        Explicit handles require exact identity and token equality. Without
+        a handle, use the full-token hash. The matched leaf is consumed and released."""
         tokens = _as_tokens(tokens)
         with self._lock:
             entry = self._resolve(tenant, handle, tokens)
@@ -238,6 +291,10 @@ class RoutingCache:
                 "pinned": sum(1 for e in self._entries.values() if e.pending_count > 0),
                 "capture_rejected": self._capture_rejected,
                 "prefix_hits": self._prefix_hits,
+                "full_captures": self._full_captures,
+                "full_capture_rows": self._full_capture_rows,
+                "verified_prefix_rows": self._verified_prefix_rows,
+                "full_prefix_mismatches": self._full_prefix_mismatches,
             }
 
     def get(self, routing_id: int) -> RoutingEntry | None:
@@ -307,6 +364,9 @@ class RoutingCache:
             entry = self._entries.get(int(handle))
             if entry is not None and entry.tenant == tenant and np.array_equal(entry.tokens, tokens):
                 return entry
+            # A stale handle must not bind to another sample of the same tokens.
+            # Its routing may have been captured under different weights.
+            return None
         if tokens.size == 0:
             return None
         cut_len, digest = _prefix_digests(tokens, self.prefix_stride)[-1]

@@ -2,6 +2,7 @@
 /generate requests with Tinker semantics (stop handling, seed offsets,
 context clamping, abort as a failure)."""
 
+import asyncio
 from argparse import Namespace
 
 import aiohttp
@@ -76,6 +77,38 @@ def test_seeds_are_offset_per_sample():
     )
 
 
+@pytest.mark.parametrize("seed", [0, 42])
+def test_deterministic_inference_preserves_explicit_client_seed(seed):
+    request = _request({"max_tokens": 4, "seed": seed}, args=Namespace(sglang_enable_deterministic_inference=True))
+    assert request["sampling_params"]["sampling_seed"] == seed
+
+
+async def test_independent_unseeded_group_calls_do_not_use_sglang_fixed_seed(monkeypatch):
+    seeds = iter(range(100, 108))
+    monkeypatch.setattr("miles.tinker.runtime.secrets.randbits", lambda bits: next(seeds))
+
+    async def deterministic_engine(session, url, payload, max_retries=GENERATE_MAX_RETRIES):
+        # Reproduce SGLang's fixed-seed fallback: all unseeded calls yield token 42.
+        token = payload["sampling_params"].get("sampling_seed", 42)
+        return {"meta_info": {"output_token_logprobs": [(-0.1, token)], "finish_reason": {"type": "stop"}}}
+
+    monkeypatch.setattr("miles.tinker.runtime.post_generate", deterministic_engine)
+    backend = MilesBackend(_args(Namespace(sglang_enable_deterministic_inference=True)), None, "http://router")
+    payload = {
+        "prompt_tokens": [1],
+        "sampling_params": {"max_tokens": 2},
+        "num_samples": 1,
+        "prompt_logprobs": False,
+        "topk_prompt_logprobs": 0,
+    }
+    try:
+        results = await asyncio.gather(*(backend.sample(payload, lora_name=None) for _ in range(8)))
+    finally:
+        await backend._generate_client.close()
+    assert len({tuple(result["sequences"][0]["tokens"]) for result in results}) == 8
+    assert payload["sampling_params"] == {"max_tokens": 2}
+
+
 def test_an_aborted_generation_is_a_failure_not_a_stop():
     response = {"meta_info": {"output_token_logprobs": [(-0.1, 11)], "finish_reason": {"type": "abort"}}}
     with pytest.raises(RuntimeError, match="aborted"):
@@ -108,10 +141,12 @@ async def test_sample_posts_once_per_sample(monkeypatch):
 @pytest.fixture
 async def flaky_router():
     """A /generate that answers 503 to its first ``failures`` calls, then a one-token sequence."""
-    state = {"failures": 1, "calls": 0}
+    state = {"failures": 1, "calls": 0, "seeds": []}
 
     async def generate(request):
         state["calls"] += 1
+        body = await request.json()
+        state["seeds"].append(body["sampling_params"].get("sampling_seed"))
         if state["calls"] <= state["failures"]:
             return web.Response(status=503, text="engine busy")
         return web.json_response(
@@ -129,10 +164,13 @@ async def flaky_router():
     await runner.cleanup()
 
 
-async def test_generate_posts_retry_a_bounded_number_of_times(monkeypatch, flaky_router):
+@pytest.mark.parametrize("deterministic", [False, True])
+async def test_generate_posts_retry_a_bounded_number_of_times(monkeypatch, flaky_router, deterministic):
     monkeypatch.setattr("miles.tinker.runtime.GENERATE_RETRY_PAUSE_S", 0.0)
+    seeds = iter([100, 200])
+    monkeypatch.setattr("miles.tinker.runtime.secrets.randbits", lambda bits: next(seeds))
     state, router_url = flaky_router
-    backend = MilesBackend(_args(None), None, router_url)
+    backend = MilesBackend(_args(Namespace(sglang_enable_deterministic_inference=deterministic)), None, router_url)
     payload = {
         "prompt_tokens": [1],
         "sampling_params": {"max_tokens": 2},
@@ -142,9 +180,12 @@ async def test_generate_posts_retry_a_bounded_number_of_times(monkeypatch, flaky
     }
     result = await backend.sample(payload, lora_name=None)
     assert result["sequences"][0]["tokens"] == [5] and state["calls"] == 2, "one 503, one retry"
+    assert state["seeds"] == ([100, 100] if deterministic else [None, None])
 
     state["failures"], state["calls"] = 10, 0
+    state["seeds"] = []
     with pytest.raises(aiohttp.ClientResponseError):
         await backend.sample(payload, lora_name=None)
     assert state["calls"] == GENERATE_MAX_RETRIES, "a persistent failure gives up after the bounded retries"
+    assert set(state["seeds"]) == ({200} if deterministic else {None})
     await backend._generate_client.close()

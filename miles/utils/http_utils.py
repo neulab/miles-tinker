@@ -222,8 +222,14 @@ class GeneralHttpClientProvider:
     _CONNECT_TIMEOUT = 10.0
     _WRITE_TIMEOUT = 60.0
     _POOL_TIMEOUT = 60.0
+    # Seconds an idle pooled connection may be reused; past that httpcore closes it and opens a new one. Keep this
+    # well below the engines' own idle limit: SGLang's uvicorn closes a keep-alive connection after
+    # SGLANG_TIMEOUT_KEEP_ALIVE seconds (5 by default; miles raises it in compute_inference_engine_env_vars), and
+    # httpx's default expiry is the same 5 s. A request written on a connection the engine is closing at that moment
+    # gets a TCP reset (httpx.ReadError); that killed a full-weight sync whose buckets went out 5 s apart.
+    _KEEPALIVE_EXPIRY = 2.0
     _TIMEOUT = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=None, write=_WRITE_TIMEOUT, pool=_POOL_TIMEOUT)
-    _LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    _LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=None, keepalive_expiry=_KEEPALIVE_EXPIRY)
 
     # TODO: entries are never evicted and the clients are never aclose()d, so a caller that keeps
     # creating event loops (repeated asyncio.run) leaks one client and its keep-alive sockets per

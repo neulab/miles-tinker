@@ -88,6 +88,13 @@ class DummyTrainActor:
         self._record("update_weights", args, kwargs)
         return self._update_weights_return_value
 
+    def push_slot(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("push_slot", args, kwargs)
+        return self._update_weights_return_value
+
+    def unload_adapter(self, *args: Any, **kwargs: Any) -> None:
+        self._record("unload_adapter", args, kwargs)
+
     def kill_self(self) -> None:
         self._record("kill_self", (), {})
         os._exit(1)
