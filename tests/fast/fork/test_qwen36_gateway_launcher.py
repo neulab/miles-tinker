@@ -36,7 +36,8 @@ def _serve_argv(module, monkeypatch, **overrides) -> list[str]:
     monkeypatch.setattr(U, "execute_train", lambda **kwargs: captured.update(kwargs))
     module.serve(hf_checkpoint="/x/hf", checkpoint_root="/x/ckpt", **overrides)
     assert captured["train_script"] == "serve_tinker.py"
-    assert captured["megatron_model_type"] == "qwen3.6-35B-A3B"
+    expected_model = "qwen3.6-27B" if overrides.get("model_variant") == "27b" else "qwen3.6-35B-A3B"
+    assert captured["megatron_model_type"] == expected_model
     return shlex.split(captured["train_args"])
 
 
@@ -132,7 +133,11 @@ def test_default_argv_pins_the_recipe_decisions(launcher, monkeypatch):
 def test_every_sglang_flag_is_a_server_args_field(launcher, monkeypatch):
     fields = _server_args_fields()
     assert len(fields) > 300, "the ServerArgs snapshot looks truncated"
-    for overrides in ({}, {"sglang_max_total_tokens": 4_000_000, "sglang_fp32_lm_head": False}):
+    for overrides in (
+        {},
+        {"sglang_max_total_tokens": 4_000_000, "sglang_fp32_lm_head": False},
+        {"model_variant": "27b", "mtp_speculative_decoding": True},
+    ):
         argv = _serve_argv(launcher, monkeypatch, **overrides)
         sglang_flags = [flag for flag in argv if flag.startswith("--sglang-")]
         unknown = {flag for flag in sglang_flags if _sglang_field(flag) not in fields}
@@ -170,6 +175,64 @@ def test_head_fallback_and_r3_off(launcher, monkeypatch):
     assert _flag(argv, "--log-probs-chunk-size") == "2048"
     assert "--use-rollout-routing-replay" not in argv
     assert "--sglang-enable-fp32-lm-head" not in argv
+
+
+def test_dense_recipe_uses_dense_model_and_parallelism(launcher, monkeypatch):
+    argv = _serve_argv(launcher, monkeypatch, model_variant="27b")
+    assert _flag(argv, "--tinker-base-model") == "Qwen/Qwen3.6-27B"
+    assert _flag(argv, "--tensor-model-parallel-size") == "4"
+    assert _flag(argv, "--expert-model-parallel-size") == "1"
+    assert _flag(argv, "--sglang-ep-size") == "1"
+    assert "--use-rollout-routing-replay" not in argv
+    assert _flag(argv, "--mtp-num-layers") == "0"
+
+
+@pytest.mark.parametrize("train_mtp", [False, True])
+@pytest.mark.parametrize("decode_mtp", [False, True])
+def test_mtp_training_and_decoding_are_independent_opt_ins(launcher, monkeypatch, train_mtp, decode_mtp):
+    argv = _serve_argv(
+        launcher,
+        monkeypatch,
+        model_variant="27b",
+        enable_mtp_training=train_mtp,
+        mtp_speculative_decoding=decode_mtp,
+        mtp_loss_scaling_factor=0.3,
+    )
+    assert ("--enable-mtp-training" in argv) == train_mtp
+    assert _flag(argv, "--mtp-num-layers") == ("1" if train_mtp else "0")
+    if train_mtp:
+        assert _flag(argv, "--mtp-loss-scaling-factor") == "0.3"
+    else:
+        assert "--mtp-loss-scaling-factor" not in argv
+    assert ("--sglang-speculative-algorithm" in argv) == decode_mtp
+    if decode_mtp:
+        assert _flag(argv, "--sglang-speculative-algorithm") == "EAGLE"
+        assert _flag(argv, "--sglang-speculative-num-steps") == "2"
+        assert _flag(argv, "--sglang-speculative-eagle-topk") == "1"
+        assert _flag(argv, "--sglang-speculative-num-draft-tokens") == "3"
+        assert _flag(argv, "--sglang-mamba-radix-cache-strategy") == "extra_buffer"
+    assert "--fused-lm-head-logprobs" in argv
+
+
+@pytest.mark.parametrize("overrides", [{"routing_replay": True}, {"ep": 8}, {"sglang_ep_size": 8}, {"tp": 8}])
+def test_dense_recipe_rejects_moe_settings(launcher, overrides):
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(model_variant="27b", **overrides)
+
+
+def test_mtp_decoding_requires_routing_replay_off(launcher):
+    with pytest.raises(AssertionError, match="requires --no-routing-replay"):
+        launcher.ScriptArgs(mtp_speculative_decoding=True)
+    launcher.ScriptArgs(enable_mtp_training=True)  # Training alone does not need to disable R3.
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"mtp_num_layers": 0}, {"mtp_loss_scaling_factor": 0}, {"mtp_loss_scaling_factor": float("nan")}],
+)
+def test_mtp_training_rejects_empty_or_invalid_loss(launcher, overrides):
+    with pytest.raises(AssertionError):
+        launcher.ScriptArgs(enable_mtp_training=True, **overrides)
 
 
 def test_context_length_drives_both_sides(launcher, monkeypatch):
@@ -257,6 +320,21 @@ def test_r3_check_relaunch_reaches_the_trainer_actors(launcher, monkeypatch):
     assert "--tinker-r3-check" in argv and "--check-weight-update-equal" in argv
     assert captured["config"].extra_env_vars == "MILES_TEST_R3_THRESHOLD=0.02"
     assert U.resolve_extra_env_vars({}, captured["config"]) == {"MILES_TEST_R3_THRESHOLD": "0.02"}
+
+
+def test_dense_mtp_cli_reaches_the_trainer_and_sampler(launcher, monkeypatch):
+    result, captured = _invoke_serve(
+        launcher,
+        monkeypatch,
+        ["--model-variant", "27b", "--enable-mtp-training", "--mtp-speculative-decoding"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["megatron_model_type"] == "qwen3.6-27B"
+    argv = shlex.split(captured["train_args"])
+    assert "--enable-mtp-training" in argv and "--fused-lm-head-logprobs" in argv
+    assert _flag(argv, "--mtp-num-layers") == "1"
+    assert _flag(argv, "--sglang-speculative-algorithm") == "EAGLE"
+    assert "--use-rollout-routing-replay" not in argv
 
 
 def test_serve_side_flags_are_rejected_by_the_typer_cli(launcher, monkeypatch):

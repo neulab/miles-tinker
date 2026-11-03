@@ -174,8 +174,8 @@ adapter name. (A possible follow-up is a per-version `cache_salt` on
   so a restarted platoon client (restart delay 700 s) finds the single full-FT
   slot released.
 - The Qwen3.6-35B-A3B recipe (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`)
-  overrides the model definition's `--mtp-num-layers 1` with `0` and never
-  passes `--enable-mtp-training`: engines run without EAGLE and load the MTP
+  defaults to overriding the model definition's `--mtp-num-layers 1` with `0`:
+  engines run without EAGLE and load the MTP
   weights unused.
 - The R3 knobs (`--tinker-routing-replay-policy`,
   `--tinker-routing-cache-max-bytes`, `--tinker-routing-cache-ttl-s`,
@@ -184,7 +184,7 @@ adapter name. (A possible follow-up is a per-version `cache_salt` on
   validation behind them (R3 needs an MoE model and no speculative decoding,
   warns on MTP layers; the fused head needs `--loss-type policy_loss`, no
   `--calculate-per-token-loss`, no `--true-on-policy-mode`, no
-  `--use-rollout-entropy`, no MTP training/layers and untied embeddings) are
+  `--use-rollout-entropy`, and untied embeddings) are
   described in
   `docs/fork/flags-and-launcher.md`.
 
@@ -252,10 +252,16 @@ straight into the DDP `main_grad` buffer (accumulation across
 ~1 GB in forward and ~4.5 GB in backward instead of 2 x 32.5 GB of bf16 logits
 + gradient (plus a 65 GB fp32 copy when `--log-probs-chunk-size` is -1).
 Requirements: `policy_loss`-style tinker losses without entropy, no
-`--true-on-policy-mode`, no MTP (`--mtp-num-layers 0`), one lm head per
+`--true-on-policy-mode`, one lm head per
 pipeline rank, no lm-head bias. Fallback without the fused head:
 `--log-probs-chunk-size 2048` and TP2. Details and the validation procedure:
 `docs/fork/fused-lm-head.md`.
+
+MTP training is opt-in through the launcher's `--enable-mtp-training`; its
+chunked auxiliary loss preserves the policy head's memory saving. Speculative
+decoding is independently enabled by `--mtp-speculative-decoding` and requires
+R3 to be disabled. See [MTP training](fused-lm-head.md#mtp-training) for
+normalization, checkpoint, and validation details.
 
 ## MFU
 

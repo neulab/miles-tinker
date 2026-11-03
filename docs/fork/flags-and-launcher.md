@@ -1,8 +1,8 @@
-# Gateway flags and the Qwen3.6-35B-A3B launcher
+# Gateway flags and the Qwen3.6 launcher
 
 The `--tinker-*` flags of `serve_tinker.py`, the two fused-head flags, the
 serve-time validation they trigger, and the launcher that emits them for the
-35B MoE deployment (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`).
+35B MoE and 27B dense deployments (`examples/tinker/run_qwen3_6_35b_a3b_gateway.py`).
 `FORK.md` lists the files; `full-finetuning.md` covers the training semantics.
 
 ## Flags (`miles/utils/arguments.py`, tinker group)
@@ -43,9 +43,9 @@ In addition to the existing full-mode / LoRA-mode checks:
   `--mtp-num-layers` is non-zero (the MTP block is outside the replay).
 - `--fused-lm-head-logprobs` requires `--loss-type policy_loss`, no
   `--calculate-per-token-loss`, no `--true-on-policy-mode`, no
-  `--use-rollout-entropy` (the head yields target log-probs only), no
-  `--enable-mtp-training` and `--mtp-num-layers 0`/unset (the MTP block calls
-  `output_layer` for its own logits), and untied embeddings.
+  `--use-rollout-entropy` (the head yields target log-probs only), and untied
+  embeddings. MTP training uses its own chunked auxiliary loss; see
+  [the fused-head documentation](fused-lm-head.md#mtp-training).
 
 ## The 35B launcher
 
@@ -56,10 +56,10 @@ ETP1 / DP32, distributed optimizer, fp32 grad accumulation, full uniform
 recompute, `--balance-data`) and 11 TP8/EP8 engines at 64k context. Recipe
 decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
 
-- `--mtp-num-layers 0` overrides the model definition's `1` (argparse last
-  wins; model args precede `train_args` in `execute_train`) and
-  `--enable-mtp-training` is never passed: no EAGLE on the engines, the fused
-  head cannot serve MTP logits, one layer of activations saved.
+- By default, `--mtp-num-layers 0` overrides the model definition's `1`
+  (argparse last wins; model args precede `train_args` in `execute_train`).
+  MTP training and speculative decoding are both opt-in, preserving the
+  existing recipe and its memory use.
 - fp32 head on both sides: `--sglang-enable-fp32-lm-head` and
   `--fused-lm-head-logprobs --fused-lm-head-chunk-size 1024`
   (`--no-fused-lm-head` falls back to `--log-probs-chunk-size 2048`).
@@ -79,6 +79,41 @@ decisions pinned by `tests/fast/fork/test_qwen36_gateway_launcher.py`:
 - `--tp 2` is the memory fallback (`--sequence-parallel` becomes effective);
   a resumed run must keep the TP/EP/DP of its save.
 - `--check-weight-update-equal` is opt-in (smoke runs).
+
+## Dense 27B and MTP options
+
+`--model-variant 27b` selects `scripts/models/qwen3.6-27B.py`, TP4/EP1
+training, EP1 inference, and no routing replay. The default model is
+`Qwen/Qwen3.6-27B`; use `--model-name` and `--hf-checkpoint` for a custom
+preserve-thinking snapshot. Training TP can be 1, 2, or 4, matching the four
+KV heads. Other allocation and context flags work as in the MoE recipe.
+
+| Launcher option | Default | Effect |
+|---|---|---|
+| `--enable-mtp-training` | off | Load and train the MTP block alongside the policy. |
+| `--mtp-num-layers` | 1 | Number of checkpoint MTP layers to load when training is enabled. |
+| `--mtp-loss-scaling-factor` | 0.2 | Weight on the draft's token-mean auxiliary loss. |
+| `--mtp-speculative-decoding` | off | Enable EAGLE with two draft steps, top-k 1, three verification tokens, and `extra_buffer` hybrid-state caching. |
+
+The training and decoding switches are independent. A frozen-draft benchmark
+uses only `--mtp-speculative-decoding`; a run that updates the draft uses both.
+Speculative decoding rejects routing replay, so the 35B recipe must also pass
+`--no-routing-replay`. The installed SGLang 0.5.19.dev56 uses its speculative
+V2 worker without a separate environment switch. Older serving images may
+need `--extra-env-vars SGLANG_ENABLE_SPEC_V2=1`; verify the image before use.
+
+Example for a dense 27B experiment on an existing Ray cluster:
+
+```bash
+MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \
+  python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve \
+    --model-variant 27b --actor-num-nodes 2 --rollout-num-gpus 48 \
+    --enable-mtp-training --mtp-speculative-decoding
+```
+
+The default 35B arguments remain covered by the original exact-argument test.
+Recordings for both models and frozen/trained MTP drafts live under
+`tests/snapshots/launch_scripts/py/examples/tinker/run_qwen3_6_35b_a3b_gateway.py/`.
 
 ## The `--sglang-*` allowlist
 

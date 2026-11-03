@@ -27,6 +27,10 @@ Tinker full fine-tuning path (``--fused-lm-head-logprobs``).
   ``main_grad`` (``distributed_data_parallel.py`` ``_make_backward_post_hook``).
 * Entropy, true-on-policy scoring and sampling masks are unsupported (the
   tinker losses use none of them).
+* MTP uses the same chunked projection through Megatron's linear cross-entropy
+  interface. Its already-shifted labels arrive as ``[B, S]`` and hidden states
+  as ``[S, B, H]``; masking, sequence-boundary handling and loss normalization
+  remain with the loss caller. The explicitly detached shared head stays detached.
 
 Only torch is imported at module level; Megatron's TP mappings are imported
 inside :func:`install` so the module (and its CPU tests) load without Megatron.
@@ -282,6 +286,33 @@ def vocab_parallel_fused_linear_logprobs(
     )
 
 
+def vocab_parallel_fused_linear_cross_entropy(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    tp_group: Any | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Megatron linear-CE interface: ``[S, B, H]`` states and ``[B, S]`` labels.
+
+    Return unreduced fp32 losses in ``[B, S]`` order. Hidden states must already
+    carry the output layer's TP/SP mapping. In particular, use the caller's
+    ``weight`` unchanged: MTP supplies a detached view of the shared policy head.
+    The caller owns label shifting, masks and loss scaling.
+    """
+    if hidden_states.ndim != 3 or labels.ndim != 2:
+        raise ValueError("linear cross-entropy expects hidden states [S, B, H] and labels [B, S]")
+    logprobs = vocab_parallel_fused_linear_logprobs(
+        hidden_states,
+        weight,
+        labels.transpose(0, 1),
+        tp_group=tp_group,
+        chunk_size=chunk_size,
+    )
+    return -logprobs.transpose(0, 1).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Head installation and activation
 # ---------------------------------------------------------------------------
@@ -349,8 +380,8 @@ def _check_head_supported(model: Any, output_layer: Any) -> None:
         raise RuntimeError("the fused lm head does not support deferred embedding wgrad")
     if bool(getattr(getattr(model, "config", None), "use_mup", False)):
         raise RuntimeError("the fused lm head does not implement MuP output scaling")
-    if bool(getattr(model, "mtp_process", False)):
-        raise RuntimeError("the fused lm head does not support MTP output processing (--mtp-num-layers 0)")
+    if bool(getattr(model, "mtp_process", False)) and not getattr(model.config, "mtp_detach_heads", False):
+        raise RuntimeError("the fused lm head requires detached shared heads for MTP (mtp_detach_heads=True)")
 
 
 def install(
@@ -398,19 +429,25 @@ def install(
             return original_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output, **kwargs)
         if runtime_gather_output:
             raise RuntimeError("the fused lm head cannot gather full-vocabulary output (runtime_gather_output)")
-        if kwargs.get("output_cross_entropy_loss"):
-            raise RuntimeError("the fused lm head cannot fuse the cross-entropy loss (output_cross_entropy_loss)")
+        output_cross_entropy_loss = kwargs.pop("output_cross_entropy_loss", False)
+        labels = kwargs.pop("labels", None) if output_cross_entropy_loss else None
         if kwargs:
             raise RuntimeError(f"unsupported output_layer kwargs while the fused lm head is active: {sorted(kwargs)}")
         active_weight = weight if weight is not None else layer_self.weight
         if active_weight is None:
             raise RuntimeError("the Megatron lm head did not supply its (shared) output weight")
-        state.active_weight = active_weight
-        state.fused_forward_calls += 1
         if bool(getattr(layer_self, "sequence_parallel", False)):
             mapped_hidden = gather_from_sp_region(input_, group=layer_self.tp_group)
         else:
             mapped_hidden = copy_to_tp_region(input_, group=layer_self.tp_group)
+        if output_cross_entropy_loss:
+            if labels is None:
+                raise ValueError("output_cross_entropy_loss requires labels [B, S]")
+            return vocab_parallel_fused_linear_cross_entropy(
+                mapped_hidden, active_weight, labels, tp_group=state.tp_group, chunk_size=state.chunk_size
+            )
+        state.active_weight = active_weight
+        state.fused_forward_calls += 1
         return mapped_hidden, None
 
     output_layer.forward = MethodType(_conditional_forward, output_layer)
@@ -442,7 +479,10 @@ def maybe_activate(args: Namespace, model_chunks: Iterable[Any]) -> Iterator[Hea
     state = install(model_chunks)
     if state is not None:
         state.chunk_size = int(getattr(args, CHUNK_SIZE_ATTR, DEFAULT_CHUNK_SIZE))
-    with activate(state):
+    # The optional Megatron hook routes MTP's own CE through this head as well.
+    from miles.backends.megatron_utils.tinker_mtp import loss_context
+
+    with activate(state), loss_context(bool(getattr(args, "enable_mtp_training", False))):
         yield state
 
 

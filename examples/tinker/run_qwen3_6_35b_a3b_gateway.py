@@ -1,4 +1,9 @@
-"""Tinker gateway launcher for Qwen3.6-35B-A3B (hybrid GDN/attention MoE, MTP block unused).
+"""Tinker gateway launcher for Qwen3.6 hybrid GDN/attention models.
+
+``--model-variant 35b-a3b`` retains the MoE recipe. ``--model-variant 27b``
+selects the dense model with TP4/EP1 training, TP8/EP1 inference, and no
+routing replay. Custom preserve-thinking snapshots can be supplied through
+``--model-name`` and ``--hf-checkpoint``.
 
 Serves ``serve_tinker.py`` disaggregated: ``actor_num_nodes`` x 8 GPUs train
 (Megatron, TP1 / EP8 / ETP1, distributed optimizer, full uniform recompute) and
@@ -12,14 +17,16 @@ the HF snapshot is a ``Qwen3_5MoeForConditionalGeneration`` wrapper, which the
 bridge maps to its Qwen3.5-VL MoE provider (language model + vision tower + the
 MTP block read from ``mtp_num_hidden_layers``), so no torch_dist conversion is
 needed. Model args come from ``scripts/models/qwen3.6-35B-A3B.py``; the
-launcher overrides its ``--mtp-num-layers 1`` with ``0`` (argparse last wins)
-and never passes ``--enable-mtp-training``: the engines run without EAGLE, the
-fused lm head cannot serve the MTP block's logits, and one layer of activations
-is saved. The bridge itself derives ``mtp_num_layers=1`` from the HF config, so
+launcher defaults to ``--mtp-num-layers 0`` (argparse last wins), saving the
+MTP training activations. ``--enable-mtp-training`` instead loads and trains
+the checkpoint's MTP block using the fused chunked head. Speculative decoding
+is independent: ``--mtp-speculative-decoding`` enables the pretrained or
+trained MTP draft on the engines and requires routing replay to be disabled.
+The bridge itself derives ``mtp_num_layers=1`` from the HF config, so
 it is ``_apply_bridge_runtime_config`` (miles/backends/megatron_utils/
 model_provider.py) that carries the 0 onto the provider and skips the MTP block;
 the unused HF ``mtp.*`` tensors are never requested by the Megatron-param-driven
-bridge load. The engines load the MTP weights from HF and never use them.
+bridge load when training is disabled.
 
 Numerics are matched across the two sides: the engines run with
 ``--sglang-enable-fp32-lm-head`` and the trainer scores the same fp32 logits
@@ -38,6 +45,7 @@ Requires: a Ray cluster already joined by every node (``MILES_SCRIPT_EXTERNAL_RA
 ``tinker`` SDK importable by the driver (proto codec).
 
 Args:
+  --model-variant: ``35b-a3b`` (default) or ``27b``; selects model and parallelism defaults.
   --mode: ``full`` (full fine-tuning, emits ``--tinker-train-mode full``); ``lora``
     is not supported by this recipe yet.
   --model-name: HuggingFace id the gateway advertises.
@@ -60,6 +68,10 @@ Args:
     --routing-cache-ttl-s / --routing-prefix-stride / --r3-check: R3 knobs.
   --fused-lm-head / --fused-lm-head-chunk-size: the fused fp32 head; with
     ``--no-fused-lm-head`` the trainer falls back to ``--log-probs-chunk-size``.
+  --enable-mtp-training / --mtp-num-layers / --mtp-loss-scaling-factor:
+    opt-in MTP training (one layer, loss factor 0.2); the default keeps it disabled.
+  --mtp-speculative-decoding: opt-in EAGLE decoding with two draft steps,
+    top-k 1, and three verification tokens; independent of MTP training.
   --balance-data: Karmarkar-Karp token balancing across DP ranks per unit.
   --recompute-args: Megatron recompute flags (default full uniform, 1 layer).
   --moe-token-dispatcher-type: Megatron MoE dispatcher (``alltoall``).
@@ -77,9 +89,15 @@ Example:
   MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
     python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --mode full \\
       --actor-num-nodes 4 --rollout-num-gpus 8 --tinker-port 20613 --check-weight-update-equal
+
+  MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=10.0.80.66 \\
+    python examples/tinker/run_qwen3_6_35b_a3b_gateway.py serve --model-variant 27b \\
+      --actor-num-nodes 2 --rollout-num-gpus 48 --enable-mtp-training --mtp-speculative-decoding
 """
 
 from dataclasses import dataclass
+from math import isfinite
+from typing import Literal
 
 import typer
 
@@ -87,7 +105,21 @@ import miles.utils.external_utils.command_utils as U
 
 app = typer.Typer()
 
-_MEGATRON_MODEL_TYPE = "qwen3.6-35B-A3B"
+
+@dataclass(frozen=True)
+class _Recipe:
+    model_name: str
+    megatron_model_type: str
+    tp: int
+    ep: int
+    sglang_ep_size: int
+    routing_replay: bool
+
+
+_RECIPES = {
+    "35b-a3b": _Recipe("apurvaga/Qwen3.6-35B-A3B-preserve-thinking", "qwen3.6-35B-A3B", 1, 8, 8, True),
+    "27b": _Recipe("Qwen/Qwen3.6-27B", "qwen3.6-27B", 4, 1, 1, False),
+}
 
 
 @dataclass
@@ -95,7 +127,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     mode: str = "full"
-    model_name: str = "apurvaga/Qwen3.6-35B-A3B-preserve-thinking"
+    model_variant: Literal["35b-a3b", "27b"] = "35b-a3b"
+    model_name: str | None = None
     hf_checkpoint: str | None = None
     model_dir: str = "/root/models"
     checkpoint_root: str | None = None
@@ -109,8 +142,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_num_gpus_per_engine: int = 8
 
     # Megatron parallelism: TP1 (num_query_groups=2 caps TP at 2), experts spread over 8 ranks.
-    tp: int = 1
-    ep: int = 8
+    tp: int | None = None
+    ep: int | None = None
     etp: int = 1
 
     # Training performance knobs: one 64k row (65536 model_input + 1 target token) per DP rank per microbatch.
@@ -129,7 +162,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lease_timeout_s: float = 600.0
 
     # R3: replay the engines' routing in training; the cache lives on the gateway host.
-    routing_replay: bool = True
+    routing_replay: bool | None = None
     routing_policy: str = "natural"
     routing_cache_max_bytes: int = 128 * 1024**3
     routing_cache_ttl_s: float = 21600.0
@@ -141,6 +174,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     fused_lm_head_chunk_size: int = 1024
     log_probs_chunk_size: int = 2048  # only without the fused head
     sglang_fp32_lm_head: bool = True
+
+    # Training the draft and using it for inference are independent opt-ins.
+    enable_mtp_training: bool = False
+    mtp_num_layers: int = 1
+    mtp_loss_scaling_factor: float = 0.2
+    mtp_speculative_decoding: bool = False
 
     # Weight pushes: a full-weight push must drop the engines' prefix cache, so retract.
     pause_generation_mode: str = "retract"
@@ -171,7 +210,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_health_check_first_wait: float = 600.0
 
     # Sampling engines.
-    sglang_ep_size: int = 8
+    sglang_ep_size: int | None = None
     sglang_mem_fraction_static: float = 0.75
     sglang_chunked_prefill_size: int = 16384
     sglang_max_running_requests: int = 128
@@ -181,6 +220,21 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        recipe = _RECIPES[self.model_variant]
+        for name in ("model_name", "tp", "ep", "sglang_ep_size", "routing_replay"):
+            if getattr(self, name) is None:
+                setattr(self, name, getattr(recipe, name))
+        if self.model_variant == "27b":
+            assert not self.routing_replay, "The dense model has no expert routes to replay"
+            assert self.ep == self.sglang_ep_size == 1, "The dense model requires EP1 on training and inference"
+            assert self.tp in (1, 2, 4), "Qwen3.6-27B training TP must divide its four KV heads"
+        if self.enable_mtp_training:
+            assert self.mtp_num_layers > 0, "--enable-mtp-training requires --mtp-num-layers > 0"
+            assert (
+                isfinite(self.mtp_loss_scaling_factor) and self.mtp_loss_scaling_factor > 0
+            ), "--mtp-loss-scaling-factor must be finite and positive"
+        if self.mtp_speculative_decoding:
+            assert not self.routing_replay, "MTP speculative decoding requires --no-routing-replay"
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name.rsplit('/', 1)[-1]}"
         if self.checkpoint_root is None:
@@ -223,7 +277,9 @@ def serve(args: ScriptArgs):
         f"{args.rollout_num_gpus} rollout GPUs ({args.rollout_num_gpus_per_engine} per engine), "
         f"port {args.tinker_port}, checkpoints {args.checkpoint_root}, "
         f"r3={'on' if args.routing_replay else 'off'}/{args.routing_policy}, "
-        f"fused_lm_head={'on' if args.fused_lm_head else 'off'}"
+        f"fused_lm_head={'on' if args.fused_lm_head else 'off'}, "
+        f"mtp_training={'on' if args.enable_mtp_training else 'off'}, "
+        f"mtp_decoding={'on' if args.mtp_speculative_decoding else 'off'}"
     )
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
@@ -271,9 +327,14 @@ def serve(args: ScriptArgs):
         f"--moe-token-dispatcher-type {args.moe_token_dispatcher_type} "
     )
 
-    # last-wins over the model definition's --mtp-num-layers 1; no --enable-mtp-training.
+    # Last-wins over the model definition; keep the default recipe's MTP block absent.
     # The bridge provider only sees it through _apply_bridge_runtime_config (model_provider.py).
-    mtp_args = "--mtp-num-layers 0 "
+    mtp_args = (
+        f"--enable-mtp-training --mtp-num-layers {args.mtp_num_layers} "
+        f"--mtp-loss-scaling-factor {args.mtp_loss_scaling_factor} "
+        if args.enable_mtp_training
+        else "--mtp-num-layers 0 "
+    )
 
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
@@ -287,6 +348,13 @@ def serve(args: ScriptArgs):
     )
     if args.sglang_max_total_tokens is not None:
         sglang_args += f"--sglang-max-total-tokens {args.sglang_max_total_tokens} "
+    if args.mtp_speculative_decoding:
+        sglang_args += (
+            "--sglang-speculative-algorithm EAGLE "
+            "--sglang-speculative-num-steps 2 --sglang-speculative-eagle-topk 1 "
+            "--sglang-speculative-num-draft-tokens 3 "
+            "--sglang-mamba-radix-cache-strategy extra_buffer "
+        )
 
     update_weight_args = (
         f"--pause-generation-mode {args.pause_generation_mode} "
@@ -324,7 +392,7 @@ def serve(args: ScriptArgs):
         train_args=train_args,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
-        megatron_model_type=_MEGATRON_MODEL_TYPE,
+        megatron_model_type=_RECIPES[args.model_variant].megatron_model_type,
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
     )

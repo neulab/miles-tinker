@@ -135,8 +135,11 @@ def test_bridge_runtime_config_overrides_the_hf_derived_mtp_depth(provider_modul
     assert provider.mtp_loss_scaling_factor == 0.1 and provider.mtp_detach_heads is False
 
     kept = _Provider()
-    provider_module._apply_bridge_runtime_config(kept, _args(mtp_num_layers=1, enable_mtp_training=True))
+    provider_module._apply_bridge_runtime_config(
+        kept, _args(mtp_num_layers=1, enable_mtp_training=True, mtp_loss_scaling_factor=0.35)
+    )
     assert kept.mtp_num_layers == 1 and kept.mtp_detach_heads is True, "raw-path detach rule mirrored"
+    assert kept.mtp_loss_scaling_factor == 0.35, "the CLI overrides the provider's MTP loss scale"
 
     absent = _Provider()
     provider_module._apply_bridge_runtime_config(absent, _args(mtp_num_layers=None))

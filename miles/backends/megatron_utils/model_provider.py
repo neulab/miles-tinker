@@ -93,6 +93,7 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     if getattr(args, "enable_mtp_training", False):
         # mirror the raw path: keep RL MTP gradients out of the shared embedding / lm head
         provider.mtp_detach_heads = True
+        provider.mtp_loss_scaling_factor = getattr(args, "mtp_loss_scaling_factor", 0.2)
 
     # arg name != provider field; arg default None, so propagate only when the user set it
     if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:

@@ -403,3 +403,39 @@ def test_the_optimizer_step_is_charged_inside_the_train_timer(rig, monkeypatch):
 
     _, stages = tinker_perf.pop_diagnostics()
     assert stages == {tinker_perf.STAGE_OPTIM: pytest.approx(3.0)}
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_mtp_normalizes_once_before_dp_finalize_and_resets_on_discard(rig, monkeypatch, dirty):
+    from contextlib import nullcontext
+
+    class Window:
+        def normalize_gradients(self, model, *, dp_group):
+            assert dp_group == "dp"
+            rig.log.append("mtp_normalize")
+            return {"mtp_loss": 2.5, "mtp_tokens": 12}
+
+        def reset(self):
+            rig.log.append("mtp_reset")
+
+    monkeypatch.setattr(rig.executor, "_mtp_window", Window())
+    monkeypatch.setattr(rig.executor.tinker_mtp, "loss_context", lambda enabled: nullcontext())
+    monkeypatch.setattr(
+        rig.executor,
+        "get_parallel_state",
+        lambda: SimpleNamespace(is_pp_last_stage=True, intra_dp=SimpleNamespace(group="dp")),
+    )
+    rig.args.enable_mtp_training = True
+    optimizer = FakeOptimizer()
+    for unit in (1, 2):
+        rig.executor.forward_backward(rig.args, unit, rig.model, optimizer, {})
+    assert "mtp_normalize" not in rig.log and "mtp_reset" not in rig.log
+    rig.executor._state["dirty"] = dirty
+    result = rig.executor.optim_step(rig.args, rig.model, optimizer, ADAM)
+    if dirty:
+        assert "mtp_normalize" not in rig.log
+        assert result["skipped"] == 1 and "mtp_loss" not in result
+    else:
+        assert rig.log.index("mtp_normalize") < rig.log.index("finalize") < rig.log.index("mtp_reset")
+        assert result["mtp_loss"] == 2.5 and result["mtp_tokens"] == 12
+    assert rig.log.count("mtp_reset") == 1
