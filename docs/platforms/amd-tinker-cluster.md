@@ -1,8 +1,9 @@
 # Multinode Tinker training on MI350
 
-Run Tinker across allocated nodes with **one MI350 GPU per node**. This example
-uses two GPUs for training and one for inference. The launcher starts Ray and
-Tinker in tmux sessions over SSH.
+Run Tinker across allocated MI350 nodes with one or more GPUs each. This example
+uses three single-GPU nodes, two for training and one for inference; see
+[Nodes with several GPUs](#nodes-with-several-gpus) for 8-GPU nodes. The
+launcher starts Ray and Tinker in tmux sessions over SSH.
 
 ## Setup
 
@@ -29,10 +30,25 @@ MODEL_ID=Qwen/Qwen3-4B-Instruct-2507
 MODEL_TYPE=qwen3-4B-Instruct-2507
 ```
 
-The GPU counts must add up to the number of nodes. Ray assigns which nodes train
-and which serve inference. Set `RAY_CPUS_PER_NODE` no higher than the CPUs in
+The GPU counts must add up to the number of nodes times `--gpus-per-node`. Ray
+assigns which nodes train and which serve inference. Set `RAY_CPUS_PER_NODE` no higher than the CPUs in
 each node's allocation. The launcher uses existing allocations; stop it before
 releasing the nodes. Use nodes without another Ray/Tinker deployment running.
+
+## Nodes with several GPUs
+
+With `--gpus-per-node 8`, training takes whole nodes first, in node IP order, so
+its tensor-parallel groups stay inside a node. Training that spans nodes must
+take a multiple of `--gpus-per-node` GPUs; for two 8-GPU nodes, use
+`--train-gpus 8 --rollout-gpus 8`. Weights then reach the inference engines over
+the network after each step. On mi3508x, add `--roce` so RCCL uses the RoCE NICs.
+It sets `NCCL_NET_GDR_LEVEL=0`: with GPU-direct RDMA, the image's RCCL 2.27.7
+fails the weight push from one training GPU to eight engine GPUs on another node
+("Message truncated").
+
+`PYTORCH_HIP_ALLOC_CONF`, `PYTORCH_CUDA_ALLOC_CONF`, `NCCL_DEBUG`, and
+`NCCL_DEBUG_SUBSYS` set on the head when you run `start` are applied on every
+node. `deploy/amd/serve_openhands.sbatch` wraps this launcher for `NODES=...`.
 
 ## Usage / serve
 
@@ -58,8 +74,11 @@ python3 tools/amd_tinker_cluster.py start \
 | Cluster flag | Meaning |
 | --- | --- |
 | `--nodes` | Allocated hostnames, with the head first. |
-| `--train-gpus`, `--rollout-gpus` | Number of training and inference GPUs. Each node contributes one GPU. |
+| `--train-gpus`, `--rollout-gpus` | Number of training and inference GPUs; together all GPUs of all nodes. |
+| `--gpus-per-node` | GPUs on each node, all of them used (default 1). |
 | `--cpus-per-node` | CPUs advertised to Ray on each node. |
+| `--object-store-gb` | Ray object store on each node (default 2). |
+| `--roce` | Add the AMD HPC Fund mi3508x RoCE NCCL settings on every node. |
 | `--interface` | Network interface for node addresses and GPU communication. |
 | `--ray-port` | Ray head port. |
 | `--port` | Tinker HTTP port on the head. |

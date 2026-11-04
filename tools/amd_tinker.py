@@ -127,7 +127,9 @@ class BackendConfig:
 
     @property
     def model_path(self):
-        return self.root / "models" / self.model_id.rsplit("/", 1)[-1]
+        # MILES_AMD_MODELS moves the weights off --root, e.g. to node-local /tmp (bound into the container).
+        models = Path(os.environ.get("MILES_AMD_MODELS") or self.root / "models")
+        return models / self.model_id.rsplit("/", 1)[-1]
 
 
 def _host_env(config):
@@ -137,7 +139,14 @@ def _host_env(config):
         "APPTAINER_TMPDIR": str(config.scratch / "apptainer-tmp"),
         "TMPDIR": str(config.scratch / "apptainer-tmp"),
         "PIP_CACHE_DIR": str(config.scratch / "pip-cache"),
+        # --cleanenv drops the host environment, and --env takes a comma-separated list that a value
+        # like "expandable_segments:True,garbage_collection_threshold:0.8" would split; Apptainer
+        # passes APPTAINERENV_<NAME> through as <NAME> whatever it contains.
+        **{f"APPTAINERENV_{key}": os.environ[key] for key in _ALLOCATOR_ENV if key in os.environ},
     }
+
+
+_ALLOCATOR_ENV = ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
 
 
 def _runtime_env(config):
