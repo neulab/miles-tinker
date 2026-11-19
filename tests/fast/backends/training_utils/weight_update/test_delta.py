@@ -1,10 +1,16 @@
 from argparse import Namespace
+from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
-from miles.backends.training_utils.weight_update.protocols.delta import UpdateWeightFromDiskDelta
+from miles.backends.training_utils.weight_update.protocols.delta import (
+    UpdateWeightFromDiskDelta,
+    _checkpoint_float_dtype,
+)
 
 _DELTA_MODULE = "miles.backends.training_utils.weight_update.protocols.delta"
 
@@ -83,3 +89,87 @@ class TestReloadEnginesFailureTransitions:
                 protocol._reload_engines(7)
 
         assert [name for name, _kwargs in calls] == expected_calls
+
+
+_NORM = "model.layers.0.linear_attn.norm.weight"
+_PROJ = "model.layers.0.mlp.down_proj.weight"
+
+
+class TestCheckpointDtypeCast:
+    """Qwen3.5 stores some tensors (e.g. linear_attn.norm.weight) in F32 while Megatron emits BF16."""
+
+    @pytest.mark.parametrize(
+        ("emitted", "stored", "expected"),
+        [
+            (torch.bfloat16, "F32", torch.float32),
+            (torch.float32, "F16", torch.float16),
+            (torch.bfloat16, "BF16", None),
+            (torch.bfloat16, None, None),
+            (torch.bfloat16, "I64", None),
+            (torch.int64, "F32", None),
+        ],
+    )
+    def test_only_float_mismatches_cast_to_the_stored_dtype(self, emitted, stored, expected) -> None:
+        assert _checkpoint_float_dtype(emitted, stored) is expected
+
+    @staticmethod
+    def _make_protocol(tmp_path: Path) -> UpdateWeightFromDiskDelta:
+        hf_dir = tmp_path / "hf"
+        hf_dir.mkdir()
+        save_file(
+            {
+                _NORM: torch.tensor([1.0, 0.5, -2.0, 0.25], dtype=torch.float32),
+                _PROJ: torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+            },
+            str(hf_dir / "model.safetensors"),
+        )
+        protocol = UpdateWeightFromDiskDelta.__new__(UpdateWeightFromDiskDelta)
+        protocol.args = Namespace(
+            hf_checkpoint=str(hf_dir),
+            update_weight_local_checkpoint_dir="/local/ckpt",
+            update_weight_disk_dir=str(tmp_path / "delta"),
+            check_weight_update_equal=False,
+        )
+        protocol.delta_dir = str(tmp_path / "delta")
+        protocol.rollout_engines = []
+        protocol.is_sender = True
+        protocol._post_write_hook = None
+        protocol._snapshot = {}
+        return protocol
+
+    def test_baseline_casts_bf16_emitted_tensors_to_the_f32_checkpoint_dtype(self, tmp_path: Path) -> None:
+        """The raw-byte baseline must match the engines' checkpoint files, so the F32 tensor is upcast."""
+        protocol = self._make_protocol(tmp_path)
+        bucket = [
+            (_NORM, torch.tensor([1.0, 0.5, -2.0, 0.25], dtype=torch.bfloat16)),
+            (_PROJ, torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)),
+        ]
+
+        with (
+            patch(f"{_DELTA_MODULE}.dist") as dist_mock,
+            patch(f"{_DELTA_MODULE}.get_gloo_group", return_value=MagicMock()),
+        ):
+            dist_mock.get_rank.return_value = 0
+            dist_mock.get_world_size.return_value = 1
+            protocol._capture_baseline(lambda materialize: [bucket])
+
+        assert protocol._cast == {_NORM: torch.float32}
+        assert protocol._snapshot[_NORM].nbytes == 4 * 4
+        assert protocol._snapshot[_PROJ].nbytes == 6 * 2
+
+    def test_send_bucket_diffs_the_cast_bytes(self, tmp_path: Path) -> None:
+        """Later syncs emit the same BF16 tensor; its bytes are diffed in the checkpoint's F32 layout."""
+        protocol = self._make_protocol(tmp_path)
+        protocol._cast = {_NORM: torch.float32}
+        protocol._use_pinned = False
+        protocol._max_bytes = 0
+        protocol._pool = MagicMock()
+        protocol._inflight = deque()
+        protocol.total_bytes = 0
+        emitted = torch.tensor([1.0, 0.5, -2.0, 0.25], dtype=torch.bfloat16)
+
+        protocol.send_bucket([(_NORM, emitted)])
+
+        _fn, name, payload, nbytes, pinned = protocol._pool.submit.call_args.args
+        assert (name, nbytes, pinned) == (_NORM, 16, False)
+        assert payload.tobytes() == emitted.to(torch.float32).numpy().tobytes()
