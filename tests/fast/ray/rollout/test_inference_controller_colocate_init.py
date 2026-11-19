@@ -36,6 +36,9 @@ class _FakeCell:
     def is_pending_weights_or_serving(self) -> bool:
         return self.state == "pending_weights"
 
+    # a miles-launched engine: always part of the weight update it waits for
+    joins_weight_updates = True
+
 
 class _StubServer:
     def __init__(self, server_cells: dict):

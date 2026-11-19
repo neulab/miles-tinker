@@ -8,6 +8,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleet
+from miles.ray.rollout.external_engines import ExternalEngineProvider
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import wait_session_server_ready
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
@@ -61,9 +62,7 @@ class InferenceController:
             global_health_checker_activeness=self._health_checker_activeness.get,
         )
         # TODO: may change to InferenceController.init(engine_provider, ...) later
-        provider: BaseWorkerProvider = RayWorkerProvider.create(
-            pool_ids=compute_engine_pool_ids(self.args)
-        )  # TODO inject instance
+        provider = _create_engine_provider(self.args)  # TODO inject instance
         self._watcher_disposers.append(await provider.watch_cells(self._reconcile))
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
@@ -174,7 +173,11 @@ class InferenceController:
             rollout_engines=srv.api_clients,
             engine_gpu_counts=srv.engine_gpu_counts,
             engine_gpu_offsets=srv.engine_gpu_offsets,
-            snapshot_cell_id_to_hashes={cell_id: cell.meta.workers_hash for cell_id, cell in srv.server_cells.items()},
+            snapshot_cell_id_to_hashes={
+                cell_id: cell.meta.workers_hash
+                for cell_id, cell in srv.server_cells.items()
+                if cell.joins_weight_updates
+            },
         )
 
     @releases_lock
@@ -197,7 +200,9 @@ class InferenceController:
             cells = [cell for srv in self.servers.values() for cell in srv.server_cells.values()]
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
-            pending = [cell for cell in cells if not cell.is_pending_weights_or_serving]
+            pending = [
+                cell for cell in cells if cell.joins_weight_updates and not cell.is_pending_weights_or_serving
+            ]
             if not pending:
                 return
             if time.monotonic() >= deadline:
@@ -333,4 +338,11 @@ def _compute_server_cell_meta_from_info(info: CellInfo) -> ServerCellMetadata:
         needs_offload=info.meta["needs_offload"],
         update_weights=info.meta["update_weights"],
         workers_hash=info.workers_hash,
+        external_server_url=info.meta.get("external_server_url"),
     )
+
+
+def _create_engine_provider(args) -> BaseWorkerProvider:
+    if args.rollout_external:
+        return ExternalEngineProvider.create(args)
+    return RayWorkerProvider.create(pool_ids=compute_engine_pool_ids(args))

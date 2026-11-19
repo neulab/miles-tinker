@@ -77,9 +77,29 @@ the rationale column of this table, so keep one row per file or directory
 | `miles/ray/train/group.py` | `warmup`, `unload_adapter` and FFT weight push plumbing on the trainer controller | yes |
 | `miles/tinker/runtime.py` (MilesBackend) | dp padding of units and output stripping; FFT `train_data` without `adapter_slots`; optim_step metrics passthrough and `<checkpoint_root>/perf.jsonl` (per-slot MFU records) | yes |
 | `serve_tinker.py` | uvloop when installed, no uvicorn access log, 60 s keep-alive; `--tinker-train-mode {lora,full}` and the GatewayConfig flags (`--tinker-lease-timeout-s`, `--tinker-sampler-versions-to-keep`, `--tinker-coalesce-wait-s`, `--tinker-max-concurrent-samples`, `--tinker-retrieve-poll-timeout-s`, `--tinker-unit-token-budget`); no `multi_lora` assert in full mode | yes |
-| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA) | yes |
+| `miles/utils/arguments.py`, `miles/utils/tinker_args.py` | the `--tinker-*` flags above and the serve-mode validation (full mode forces `retract` pausing, warns on TP*EP>1 for LoRA); `--rollout-external*` help text and the `validate_rollout_external_args` call (see attached engines below) | yes |
 | `miles/utils/train_metric_utils.py`, `miles/utils/timer.py`, `miles/utils/flops_utils.py` | only if needed for per-unit MFU (`actor_train_mfu`, `actor_train_tok_per_s` from `Timer().seq_lens`) | yes |
 | `tests/fast/tinker/test_runtime.py`, `tests/fast/tinker/test_full_executor.py`, `tests/fast/backends/` | padding, FFT executor and metrics tests | yes |
+
+### Attached external SGLang engines (`--rollout-external`)
+
+Upstream removed external address allocation ("a new implementation is coming"); the fork
+attaches engines it did not launch (e.g. an engine pool on another cluster), keeps miles' own
+router, and drives broadcast / disk-delta weight updates to them. The external path is one new
+module plus small branches, so on an upstream sync that brings its own implementation, drop
+these rows and take upstream's.
+
+| File | Rationale | Upstream-worthy? |
+|---|---|---|
+| `miles/ray/rollout/external_engines.py` | `ExternalEngineProvider` (one cell per `--rollout-external-engine-addrs` entry, alive while `/health` answers, a comeback is a new generation/`workers_hash`; never launches or kills) and the `/server_info` launch-flag check | yes (until upstream's lands) |
+| `miles/utils/rollout_external_args.py` | stdlib-only validation: addrs required and parsed, no colocate/eval fleet/p2p, `rollout_num_gpus` derived from the engine count | yes |
+| `miles/ray/rollout/server_cell.py`, `miles/ray/rollout/cell_state.py` | `ServerCellMetadata.external_server_url`: init takes the given url (no gate, no worker lookup, `gate_url=None`); the initializing tick checks the engine's flags before pending-weights; replaces the `NotImplementedError` | yes |
+| `miles/ray/rollout/inference_controller.py` | `_create_engine_provider`: external provider under `--rollout-external`, cell meta carries `external_server_url` | yes |
+| `miles/ray/specs/inference.py` | no engine launch spec under `--rollout-external` | yes |
+| `miles/dashboard/hooks.py` | engine registration skips external cells (no actor; the collector synthesizes them from scrapes) | yes |
+| `tests/fast/ray/rollout/test_external_engines.py` | args, flag check, provider liveness, and the attach/sync/route/restart/shutdown lifecycle against fake HTTP engines | yes |
+| `tests/fast/ray/rollout/test_server_cell_state_machine.py` | the external-init test asserts the given url / no gate instead of the `NotImplementedError` | yes |
+| `docs/advanced/disaggregated-rollout.md` | "Attached SGLang engines" section: lifecycle, required engine launch flags, broadcast/disk-delta preconditions | yes |
 
 ### Fork-only tooling, deployment and docs
 

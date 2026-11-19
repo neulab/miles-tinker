@@ -20,6 +20,7 @@ from miles.ray.rollout.cell_state import (
     StateServing,
     StateUninitialized,
 )
+from miles.ray.rollout.external_engines import check_external_engine_server_info
 from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
 from miles.utils.ft_utils.health_checker import (
     ActiveAndEpoch,
@@ -50,6 +51,8 @@ class ServerCellMetadata(FrozenStrictBaseModel):
     needs_offload: bool
     update_weights: bool
     workers_hash: str
+    # set for an attached engine miles did not launch (--rollout-external): no gate, no worker lookup
+    external_server_url: str | None = None
 
 
 @dataclass
@@ -132,6 +135,13 @@ class ServerCell:
         return isinstance(self._state, StateServing)
 
     @property
+    def joins_weight_updates(self) -> bool:
+        """An attached external engine that is not ready (still starting, or failing its flag
+        check) is left out of weight updates instead of blocking them; it joins a later one,
+        whose changed cell snapshot makes the trainer reconnect it."""
+        return self.meta.external_server_url is None or self.is_pending_weights_or_serving
+
+    @property
     def is_initializing_past_deadline(self) -> bool:
         return self.is_initializing and time.monotonic() - self._state.start_time >= INITIALIZING_TIMEOUT_SECONDS
 
@@ -149,13 +159,11 @@ class ServerCell:
         return SGLangApiClient(server_url=self.server_url)
 
     async def init(self) -> None:
-        if self.args.rollout_external:
-            raise NotImplementedError(
-                "external rollout address allocation was removed and a new implementation is coming"
-            )
-
-        addr_info = await self._compute_addr_info()
-        await activate_launch_gate(gate_url=addr_info.gate_url)
+        if (external_server_url := self.meta.external_server_url) is not None:
+            addr_info = CellAddrInfo(server_url=external_server_url, bootstrap_port=None, gate_url=None)
+        else:
+            addr_info = await self._compute_addr_info()
+            await activate_launch_gate(gate_url=addr_info.gate_url)
         self._change_state(
             "init", StateUninitialized, StateInitializing(addr_info=addr_info, start_time=time.monotonic())
         )
@@ -168,6 +176,9 @@ class ServerCell:
         addr_info = self._state.addr_info
         if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
             return
+
+        if self.meta.external_server_url is not None:
+            await self._check_external_engine(server_url=addr_info.server_url)
 
         if self.args.check_weight_update_equal and self.meta.update_weights:
             await self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
@@ -193,6 +204,16 @@ class ServerCell:
 
         if serve_without_weight_update:
             self._mark_serving()
+
+    async def _check_external_engine(self, *, server_url: str) -> None:
+        api_client = SGLangApiClient(server_url=server_url)
+        check_external_engine_server_info(
+            self.args,
+            server_info=await api_client.get_server_info(),
+            weight_version=await api_client.get_weight_version(),
+            num_gpus_per_engine=self.meta.num_gpus_per_engine,
+            server_url=server_url,
+        )
 
     async def mark_weights_ready(self) -> None:
         assert isinstance(self._state, StatePendingWeights), f"{self._state=}"

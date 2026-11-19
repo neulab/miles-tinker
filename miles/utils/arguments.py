@@ -22,6 +22,7 @@ from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.lora import is_lora_enabled
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.object_store import ObjectStoreBackend
+from miles.utils.rollout_external_args import validate_rollout_external_args
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tinker_args import validate_tinker_serve_args
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
@@ -872,14 +873,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--rollout-external",
                 action="store_true",
                 default=False,
-                help="Use external SGLang instances instead of launching them inside the framework.",
+                help=(
+                    "Attach SGLang engines launched outside miles (--rollout-external-engine-addrs) instead of "
+                    "launching them. miles still runs its own router, registers the engines once their weights "
+                    "are synced, and drives their weight updates (broadcast or disk-delta); it never launches, "
+                    "kills or restarts them. See docs/advanced/disaggregated-rollout.md for the engine flags."
+                ),
             )
             parser.add_argument(
                 "--rollout-external-engine-addrs",
                 type=str,
                 default=None,
                 nargs="+",
-                help="Address and ports of the external engines.",
+                help=(
+                    "host:port of each external engine, one rollout cell per entry. "
+                    "--rollout-num-gpus is derived as len(addrs) * --rollout-num-gpus-per-engine."
+                ),
             )
             parser.add_argument(
                 "--update-weight-transfer-mode",
@@ -2919,6 +2928,7 @@ def miles_validate_args(args):
             setattr(args, k, v)
 
     validate_dashboard_args(args)
+    validate_rollout_external_args(args)
 
     args.ft_components = _resolve_ft_components(args)
     assert not ("rollout" in args.ft_components and args.eval_num_gpus > 0), (
