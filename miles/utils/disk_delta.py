@@ -79,6 +79,11 @@ def _tensor_locations(ckpt_dir: str) -> dict[str, tuple[str, int, int, str, tupl
     return locations
 
 
+def tensor_dtypes(ckpt_dir: str) -> dict[str, str]:
+    """Each tensor's safetensors dtype code (e.g. "F32", "BF16") as the checkpoint stores it."""
+    return {name: location[3] for name, location in _tensor_locations(ckpt_dir).items()}
+
+
 def make_tensor_reader(ckpt_dir: str):
     """Index headers once and return a layout-aware raw tensor reader."""
     locations = _tensor_locations(ckpt_dir)

@@ -23,7 +23,7 @@ from miles.backends.training_utils.weight_update.protocol import WeightTransferP
 from miles.backends.training_utils.weight_update.session import check_weight_sync_results
 from miles.backends.training_utils.weight_update.utils import get_data_replica_rank_and_size
 from miles.utils import async_utils
-from miles.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
+from miles.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode, tensor_dtypes
 from miles.utils.distributed_utils import get_gloo_group
 
 logger = logging.getLogger(__name__)
@@ -59,11 +59,23 @@ _SAFETENSORS_DTYPE_BY_TORCH_DTYPE = {
 }
 
 
+_FLOAT_SAFETENSORS_DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16}
+
+
 def _safetensors_dtype(dtype: torch.dtype) -> str:
     try:
         return _SAFETENSORS_DTYPE_BY_TORCH_DTYPE[dtype]
     except KeyError:
         raise ValueError(f"Disk-delta does not support trainer tensor dtype {dtype}") from None
+
+
+def _checkpoint_float_dtype(emitted: torch.dtype, stored: str | None) -> torch.dtype | None:
+    """The float dtype the checkpoint stores a tensor in when the trainer emits another float
+    dtype (cast before diffing so raw bytes line up); None when no cast applies."""
+    emitted_code = _safetensors_dtype(emitted)
+    if stored != emitted_code and stored in _FLOAT_SAFETENSORS_DTYPES and emitted_code in _FLOAT_SAFETENSORS_DTYPES:
+        return _FLOAT_SAFETENSORS_DTYPES[stored]
+    return None
 
 
 class UpdateWeightFromDiskDelta(WeightTransferProtocol):
@@ -88,6 +100,11 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
         self.delta_encoding = args.update_weight_delta_encoding
         self.checksum_algorithm = args.update_weight_delta_checksum
         self._snapshot: dict[str, np.ndarray] = {}
+        # name -> dtype the checkpoint stores it in, when the trainer emits another float dtype
+        # (Qwen3.5 keeps e.g. linear_attn.norm.weight in F32; Megatron trains it in BF16): such
+        # tensors are cast to the checkpoint's dtype (there a lossless BF16->F32 upcast) so the
+        # raw-byte deltas apply to the engines' checkpoint files
+        self._cast: dict[str, torch.dtype] = {}
         self._baseline_captured = False
         # Post-write hook: object-store-backed shared filesystems lack cross-host
         # read-after-write consistency, so written files need an explicit step
@@ -127,6 +144,8 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
         """Submit each tensor of the bucket to the diff/compress pool (pipelined with the gather)."""
         for name, tensor in bucket:
+            if name in self._cast:
+                tensor = tensor.to(self._cast[name])
             flat = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
             nbytes = int(flat.numel())
             if self._use_pinned and nbytes <= self._max_bytes:
@@ -162,6 +181,7 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
         layout as that canonical checkpoint because deltas operate on raw bytes. pull_weights(0)
         makes each host materialize its local base now, overlapped with the snapshot gather, so the
         first real sync only pays the delta apply."""
+        self._cast = {}
         # a prior run's versions would apply against the wrong base; start the dir clean
         pulls = []
         if dist.get_rank() == 0:
@@ -182,10 +202,12 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
         dist.barrier(group=get_gloo_group())
 
         read_hf = None
+        ckpt_dtypes: dict[str, str] = {}
         local_error: ValueError | None = None
         if self.is_sender:
             try:
                 read_hf = make_tensor_reader(self.args.hf_checkpoint)  # index the HF headers once
+                ckpt_dtypes = tensor_dtypes(self.args.hf_checkpoint)
             except ValueError as error:
                 local_error = error
 
@@ -195,6 +217,10 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
             assert read_hf is not None
             try:
                 for name, tensor in bucket:
+                    cast = _checkpoint_float_dtype(tensor.dtype, ckpt_dtypes.get(name))
+                    if cast is not None:
+                        self._cast[name] = cast
+                        tensor = tensor.to(cast)
                     try:
                         baseline = read_hf(
                             name,
@@ -253,9 +279,10 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
                 # TODO: temporarily weaken checkers; should enhance and fix related logics
                 _update_weight_version_if_unset(self.rollout_engines, "0")
             logger.info(
-                "[disk delta] captured baseline snapshot of %d tensors from %s",
+                "[disk delta] captured baseline snapshot of %d tensors from %s (%d cast to the checkpoint dtype)",
                 len(self._snapshot),
                 self.args.hf_checkpoint,
+                len(self._cast),
             )
         dist.barrier(group=get_gloo_group())
 
