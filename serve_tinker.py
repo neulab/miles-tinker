@@ -12,7 +12,6 @@ from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.train.group import TrainerController
 from miles.ray.wiring import launch_worker_manager
 from miles.tinker.core.service import TinkerService
-from miles.tinker.core.types import GatewayConfig
 from miles.tinker.runtime import MilesBackend
 from miles.tinker.server.app import build_app
 from miles.utils import object_store
@@ -20,6 +19,7 @@ from miles.utils.arguments import parse_args
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
 from miles.utils.http_utils import init_http_client
 from miles.utils.logging_utils import configure_logger
+from miles.utils.tinker_args import gateway_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +52,7 @@ async def serve(args):
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     # the backend keeps its perf log beside the checkpoints, whichever flag named the root
     args.tinker_checkpoint_root = checkpoint_root
-    config = GatewayConfig(
-        base_model=args.tinker_base_model or args.hf_checkpoint,
-        # full fine-tuning: one tenant, slot 0 is the base model
-        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
-        checkpoint_root=checkpoint_root,
-        lora_alpha=args.lora_alpha if train_mode == "lora" else None,
-        lease_timeout_s=args.tinker_lease_timeout_s,
-        unit_token_budget=args.tinker_unit_token_budget,
-        train_mode=train_mode,
-        retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
-        sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
-        coalesce_wait_s=args.tinker_coalesce_wait_s,
-        max_concurrent_samples=args.tinker_max_concurrent_samples,
-    )
+    config = gateway_config(args)
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)
     service = TinkerService(backend, config)
