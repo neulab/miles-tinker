@@ -1,10 +1,13 @@
 """Serve-entry validation of the Tinker gateway modes."""
 
+import argparse
 from argparse import Namespace
 
 import pytest
 
+from miles.tinker.core.types import GatewayConfig
 from miles.utils import tinker_args as arguments
+from miles.utils.arguments import get_miles_extra_args_provider
 
 
 def _serve_args(**overrides) -> Namespace:
@@ -76,3 +79,24 @@ def test_full_mode_overrides_in_place_pausing(caplog):
     args = _serve_args(tinker_train_mode="full", multi_lora_n_adapters=0, lora_rank=0, pause_generation_mode="abort")
     validate_tinker_serve_args(args)
     assert args.pause_generation_mode == "abort"
+
+
+def _parsed_serve_flags(argv: list[str]) -> Namespace:
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args, _ = parser.parse_known_args(argv + ["--rollout-batch-size", "64"])
+    # Megatron-side flags the gateway config also reads
+    args.hf_checkpoint, args.multi_lora_n_adapters, args.lora_alpha = "/x/hf", 0, None
+    args.tinker_train_mode, args.tinker_checkpoint_root = "full", "/x/ckpt"
+    return args
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [([], GatewayConfig.max_tokens_per_datum), (["--tinker-max-tokens-per-datum", "65536"], 65536)],
+)
+def test_max_tokens_per_datum_flag_reaches_the_gateway_config(argv, expected):
+    """Agentic RL datums can exceed the 32k default; the flag must reach the admission check."""
+    config = arguments.gateway_config(_parsed_serve_flags(argv))
+
+    assert config.max_tokens_per_datum == expected

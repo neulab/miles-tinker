@@ -1,10 +1,12 @@
-"""Serve-entry (Tinker gateway) argument validation.
+"""Serve-entry (Tinker gateway) argument validation and GatewayConfig assembly.
 
-Kept stdlib-only so the fast tests exercise it without the sglang/megatron
-imports that ``miles.utils.arguments`` pulls in.
+Imports only the stdlib and the (stdlib-only) tinker core types, so the fast tests
+exercise it without the sglang/megatron imports that ``miles.utils.arguments`` pulls in.
 """
 
 import logging
+
+from miles.tinker.core.types import GatewayConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,3 +58,23 @@ def validate_tinker_serve_args(args) -> None:
         # Megatron's DDP nan check raises inside the grad sync and kills the actor; the executors veto the step instead.
         logger.info("Tinker gateway: setting check_for_nan_in_loss_and_grad=False (non-finite steps are vetoed)")
         args.check_for_nan_in_loss_and_grad = False
+
+
+def gateway_config(args) -> GatewayConfig:
+    """The GatewayConfig the --tinker-* flags describe (args.tinker_checkpoint_root already resolved)."""
+    train_mode = args.tinker_train_mode
+    return GatewayConfig(
+        base_model=args.tinker_base_model or args.hf_checkpoint,
+        # full fine-tuning: one tenant, slot 0 is the base model
+        n_slots=args.multi_lora_n_adapters if train_mode == "lora" else 1,
+        checkpoint_root=args.tinker_checkpoint_root,
+        lora_alpha=args.lora_alpha if train_mode == "lora" else None,
+        lease_timeout_s=args.tinker_lease_timeout_s,
+        unit_token_budget=args.tinker_unit_token_budget,
+        train_mode=train_mode,
+        retrieve_poll_timeout_s=args.tinker_retrieve_poll_timeout_s,
+        sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
+        coalesce_wait_s=args.tinker_coalesce_wait_s,
+        max_concurrent_samples=args.tinker_max_concurrent_samples,
+        max_tokens_per_datum=args.tinker_max_tokens_per_datum,
+    )

@@ -1892,6 +1892,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Maximum in-flight /generate posts per gateway (default: 512)",
             )
             parser.add_argument(
+                "--tinker-max-tokens-per-datum",
+                type=int,
+                default=32768,
+                help="Longest datum (prompt + completion tokens) forward_backward accepts (default: 32768)",
+            )
+            parser.add_argument(
                 "--tinker-retrieve-poll-timeout-s",
                 type=float,
                 default=20.0,
