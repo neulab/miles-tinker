@@ -169,8 +169,11 @@ Both supported transfer modes use the same code paths as miles-managed engines:
   / IB settings on both sides accordingly).
 - **disk-delta**: `--update-weight-disk-dir` must be visible at the same path on
   the trainer and every engine host, and `--update-weight-local-checkpoint-dir`
-  must be a writable host-local path on every engine host. Use a run-unique
-  local directory: an engine host's applied-version marker from an earlier run
+  must be a writable host-local path on every engine host, at the same path on
+  all of them (one flag serves every host) and visible inside the engines'
+  container. It holds a full copy of the checkpoint (about 9 GB for a 4B
+  model), so check its free space: on ABCI rt_HF nodes `/tmp` is an 8 GB tmpfs,
+  while `/dev/shm` has about 1 TB. Use a run-unique local directory: an engine host's applied-version marker from an earlier run
   makes the first delta of a new run fail as out-of-order. Object-store mounts
   need `--custom-update-weight-post-write-path` on the trainer and
   `--custom-pull-weights-pre-read-hook` on the engines.
