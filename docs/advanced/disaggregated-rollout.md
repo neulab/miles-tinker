@@ -52,7 +52,7 @@ to independent scaling, routing, and lifecycle.
 `--rollout-external` is the second row, not the third. It prevents miles from
 launching SGLang, but miles still knows the individual engine addresses, checks
 their configuration, registers them with its router, and calls their
-weight-update lifecycle.
+weight-update lifecycle (see [Attached SGLang engines](#attached-sglang-engines)).
 
 An external rollout service is a narrower interface. miles sends rollout
 requests to one endpoint and publishes new policy versions without needing an
@@ -78,18 +78,101 @@ GPUs and take turns; fully async rollout therefore requires the disaggregated
 layout. See [Training Backends: Choosing the GPU layout](/user-guide/training-backend#3-choosing-the-gpu-layout)
 for placement and offload behavior.
 
-To attach SGLang engines launched outside the miles Ray job, provide their
-addresses explicitly:
+To attach SGLang engines launched outside the miles Ray job instead, see
+[Attached SGLang engines](#attached-sglang-engines) below.
+
+## Attached SGLang engines
+
+`--rollout-external` attaches SGLang engines that something else launched and
+keeps alive (a deployment, an engine pool on another cluster). miles never
+launches, kills, or restarts them; it treats each address as one rollout cell
+and otherwise runs the same lifecycle as for its own engines:
 
 ```bash
 --rollout-external \
---rollout-external-engine-addrs 10.0.1.10:30000 10.0.1.11:30000
+--rollout-external-engine-addrs 10.0.1.10:30000 10.0.1.11:30000 \
+--rollout-num-gpus-per-engine 1 \
+--update-weight-transfer-mode disk-delta   # or broadcast
 ```
 
-The engines must be reachable from the miles job and must have server settings
-compatible with the rollout configuration. Because miles retains individual
-engine handles, `--rollout-external` does not hand off weight-update ownership:
-miles still runs the selected weight-update lifecycle.
+`--rollout-num-gpus` is derived as `len(addrs) * --rollout-num-gpus-per-engine`
+(a contradicting explicit value is refused). `--colocate`, `--eval-num-gpus`,
+`--sglang-config`, `--prefill-num-servers`, and `p2p` weight transfer are not
+supported with attached engines.
+
+Lifecycle of one attached engine:
+
+1. miles polls `GET /health` on every address. An engine that answers is
+   offered as a cell; one that is not up yet is waited for (startup waits for
+   all of them).
+2. The cell waits for `/health_generate`, then reads `/server_info` and the
+   live weight version and checks the launch flags below. A mismatch is logged
+   on every tick and keeps the cell out of the rollout; it never gets a weight
+   update.
+3. The cell is pending weights: it takes part in the next weight update and is
+   registered with the miles router only after that update completed.
+4. An engine that fails three consecutive health polls (about 15 s) is removed:
+   deregistered from the router and dropped from later weight updates, so the
+   trainer does not wait for it. Restarting it is the owner's job. When it
+   answers again it comes back as a new generation (a new `workers_hash`), so
+   the trainer reconnects and the engine is fully synced (broadcast: all
+   tensors; disk-delta: it catches up through every published version from its
+   base) before the router sees it again.
+5. At shutdown miles deregisters the engines from its router and leaves them
+   running. The ft API server and the dashboard engine registration never see
+   attached engines (they have no miles worker); the dashboard still picks
+   them up from its metrics scrapes.
+
+miles runs its own router as usual; an external router is not supported.
+
+### Launch flags of an attached engine
+
+miles cannot choose the engine's server arguments, so it checks the ones
+weight sync and rollout depend on. Launch each engine with:
+
+| Flag | Value | Checked |
+|---|---|---|
+| `--model-path` | the same checkpoint bytes as the trainer's `--hf-checkpoint` (disk-delta patches them) | warning if the path differs |
+| `--tp-size` | `--rollout-num-gpus-per-engine` (the broadcast group gives one rank per engine GPU) | error |
+| `--pp-size`, `--dp-size` | `--sglang-pp-size`, `--sglang-dp-size` | error |
+| `--enable-lora`, `--max-lora-rank`, `--lora-target-modules`, `--max-loras-per-batch` | as miles would set them, for LoRA rollout / multi-LoRA | `enable_lora` is an error |
+| `--enable-return-routed-experts` | with `--use-rollout-routing-replay` | error |
+| `--enable-return-indexer-topk` | with `--use-rollout-indexer-replay` | error |
+| `--dtype float16` | with `--fp16` | error |
+| `--host` | an address the trainer and the miles router can reach | - |
+| `--skip-server-warmup`, `--enable-metrics` | recommended (miles sets both on its own engines) | - |
+
+Also:
+
+- miles calls the engines' admin endpoints (`/init_weights_update_group`,
+  `/update_weights_from_distributed`, `/pull_weights`,
+  `/update_weights_from_disk`, `/pause_generation`, ...) without an API key, so
+  do not require one for them. `--sglang-api-key` is sent on health probes only.
+- An engine that reports a weight version other than the unset `default` at
+  attach time (an earlier run's update, or a deployment that launches with
+  `--weight-version`) is logged with a warning: it may still serve another
+  policy. With broadcast the first update
+  overwrites it; with disk-delta the first update only records the baseline, so
+  restart such an engine (or accept one stale rollout step).
+- The engine build must include the `/pull_weights` endpoint for disk-delta
+  (the sglang-miles build in the miles image does).
+
+### Weight updates to attached engines
+
+Both supported transfer modes use the same code paths as miles-managed engines:
+
+- **broadcast**: the trainer's rank 0 opens a TCP rendezvous on its node IP and
+  a random port, every engine joins the NCCL group via
+  `/init_weights_update_group`, and the tensors are broadcast over NCCL. The
+  engines must reach the trainer node over TCP and NCCL (set `NCCL_SOCKET_IFNAME`
+  / IB settings on both sides accordingly).
+- **disk-delta**: `--update-weight-disk-dir` must be visible at the same path on
+  the trainer and every engine host, and `--update-weight-local-checkpoint-dir`
+  must be a writable host-local path on every engine host. Use a run-unique
+  local directory: an engine host's applied-version marker from an earlier run
+  makes the first delta of a new run fail as out-of-order. Object-store mounts
+  need `--custom-update-weight-post-write-path` on the trainer and
+  `--custom-pull-weights-pre-read-hook` on the engines.
 
 ## Weight synchronization
 

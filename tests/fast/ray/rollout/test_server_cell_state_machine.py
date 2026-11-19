@@ -179,21 +179,21 @@ class TestInit:
         with pytest.raises(AssertionError):
             await cell.init()
 
-    async def test_external_rollout_initialization_is_rejected_before_allocating_an_address(
+    async def test_an_external_engine_cell_takes_its_given_address_without_a_gate_or_lookup(
         self, cell_env, monkeypatch
     ):
-        """External address allocation was removed, so the cell must refuse instead of opening a gate it does not own."""
+        """An attached engine was launched by someone else: there is no gate to open and no worker to look up."""
 
         async def _unexpected_compute_addr_info(self) -> CellAddrInfo:
             raise AssertionError("external rollout initialization looked up a worker address")
 
         monkeypatch.setattr(ServerCell, "_compute_addr_info", _unexpected_compute_addr_info)
-        cell = _make_cell(args_overrides=dict(rollout_external=True))
+        cell = _make_cell(args_overrides=dict(rollout_external=True), external_server_url="http://10.0.0.9:30000")
 
-        with pytest.raises(NotImplementedError):
-            await cell.init()
+        await cell.init()
 
-        assert cell.is_uninitialized
+        assert isinstance(cell._state, StateInitializing)
+        assert cell.addr_info == CellAddrInfo(server_url="http://10.0.0.9:30000", bootstrap_port=None, gate_url=None)
         assert cell_env["activated"] == []
 
     async def test_an_address_lookup_failure_leaves_the_cell_uninitialized_and_retryable(self, cell_env, monkeypatch):

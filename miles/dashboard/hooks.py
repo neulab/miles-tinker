@@ -371,11 +371,12 @@ def report_data_buffer(length: int | None) -> None:
 def _alive_engine_cells(servers) -> list:
     """A multi-node engine's cell holds ``num_nodes`` actors; only the first
     (master) owns the router-visible URL. Cells that are not alive are skipped
-    until recovery completes."""
+    until recovery completes. Attached external engines have no actor; the
+    collector synthesizes them from scrapes instead."""
     cells = []
     for server in servers.values():
         for cell in server.server_cells.values():
-            if cell.is_pending_weights_or_serving:
+            if cell.is_pending_weights_or_serving and cell.meta.external_server_url is None:
                 cells.append(cell)
     return cells
 

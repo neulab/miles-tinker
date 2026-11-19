@@ -129,7 +129,8 @@ def compute_engine_pool_id(model_idx: int, group_index: int) -> str:
 
 
 def specs_inference_engine(args) -> list[CommandWorkerSpec]:
-    if args.debug_train_only:
+    # attached external engines are observed by `ExternalEngineProvider`, never launched
+    if args.debug_train_only or args.rollout_external:
         return []
 
     config = resolve_sglang_config(args)  # TODO avoid resolve repeatedly
