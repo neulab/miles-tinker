@@ -198,7 +198,15 @@ def check_external_engine_server_info(
     if errors:
         raise ValueError(f"External engine {server_url} was launched with incompatible flags: " + "; ".join(errors))
 
-    if (model_path := server_info.get("model_path")) != args.hf_checkpoint:
+    model_path = server_info.get("model_path")
+    is_hub_id = model_path is not None and not model_path.startswith("/")
+    if args.update_weight_transfer_mode == "disk-delta" and is_hub_id:
+        raise ValueError(
+            f"External engine {server_url} serves model_path={model_path!r}: disk-delta seeds each engine "
+            f"host's local checkpoint from the engine's --model-path, which must be a local checkpoint "
+            f"directory (the same bytes as --hf-checkpoint), not a hub id"
+        )
+    if model_path != args.hf_checkpoint:
         logger.warning(
             f"External engine {server_url} serves model_path={model_path!r}, not --hf-checkpoint "
             f"{args.hf_checkpoint!r}; it must be the same checkpoint (disk-delta patches its bytes)"

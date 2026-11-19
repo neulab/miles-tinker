@@ -112,6 +112,7 @@ def make_args(**overrides: Any) -> Namespace:
         # external rollout
         rollout_external=False,
         rollout_external_engine_addrs=None,
+        update_weight_transfer_mode="broadcast",
         # offload / fault tolerance
         offload_rollout=False,
         use_fault_tolerance=False,

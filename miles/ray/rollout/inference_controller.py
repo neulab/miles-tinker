@@ -173,7 +173,11 @@ class InferenceController:
             rollout_engines=srv.api_clients,
             engine_gpu_counts=srv.engine_gpu_counts,
             engine_gpu_offsets=srv.engine_gpu_offsets,
-            snapshot_cell_id_to_hashes={cell_id: cell.meta.workers_hash for cell_id, cell in srv.server_cells.items()},
+            snapshot_cell_id_to_hashes={
+                cell_id: cell.meta.workers_hash
+                for cell_id, cell in srv.server_cells.items()
+                if cell.joins_weight_updates
+            },
         )
 
     @releases_lock
@@ -196,7 +200,9 @@ class InferenceController:
             cells = [cell for srv in self.servers.values() for cell in srv.server_cells.values()]
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
-            pending = [cell for cell in cells if not cell.is_pending_weights_or_serving]
+            pending = [
+                cell for cell in cells if cell.joins_weight_updates and not cell.is_pending_weights_or_serving
+            ]
             if not pending:
                 return
             if time.monotonic() >= deadline:

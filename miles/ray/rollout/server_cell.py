@@ -135,6 +135,13 @@ class ServerCell:
         return isinstance(self._state, StateServing)
 
     @property
+    def joins_weight_updates(self) -> bool:
+        """An attached external engine that is not ready (still starting, or failing its flag
+        check) is left out of weight updates instead of blocking them; it joins a later one,
+        whose changed cell snapshot makes the trainer reconnect it."""
+        return self.meta.external_server_url is None or self.is_pending_weights_or_serving
+
+    @property
     def is_initializing_past_deadline(self) -> bool:
         return self.is_initializing and time.monotonic() - self._state.start_time >= INITIALIZING_TIMEOUT_SECONDS
 

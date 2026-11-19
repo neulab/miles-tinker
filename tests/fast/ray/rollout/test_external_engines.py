@@ -159,6 +159,14 @@ class TestServerInfoCheck:
             make_args(), server_info={}, weight_version=None, num_gpus_per_engine=1, server_url="http://e:1"
         )
 
+    def test_a_hub_id_model_path_is_refused_under_disk_delta(self):
+        """/pull_weights seeds the engine host's local checkpoint by listing --model-path."""
+        with pytest.raises(ValueError, match="hub id"):
+            self._check(make_args(update_weight_transfer_mode="disk-delta"), model_path="Qwen/Qwen3.5-4B")
+
+    def test_a_hub_id_model_path_is_fine_under_broadcast(self):
+        self._check(make_args(update_weight_transfer_mode="broadcast"), model_path="Qwen/Qwen3.5-4B")
+
     def test_another_checkpoint_or_a_used_engine_only_warns(self, caplog):
         """A host may mount the checkpoint elsewhere; an engine reused from another run is legal but suspicious."""
         with caplog.at_level(logging.WARNING, logger=external_engines_module.__name__):
@@ -397,6 +405,14 @@ class TestLifecycleAgainstFakeEngines:
 
         cells = controller.servers["default"].server_cells
         assert cells["inference-engine-0-0-0"].is_pending_weights
+        assert cells["inference-engine-0-0-1"].is_initializing
+
+        # it neither blocks the weight update nor receives it
+        engines_to_sync = await controller.start_update_weights()
+        await controller.end_update_weights(engines_to_sync.snapshot_cell_id_to_hashes)
+        assert [client.server_url for client in engines_to_sync.rollout_engines] == [engines[0].url]
+        assert list(engines_to_sync.snapshot_cell_id_to_hashes) == ["inference-engine-0-0-0"]
+        assert cells["inference-engine-0-0-0"].is_serving
         assert cells["inference-engine-0-0-1"].is_initializing
         await controller.dispose()
 

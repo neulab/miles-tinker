@@ -128,6 +128,7 @@ class _FakeUpdatableCell:
         self.marked_ready = 0
         self.is_pending_weights = True
         self.is_pending_weights_or_serving = True
+        self.joins_weight_updates = True
 
     async def mark_weights_ready(self) -> None:
         self.marked_ready += 1

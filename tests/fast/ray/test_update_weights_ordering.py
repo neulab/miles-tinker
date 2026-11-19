@@ -54,6 +54,8 @@ class _ColocatedCellStub:
     def is_pending_weights_or_serving(self) -> bool:
         return self.ready
 
+    joins_weight_updates = True
+
 
 class _ServerStub:
     def __init__(self, server_cells: dict[str, _ColocatedCellStub]) -> None:

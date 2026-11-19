@@ -107,8 +107,9 @@ Lifecycle of one attached engine:
    all of them).
 2. The cell waits for `/health_generate`, then reads `/server_info` and the
    live weight version and checks the launch flags below. A mismatch is logged
-   on every tick and keeps the cell out of the rollout; it never gets a weight
-   update.
+   on every tick and keeps the cell out of the rollout. Weight updates neither
+   wait for nor reach a cell that is not ready yet; it joins the first update
+   after it becomes ready.
 3. The cell is pending weights: it takes part in the next weight update and is
    registered with the miles router only after that update completed.
 4. An engine that fails three consecutive health polls (about 15 s) is removed:
@@ -132,7 +133,7 @@ weight sync and rollout depend on. Launch each engine with:
 
 | Flag | Value | Checked |
 |---|---|---|
-| `--model-path` | the same checkpoint bytes as the trainer's `--hf-checkpoint` (disk-delta patches them) | warning if the path differs |
+| `--model-path` | a local directory with the same checkpoint bytes as the trainer's `--hf-checkpoint` (disk-delta seeds each host's local checkpoint by copying it, then patches the bytes) | error for a hub id under disk-delta; warning if the path differs |
 | `--tp-size` | `--rollout-num-gpus-per-engine` (the broadcast group gives one rank per engine GPU) | error |
 | `--pp-size`, `--dp-size` | `--sglang-pp-size`, `--sglang-dp-size` | error |
 | `--enable-lora`, `--max-lora-rank`, `--lora-target-modules`, `--max-loras-per-batch` | as miles would set them, for LoRA rollout / multi-LoRA | `enable_lora` is an error |
