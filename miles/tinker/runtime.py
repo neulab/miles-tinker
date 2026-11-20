@@ -103,6 +103,8 @@ class MilesBackend(ExecutorBackend):
                 index = int(item["sample_index"])
                 if index not in by_index:
                     by_index[index] = {"loss": float(item["loss"]), "logprobs": item["logprobs"].tolist()}
+                    if "metrics" in item:  # a custom loss's per-datum metrics
+                        by_index[index]["metrics"] = item["metrics"]
         # padded rows sit past len(slot_rows) and are dropped here
         return [by_index[index] for index in range(len(slot_rows))]
 

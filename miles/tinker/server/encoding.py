@@ -148,12 +148,20 @@ def decode_sample_request(payload: dict) -> dict:
 
 
 def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
-    """Request-level metrics in the SDK's ``name:reduction`` form."""
-    return {
+    """Request-level metrics in the SDK's ``name:reduction`` form; a custom loss's per-datum metrics
+    are summed over the datums as ``<name>:sum``."""
+    metrics = {
         "loss:sum": float(sum(output["loss"] for output in outputs)),
         "num_tokens:sum": float(sum(len(output["logprobs"]) for output in outputs)),
         "num_datums:sum": float(len(outputs)),
     }
+    for output in outputs:
+        for name, value in (output.get("metrics") or {}).items():
+            key = f"{name}:sum"
+            if key in ("loss:sum", "num_tokens:sum", "num_datums:sum"):
+                continue  # a custom metric never shadows the request's own
+            metrics[key] = metrics.get(key, 0.0) + float(value)
+    return metrics
 
 
 def render_result(result: dict) -> dict:

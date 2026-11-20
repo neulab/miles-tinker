@@ -1892,6 +1892,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Maximum in-flight /generate posts per gateway (default: 512)",
             )
             parser.add_argument(
+                "--tinker-custom-loss",
+                action="append",
+                default=[],
+                metavar="NAME=module.path:function",
+                help="Register a custom Tinker loss: requests with loss_fn NAME call module.path:function per datum "
+                "(signature in loss_hub/tinker_losses.py). Repeatable; imported at startup, so a bad path fails fast",
+            )
+            parser.add_argument(
                 "--tinker-retrieve-poll-timeout-s",
                 type=float,
                 default=20.0,
