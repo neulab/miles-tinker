@@ -12,6 +12,9 @@ also the custom-loss backend.
 Config keys and defaults follow the Tinker docs.
 """
 
+import functools
+import importlib
+import numbers
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -40,7 +43,17 @@ def drain_per_datum_outputs() -> list[dict]:
     return outputs or []
 
 
-def _record_per_datum(batch: RolloutBatch, log_probs: list[torch.Tensor], per_sample_loss: list[torch.Tensor]) -> None:
+def _metric_tensor(value, reference: torch.Tensor) -> torch.Tensor:
+    value = value.detach() if isinstance(value, torch.Tensor) else torch.tensor(float(value))
+    return value.reshape(()).to(device=reference.device, dtype=torch.float64)
+
+
+def _record_per_datum(
+    batch: RolloutBatch,
+    log_probs: list[torch.Tensor],
+    per_sample_loss: list[torch.Tensor],
+    per_sample_metrics: list[dict[str, torch.Tensor]] | None = None,
+) -> None:
     if _per_datum_outputs is None:
         return
     sample_indices = batch.get("sample_indices")
@@ -51,8 +64,22 @@ def _record_per_datum(batch: RolloutBatch, log_probs: list[torch.Tensor], per_sa
     flat_log_probs = torch.cat([lp.detach() for lp in log_probs]).cpu()
     losses = torch.stack([loss.detach() for loss in per_sample_loss]).cpu()
     per_datum_log_probs = torch.split(flat_log_probs, [lp.numel() for lp in log_probs])
-    for index, log_prob, loss in zip(sample_indices, per_datum_log_probs, losses, strict=True):
-        _per_datum_outputs.append({"sample_index": index, "logprobs": log_prob, "loss": loss})
+    metric_rows = None
+    if per_sample_metrics:
+        # one device sync for all per-datum metrics of the microbatch
+        names = sorted({name for metrics in per_sample_metrics for name in metrics})
+        table = torch.stack(
+            [
+                torch.stack([_metric_tensor(metrics.get(name, 0.0), per_sample_loss[0]) for name in names])
+                for metrics in per_sample_metrics
+            ]
+        ).cpu()
+        metric_rows = [dict(zip(names, row.tolist(), strict=True)) for row in table]
+    for i, (index, log_prob, loss) in enumerate(zip(sample_indices, per_datum_log_probs, losses, strict=True)):
+        output = {"sample_index": index, "logprobs": log_prob, "loss": loss}
+        if metric_rows is not None:
+            output["metrics"] = metric_rows[i]
+        _per_datum_outputs.append(output)
 
 
 def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
@@ -87,6 +114,7 @@ def _finish(
     logits: torch.Tensor,
     log_probs: list[torch.Tensor],
     per_sample_loss: list[torch.Tensor],
+    per_sample_metrics: list[dict[str, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     per_sample_loss = _drop_masked_out(batch, per_sample_loss)
     if per_sample_loss:
@@ -94,7 +122,7 @@ def _finish(
     else:
         # a microbatch with no supervised tokens still needs the graph alive; fp32 sum avoids fp16 inf -> nan
         loss = logits.sum(dtype=torch.float32) * 0
-    _record_per_datum(batch, log_probs, per_sample_loss)
+    _record_per_datum(batch, log_probs, per_sample_loss, per_sample_metrics)
     return loss, {"loss": loss.clone().detach()}
 
 
@@ -177,6 +205,110 @@ def dro_loss_function(
         objective = lp * _like(adv, lp) - 0.5 * beta * divergence**2
         per_sample.append(-objective.sum())
     return _finish(batch, logits, log_probs, per_sample)
+
+
+# -------- custom losses (--tinker-custom-loss NAME=module:function) --------
+#
+# A custom loss is a per-datum function, imported once per process:
+#
+#     fn(*, logprobs, sampling_logprobs, advantages, loss_mask, config) -> (per_token_loss, metrics)
+#
+#   logprobs           trainer logprobs of the target tokens, shape [T], carrying the gradient
+#   sampling_logprobs  loss_fn_inputs["logprobs"] (the sampler's), shape [T], no gradient
+#   advantages         loss_fn_inputs["advantages"], shape [T]
+#   loss_mask          1 on the datum's tokens, 0 on the runtime's DP padding rows, shape [T]
+#   config             the request's loss_fn_config (a dict)
+#   per_token_loss     tensor of shape [T]; the datum's loss is its raw sum, as for the built-in losses
+#                      (normalization stays the client's business, via advantages/weights)
+#   metrics            {name: number or 0-dim tensor} per datum; summed over the request's datums and
+#                      returned in the forward_backward result metrics as ``<name>:sum``
+
+
+def parse_custom_loss_specs(specs: list[str] | None) -> dict[str, str]:
+    """``["name=module:function", ...]`` -> {name: "module:function"}; built-in names are refused."""
+    out: dict[str, str] = {}
+    for spec in specs or []:
+        name, sep, path = spec.partition("=")
+        name, path = name.strip(), path.strip()
+        if not sep or not name or ":" not in path:
+            raise ValueError(f"--tinker-custom-loss {spec!r}: expected NAME=module.path:function")
+        if name in TINKER_LOSS_FUNCTIONS:
+            raise ValueError(f"--tinker-custom-loss {spec!r}: {name!r} is a built-in Tinker loss")
+        if name in out:
+            raise ValueError(f"--tinker-custom-loss: {name!r} given twice")
+        out[name] = path
+    return out
+
+
+@functools.cache
+def load_custom_loss(path: str) -> Callable:
+    """Import ``module.path:function`` (once per process)."""
+    module_name, _, attr = path.partition(":")
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as e:
+        raise ValueError(f"custom loss {path!r}: cannot import {module_name!r}: {e}") from e
+    fn = getattr(module, attr, None)
+    if not callable(fn):
+        raise ValueError(f"custom loss {path!r}: {module_name!r} has no callable {attr!r}")
+    return fn
+
+
+def _check_custom_output(path: str, out, logprobs: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    if not (isinstance(out, tuple) and len(out) == 2):
+        raise TypeError(f"custom loss {path!r} must return (per_token_loss, metrics), got {type(out).__name__}")
+    per_token, metrics = out
+    if not isinstance(per_token, torch.Tensor) or per_token.shape != logprobs.shape:
+        got = tuple(per_token.shape) if isinstance(per_token, torch.Tensor) else type(per_token).__name__
+        raise TypeError(f"custom loss {path!r}: per_token_loss must be a tensor of shape {tuple(logprobs.shape)}, got {got}")
+    if not isinstance(metrics, dict) or not all(
+        isinstance(k, str)
+        and (isinstance(v, numbers.Real) or (isinstance(v, torch.Tensor) and v.numel() == 1))
+        for k, v in metrics.items()
+    ):
+        raise TypeError(f"custom loss {path!r}: metrics must be a dict of str -> number or 1-element tensor")
+    return per_token, metrics
+
+
+def custom_loss_function(
+    path: str,
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    fn = load_custom_loss(path)
+    config = dict(batch.get("loss_fn_config") or {})
+    log_probs = _target_logprobs(args, batch, logits)
+    per_sample, per_sample_metrics = [], []
+    masks = batch.get("loss_masks") or [torch.ones_like(lp) for lp in log_probs]
+    for lp, sampling, adv, mask in zip(log_probs, batch["rollout_log_probs"], batch["advantages"], masks, strict=True):
+        per_token, metrics = _check_custom_output(
+            path,
+            fn(
+                logprobs=lp,
+                sampling_logprobs=_like(sampling, lp),
+                advantages=_like(adv, lp),
+                loss_mask=_like(mask, lp),
+                config=config,
+            ),
+            lp,
+        )
+        per_sample.append(per_token.sum())
+        per_sample_metrics.append(metrics)
+    return _finish(batch, logits, log_probs, per_sample, per_sample_metrics)
+
+
+def get_tinker_loss_function(args: Namespace, loss_fn: str) -> Callable:
+    """A built-in Tinker loss, or one registered with --tinker-custom-loss."""
+    if loss_fn in TINKER_LOSS_FUNCTIONS:
+        return TINKER_LOSS_FUNCTIONS[loss_fn]
+    custom = parse_custom_loss_specs(getattr(args, "tinker_custom_loss", None))
+    if loss_fn in custom:
+        return functools.partial(custom_loss_function, custom[loss_fn])
+    raise ValueError(
+        f"unknown Tinker loss_fn {loss_fn!r} (built-in: {sorted(TINKER_LOSS_FUNCTIONS)}, custom: {sorted(custom)})"
+    )
 
 
 TINKER_LOSS_FUNCTIONS = {

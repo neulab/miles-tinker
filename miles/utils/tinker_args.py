@@ -46,6 +46,13 @@ def validate_tinker_serve_args(args) -> None:
                 "every forward_backward call, so a multi-call optim window double-counts them; prefer TP=1, EP=1."
             )
     assert not args.calculate_per_token_loss, "Tinker losses are exact sums; drop --calculate-per-token-loss"
+    if getattr(args, "tinker_custom_loss", None):
+        # fail fast on a bad path, in the serve process, before any trainer starts
+        from miles.backends.training_utils.loss_hub.tinker_losses import load_custom_loss, parse_custom_loss_specs
+
+        for name, path in parse_custom_loss_specs(args.tinker_custom_loss).items():
+            load_custom_loss(path)
+            logger.info(f"Tinker custom loss {name!r}: {path}")
     assert (
         args.context_parallel_size == 1
     ), "the Tinker gateway returns per-datum logprobs; context parallelism is not supported"
