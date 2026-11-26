@@ -158,7 +158,11 @@ class LinearForLastLayer(torch.nn.Linear):
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
+            # Each TP rank sees only its sequence shard, so both grads must be summed over TP
+            # (finalize_model_grads all-reduces params marked sequence_parallel).
             self.weight.sequence_parallel = True
+            if bias:
+                self.bias.sequence_parallel = True
 
         # Small initial value predictions, following OpenRLHF's fresh critic head.
         self.weight.data.normal_(mean=0.0, std=1 / (input_size + 1) if init_std is None else init_std)
@@ -237,8 +241,12 @@ def get_model_provider_func(
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             _check_model_mtp(model, args)
             if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                # VL wrappers (e.g. Qwen3.5) run the text stack as model.language_model and never call their own
+                # output_layer, so the value head replaces the text model's output layer: it reads the final
+                # hidden states of the text tokens.
+                text_model = getattr(model, "language_model", model)
+                text_model.output_layer = LinearForLastLayer(
+                    input_size=text_model.config.hidden_size, output_size=1, config=text_model.config
                 )
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.

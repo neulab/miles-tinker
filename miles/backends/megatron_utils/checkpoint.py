@@ -184,19 +184,22 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 @contextmanager
 def _hide_critic_value_head_from_hf_load(ddp_model):
+    # A VL wrapper keeps the value head on its text model (see get_model_provider_func).
     value_heads = [
-        (chunk, name, head)
+        (module, name, head)
         for chunk in unwrap_model(ddp_model)
-        for name, head in chunk.named_children()
+        for module in (chunk, getattr(chunk, "language_model", None))
+        if module is not None
+        for name, head in module.named_children()
         if isinstance(head, LinearForLastLayer)
     ]
-    for chunk, name, _ in value_heads:
-        delattr(chunk, name)
+    for module, name, _ in value_heads:
+        delattr(module, name)
     try:
         yield
     finally:
-        for chunk, name, head in value_heads:
-            setattr(chunk, name, head)
+        for module, name, head in value_heads:
+            setattr(module, name, head)
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
